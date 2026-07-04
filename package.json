@@ -1,0 +1,23 @@
+{
+  "name": "aptlyst-ai",
+  "private": true,
+  "version": "0.1.0",
+  "description": "AI Meeting Copilot",
+  "packageManager": "pnpm@11.9.0",
+  "type": "module",
+  "scripts": {
+    "dev": "echo No dev command yet",
+    "build": "echo No build command yet",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "typecheck": "echo No TypeScript configured"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.6.0",
+    "globals": "^17.7.0",
+    "prettier": "^3.9.4",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.62.1"
+  }
+}
