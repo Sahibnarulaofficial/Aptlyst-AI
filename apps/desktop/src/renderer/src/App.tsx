@@ -1,34 +1,27 @@
-import Versions from './components/Versions'
-import electronLogo from './assets/electron.svg'
+import { Badge } from '@renderer/components/ui/Badge'
+import { Card, CardContent, CardHeader, CardTitle } from '@renderer/components/ui/Card'
+import { Input } from '@renderer/components/ui/Input'
+import { Button } from '@renderer/components/ui/Button'
+import { Separator } from '@renderer/components/ui/Separator'
 
-function App(): React.JSX.Element {
-  const ipcHandle = (): void => window.electron.ipcRenderer.send('ping')
-
+function App() {
   return (
-    <>
-      <img alt="logo" className="logo" src={electronLogo} />
-      <div className="creator">Powered by electron-vite</div>
-      <div className="text">
-        Build an Electron app with <span className="react">React</span>
-        &nbsp;and <span className="ts">TypeScript</span>
-      </div>
-      <p className="tip">
-        Please try pressing <code>F12</code> to open the devTool
-      </p>
-      <div className="actions">
-        <div className="action">
-          <a href="https://electron-vite.org/" target="_blank" rel="noreferrer">
-            Documentation
-          </a>
-        </div>
-        <div className="action">
-          <a target="_blank" rel="noreferrer" onClick={ipcHandle}>
-            Send IPC
-          </a>
-        </div>
-      </div>
-      <Versions></Versions>
-    </>
+    <main className="flex min-h-screen items-center justify-center bg-zinc-100 p-6">
+      <Card className="w-[420px]">
+        <CardHeader>
+          <Badge className="w-fit">Prototype</Badge>
+          <CardTitle className="mt-3 text-xl">Aptlyst AI</CardTitle>
+        </CardHeader>
+
+        <Separator />
+
+        <CardContent className="space-y-4 pt-6">
+          <Input placeholder="Meeting title..." />
+
+          <Button className="w-full">Start Meeting</Button>
+        </CardContent>
+      </Card>
+    </main>
   )
 }
 
