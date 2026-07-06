@@ -6,11 +6,13 @@
   "packageManager": "pnpm@11.9.0",
   "type": "module",
   "scripts": {
-    "dev": "echo No dev command yet",
-    "build": "echo No build command yet",
+    "dev": "...",
+    "build": "...",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "typecheck": "echo No TypeScript configured"
+    "typecheck": "tsc --noEmit",
+    "clean": "...",
+    "check": "pnpm lint && pnpm typecheck"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
