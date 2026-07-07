@@ -1,11 +1,16 @@
 import { Bell, Search, Sparkles } from 'lucide-react'
+import { useLocation } from 'react-router-dom'
+import { getPageTitle } from '@renderer/lib/navigationHelpers'
 
 export function Header() {
+  const location = useLocation()
+  const pageTitle = getPageTitle(location.pathname)
+
   return (
     <div className="flex h-full items-center justify-between px-6">
       {/* Left */}
       <div>
-        <h2 className="text-xl font-semibold text-zinc-900">Dashboard</h2>
+        <h2 className="text-xl font-semibold text-zinc-900">{pageTitle}</h2>
 
         <p className="text-sm text-zinc-500">Welcome to Aptlyst AI</p>
       </div>
