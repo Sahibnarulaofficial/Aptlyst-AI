@@ -1,0 +1,39 @@
+:root {
+  /* Radius */
+  --radius: 12px;
+
+  /* App */
+  --background: #f8fafc;
+  --foreground: #18181b;
+
+  /* Cards */
+  --card: #ffffff;
+  --card-foreground: #18181b;
+
+  /* Primary */
+  --primary: #18181b;
+  --primary-foreground: #ffffff;
+
+  /* Secondary */
+  --secondary: #f4f4f5;
+  --secondary-foreground: #18181b;
+
+  /* Muted */
+  --muted: #f4f4f5;
+  --muted-foreground: #71717a;
+
+  /* Border */
+  --border: #e4e4e7;
+
+  /* Sidebar */
+  --sidebar: #09090b;
+  --sidebar-foreground: #fafafa;
+  --sidebar-muted: #71717a;
+  --sidebar-hover: #18181b;
+  --sidebar-border: #27272a;
+
+  /* Status */
+  --success: #22c55e;
+  --warning: #eab308;
+  --danger: #ef4444;
+}

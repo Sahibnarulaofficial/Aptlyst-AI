@@ -6,11 +6,14 @@ import { TranscriptsPage } from '@renderer/features/transcripts/pages/Transcript
 import { AssistantPage } from '@renderer/features/assistant/pages/AssistantPage'
 import { HistoryPage } from '@renderer/features/history/pages/HistoryPage'
 import { SettingsPage } from '@renderer/features/settings/pages/SettingsPage'
+import { AppErrorBoundary } from '@renderer/app/errors/AppErrorBoundary'
 
 export const router = createHashRouter([
   {
     path: '/',
     element: <RootLayout />,
+    errorElement: <AppErrorBoundary />,
+
     children: [
       {
         index: true,

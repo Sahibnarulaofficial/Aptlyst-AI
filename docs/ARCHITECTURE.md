@@ -19,6 +19,30 @@ apps/
 
 ---
 
+## Application Architecture
+
+App
+
+↓
+
+RouterProvider
+
+↓
+
+RootLayout
+
+↓
+
+AppShell
+
+├── Sidebar
+
+├── Header
+
+├── Outlet
+
+└── Status Bar
+
 ## Desktop
 
 Uses the official Electron-Vite architecture.
@@ -40,22 +64,43 @@ Renderer structure:
 renderer/src/
 
 app/
+├── errors/
+├── layouts/
+├── providers/
+├── router/
+└── store/
+
 assets/
+
 components/
-│
 ├── common/
 ├── layout/
 └── ui/
 
 features/
+├── assistant/
+├── command-palette/
+├── dashboard/
+├── history/
+├── keyboard/
+├── meeting/
+├── settings/
+└── transcripts/
+
 hooks/
-layouts/
+
 lib/
+
 pages/
+
 services/
+
 stores/
+
 styles/
+
 types/
+
 utils/
 ```
 
@@ -79,6 +124,10 @@ Lucide React
 
 pnpm Workspace
 
+React Router
+
+Zustand
+
 ---
 
 ## Design Principles
@@ -89,6 +138,19 @@ pnpm Workspace
 - Secure IPC
 - Production-ready
 - Clean Architecture
+
+---
+
+## UI Infrastructure
+
+Reusable application infrastructure:
+
+- Command Registry
+- Keyboard Shortcut Infrastructure
+- Global Command Palette
+- Error Boundary
+- Zustand State Management
+- Shared UI Components
 
 ---
 

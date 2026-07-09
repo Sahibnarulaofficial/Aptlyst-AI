@@ -1,18 +1,22 @@
-import { NavLink } from 'react-router-dom'
-import { PanelLeftClose, PanelLeftOpen } from 'lucide-react'
+import { NavLink, useLocation } from 'react-router-dom'
+import { PanelLeftClose, PanelLeftOpen, Circle } from 'lucide-react'
 
 import { navigation } from '@renderer/lib/navigation'
 import { cn } from '@renderer/lib/cn'
 import { useUIStore } from '@renderer/app/store/uiStore'
 
+import { Tooltip } from '@renderer/components/ui/Tooltip'
+
 export function Sidebar() {
+  const location = useLocation()
+
   const sidebarCollapsed = useUIStore((state) => state.sidebarCollapsed)
 
   const toggleSidebar = useUIStore((state) => state.toggleSidebar)
 
   return (
-    <div className="flex h-full flex-col bg-zinc-950 text-white">
-      {/* Header */}
+    <aside className="flex h-full flex-col bg-zinc-950 text-white">
+      {/* ================= Header ================= */}
       <div className="border-b border-zinc-800 p-4">
         <div
           className={cn(
@@ -20,65 +24,102 @@ export function Sidebar() {
             sidebarCollapsed ? 'justify-center' : 'justify-between'
           )}
         >
-          {!sidebarCollapsed && (
-            <div>
-              <h1 className="text-xl font-bold tracking-tight">Aptlyst AI</h1>
+          {!sidebarCollapsed ? (
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-zinc-800">
+                <Circle size={14} className="fill-emerald-500 text-emerald-500" />
+              </div>
 
-              <p className="mt-1 text-xs text-zinc-400">Meeting Copilot</p>
+              <div>
+                <h1 className="text-lg font-bold tracking-tight">Aptlyst AI</h1>
+
+                <p className="text-xs text-zinc-400">Meeting Copilot</p>
+              </div>
+            </div>
+          ) : (
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-zinc-800">
+              <Circle size={14} className="fill-emerald-500 text-emerald-500" />
             </div>
           )}
-
-          <button
-            onClick={toggleSidebar}
-            className="rounded-lg p-2 text-zinc-400 transition hover:bg-zinc-800 hover:text-white"
-          >
-            {sidebarCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
-          </button>
         </div>
+
+        <button
+          onClick={toggleSidebar}
+          className={cn(
+            'mt-4 flex h-10 w-full items-center rounded-lg border border-zinc-800 text-zinc-400 transition-all duration-200 hover:bg-zinc-900 hover:text-white',
+            sidebarCollapsed ? 'justify-center' : 'justify-start px-3'
+          )}
+        >
+          {sidebarCollapsed ? (
+            <PanelLeftOpen size={18} />
+          ) : (
+            <>
+              <PanelLeftClose size={18} />
+
+              <span className="ml-3 text-sm">Collapse</span>
+            </>
+          )}
+        </button>
       </div>
 
-      {/* Navigation */}
-      <nav className="flex-1 p-3">
+      {/* ================= Navigation ================= */}
+      <nav className="flex-1 px-3 py-4">
         <ul className="space-y-1">
           {navigation.map((item) => {
             const Icon = item.icon
 
+            const isActive = location.pathname === item.path
+
             return (
-              <li key={item.path}>
-                <NavLink
-                  to={item.path}
-                  className={({ isActive }) =>
-                    cn(
-                      'flex items-center rounded-lg px-3 py-2 text-sm transition-colors duration-200',
-                      sidebarCollapsed ? 'justify-center' : 'gap-3',
+              <li key={item.id}>
+                <Tooltip content={item.title} disabled={!sidebarCollapsed}>
+                  <NavLink
+                    to={item.path}
+                    className={cn(
+                      'relative flex items-center rounded-xl transition-all duration-200',
+                      sidebarCollapsed ? 'justify-center px-0 py-3' : 'gap-3 px-3 py-3',
                       isActive
                         ? 'bg-zinc-800 text-white'
                         : 'text-zinc-400 hover:bg-zinc-900 hover:text-white'
-                    )
-                  }
-                >
-                  <Icon size={18} />
+                    )}
+                  >
+                    {isActive && (
+                      <span className="absolute left-0 h-8 w-1 rounded-r-full bg-emerald-500" />
+                    )}
 
-                  {!sidebarCollapsed && <span>{item.title}</span>}
-                </NavLink>
+                    <Icon size={20} className="shrink-0" />
+
+                    {!sidebarCollapsed && (
+                      <span className="truncate text-sm font-medium">{item.title}</span>
+                    )}
+                  </NavLink>
+                </Tooltip>
               </li>
             )
           })}
         </ul>
       </nav>
 
-      {/* Footer */}
-      <div
-        className={cn('border-t border-zinc-800 p-4', sidebarCollapsed && 'flex justify-center')}
-      >
+      {/* ================= Footer ================= */}
+      <div className="border-t border-zinc-800 p-4">
         {!sidebarCollapsed ? (
-          <div>
-            <p className="text-xs text-zinc-500">Local AI Ready</p>
-          </div>
+          <>
+            <div className="flex items-center gap-2">
+              <Circle size={10} className="fill-emerald-500 text-emerald-500" />
+
+              <span className="text-sm font-medium">Local AI</span>
+            </div>
+
+            <p className="mt-2 text-xs text-zinc-500">Offline</p>
+
+            <p className="mt-1 text-xs text-zinc-600">v0.1.0-dev</p>
+          </>
         ) : (
-          <div className="h-2 w-2 rounded-full bg-emerald-500" title="Local AI Ready" />
+          <div className="flex justify-center">
+            <Circle size={12} className="fill-emerald-500 text-emerald-500" />
+          </div>
         )}
       </div>
-    </div>
+    </aside>
   )
 }
