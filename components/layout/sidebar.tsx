@@ -3,6 +3,7 @@ import { Bot } from 'lucide-react';
 import { navItems } from '@/lib/navigation';
 import { createClient } from '@/lib/supabase/server';
 import { LogoutButton } from './logout-button';
+import { OrgSwitcher } from '@/components/organization/org-switcher';
 
 export async function Sidebar() {
   const supabase = await createClient();
@@ -18,7 +19,7 @@ export async function Sidebar() {
 
   return (
     <div className="flex flex-col w-64 border-r border-slate-800 bg-slate-950 h-screen sticky top-0 hidden md:flex shrink-0">
-      <div className="p-6">
+      <div className="p-6 pb-4">
         <div className="flex items-center gap-2">
           <div className="h-8 w-8 rounded-lg bg-blue-600 flex items-center justify-center">
             <Bot className="h-5 w-5 text-white" />
@@ -26,7 +27,8 @@ export async function Sidebar() {
           <span className="text-xl font-bold text-slate-100 tracking-tight">Aptlyst AI</span>
         </div>
       </div>
-      <nav className="flex-1 px-4 space-y-1 overflow-y-auto">
+      <OrgSwitcher />
+      <nav className="flex-1 px-4 py-3 space-y-1 overflow-y-auto">
         {navItems.map((item) => (
           <Link
             key={item.name}

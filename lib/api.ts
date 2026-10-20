@@ -39,17 +39,14 @@ export async function apiFetch<T>(
 
   if (!accessToken) {
     if (typeof window !== 'undefined') {
-      // Browser environment: dynamically import client to avoid SSR issues
-      const { createClient } = await import('@/lib/supabase/client');
-      const supabase = createClient();
-      const { data } = await supabase.auth.getSession();
-      accessToken = data.session?.access_token;
-    } else {
-      // Server environment
-      const { createClient } = await import('@/lib/supabase/server');
-      const supabase = await createClient();
-      const { data } = await supabase.auth.getSession();
-      accessToken = data.session?.access_token;
+      try {
+        const { createClient } = await import('./supabase/client');
+        const supabase = createClient();
+        const { data } = await supabase.auth.getSession();
+        accessToken = data.session?.access_token;
+      } catch {
+        // Fallback if browser client is unavailable
+      }
     }
   }
 

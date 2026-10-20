@@ -32,11 +32,15 @@ export type OrganizationRole = "owner" | "admin" | "member";
 export type Organization = {
   id: string;
   name: string;
-  createdAt: string;
-  updatedAt: string;
+  created_at: string;
+  updated_at: string;
 };
 
-export type OrganizationWithRole = Organization & {
+export type OrganizationWithRole = {
+  id: string;
+  name: string;
   role: OrganizationRole;
+  created_at: string;
+  updated_at: string;
 };
 

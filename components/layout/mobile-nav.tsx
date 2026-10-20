@@ -7,6 +7,7 @@ import { cn } from '@/lib/utils';
 import { navItems } from '@/lib/navigation';
 
 import { LogoutButton } from './logout-button';
+import { OrgSwitcher } from '@/components/organization/org-switcher';
 
 export function MobileNav() {
   const [open, setOpen] = useState(false);
@@ -31,24 +32,27 @@ export function MobileNav() {
 
       {open && (
         <div className="fixed inset-0 top-[73px] z-50 bg-slate-950 border-t border-slate-800 flex flex-col justify-between">
-          <nav className="p-4 space-y-1 overflow-y-auto">
-            {navItems.map((item) => (
-              <Link
-                key={item.name}
-                href={item.href}
-                onClick={() => setOpen(false)}
-                className={cn(
-                  "flex items-center gap-3 px-4 py-3 rounded-md text-base font-medium transition-colors",
-                  pathname === item.href 
-                    ? "bg-slate-900 text-slate-100" 
-                    : "text-slate-400 hover:text-slate-100 hover:bg-slate-900/50"
-                )}
-              >
-                <item.icon className="h-5 w-5" />
-                {item.name}
-              </Link>
-            ))}
-          </nav>
+          <div className="flex-1 overflow-y-auto">
+            <OrgSwitcher />
+            <nav className="p-4 space-y-1">
+              {navItems.map((item) => (
+                <Link
+                  key={item.name}
+                  href={item.href}
+                  onClick={() => setOpen(false)}
+                  className={cn(
+                    "flex items-center gap-3 px-4 py-3 rounded-md text-base font-medium transition-colors",
+                    pathname === item.href
+                      ? "bg-slate-900 text-slate-100"
+                      : "text-slate-400 hover:text-slate-100 hover:bg-slate-900/50"
+                  )}
+                >
+                  <item.icon className="h-5 w-5" />
+                  {item.name}
+                </Link>
+              ))}
+            </nav>
+          </div>
           <div className="p-4 border-t border-slate-800">
             <LogoutButton />
           </div>
