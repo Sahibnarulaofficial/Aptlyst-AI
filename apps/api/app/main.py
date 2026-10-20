@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.health import router as health_router
 from app.api.organizations import router as organizations_router
+from app.api.chatbots import router as chatbots_router
 
 app = FastAPI(title="Aptlyst AI API", version="0.1.0")
 
@@ -19,3 +20,4 @@ app.add_middleware(
 
 app.include_router(health_router)
 app.include_router(organizations_router, prefix="/api/v1")
+app.include_router(chatbots_router, prefix="/api/v1")

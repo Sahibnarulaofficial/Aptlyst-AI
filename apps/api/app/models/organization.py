@@ -17,6 +17,9 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 
+if False:  # TYPE_CHECKING
+    from app.models.chatbot import Chatbot
+
 
 class MemberRole(str, enum.Enum):
     owner = "owner"
@@ -42,6 +45,9 @@ class Organization(Base):
     )
 
     members: Mapped[list["OrganizationMember"]] = relationship(
+        back_populates="organization", cascade="all, delete-orphan"
+    )
+    chatbots: Mapped[list["Chatbot"]] = relationship(
         back_populates="organization", cascade="all, delete-orphan"
     )
 

@@ -13,6 +13,7 @@ from app.db.base import Base
 # Import all models here so Alembic can detect them.
 # As new models are added, import them in this block.
 from app.models.organization import Organization, OrganizationMember  # noqa: F401
+from app.models.chatbot import Chatbot  # noqa: F401
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url)

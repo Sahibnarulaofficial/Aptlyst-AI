@@ -42,7 +42,7 @@ async def test_database_connection_role_bypasses_rls() -> None:
 @pytest.mark.anyio
 async def test_tables_have_rls_enabled() -> None:
     """REAL DATABASE TEST:
-    Verifies that both 'organizations' and 'organization_members' have rowsecurity=True in pg_tables.
+    Verifies that 'organizations', 'organization_members', and 'chatbots' have rowsecurity=True in pg_tables.
     Validates that direct PostgREST client queries are subject to RLS policy enforcement.
     """
     async with AsyncSessionLocal() as session:
@@ -51,7 +51,7 @@ async def test_tables_have_rls_enabled() -> None:
                 """
                 SELECT tablename, rowsecurity
                 FROM pg_tables
-                WHERE schemaname = 'public' AND tablename IN ('organizations', 'organization_members')
+                WHERE schemaname = 'public' AND tablename IN ('organizations', 'organization_members', 'chatbots')
                 ORDER BY tablename;
                 """
             )
@@ -59,8 +59,10 @@ async def test_tables_have_rls_enabled() -> None:
         rows = dict(result.all())
         assert "organizations" in rows, "Table 'organizations' was not found in schema 'public'"
         assert "organization_members" in rows, "Table 'organization_members' was not found in schema 'public'"
+        assert "chatbots" in rows, "Table 'chatbots' was not found in schema 'public'"
         assert rows["organizations"] is True, "Table 'organizations' must have RLS enabled (rowsecurity=True)"
         assert rows["organization_members"] is True, "Table 'organization_members' must have RLS enabled (rowsecurity=True)"
+        assert rows["chatbots"] is True, "Table 'chatbots' must have RLS enabled (rowsecurity=True)"
 
 
 @pytest.mark.anyio
@@ -76,7 +78,7 @@ async def test_untrusted_roles_have_no_direct_table_privileges() -> None:
                 SELECT grantee, table_name, privilege_type
                 FROM information_schema.table_privileges
                 WHERE table_schema = 'public' 
-                  AND table_name IN ('organizations', 'organization_members')
+                  AND table_name IN ('organizations', 'organization_members', 'chatbots')
                   AND grantee IN ('anon', 'authenticated')
                 ORDER BY table_name, grantee, privilege_type;
                 """
