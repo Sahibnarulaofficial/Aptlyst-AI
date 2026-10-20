@@ -58,11 +58,14 @@ def make_es256_token(
     algorithm: str = "ES256",
     include_sub: bool = True,
     include_exp: bool = True,
+    app_metadata: dict | None = None,
 ) -> str:
     payload: dict = {
         "email": email,
         "iat": int(time.time()) - 10,
     }
+    if app_metadata is not None:
+        payload["app_metadata"] = app_metadata
     if include_sub:
         payload["sub"] = user_id if user_id is not None else str(uuid.uuid4())
     if aud is not None:
@@ -93,12 +96,15 @@ def make_token(
     include_sub: bool = True,
     include_exp: bool = True,
     headers: dict | None = None,
+    app_metadata: dict | None = None,
 ) -> str:
     """Helper for generating symmetric HS256 tokens."""
     payload: dict = {
         "email": email,
         "iat": int(time.time()) - 10,
     }
+    if app_metadata is not None:
+        payload["app_metadata"] = app_metadata
     if include_sub:
         payload["sub"] = user_id if user_id is not None else str(uuid.uuid4())
     if aud is not None:
@@ -520,3 +526,55 @@ async def test_server_rejects_none_algorithm_configuration(client: AsyncClient) 
         )
     assert response.status_code == 500
     assert "Insecure JWT algorithm" in response.json().get("detail", "")
+
+
+@pytest.mark.anyio
+async def test_verify_token_defaults_to_free_plan() -> None:
+    """When token has no app_metadata, plan defaults to free and is_paid is False."""
+    from app.auth.dependencies import _verify_token
+
+    token = make_token()
+    with patch("app.auth.dependencies.settings") as mock_settings:
+        mock_settings.supabase_jwt_algorithm = "HS256"
+        mock_settings.supabase_jwt_secret = TEST_JWT_SECRET
+        user = await _verify_token(token)
+
+    assert user.plan == "free"
+    assert user.is_paid is False
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "app_metadata,expected_plan,expected_is_paid",
+    [
+        ({"plan": "pro"}, "pro", True),
+        ({"plan": "enterprise"}, "enterprise", True),
+        ({"plan": "pro", "subscription_status": "active"}, "pro", True),
+        ({"plan": "enterprise", "subscription_status": "trialing"}, "enterprise", True),
+        ({"is_paid": True}, "free", True),
+        ({"plan": "pro", "subscription_status": "canceled"}, "pro", False),
+        ({"plan": "pro", "subscription_status": "past_due"}, "pro", False),
+        ({"plan": "pro", "is_paid": False}, "pro", False),
+        ({"plan": "free", "subscription_status": "active"}, "free", False),
+        ({"plan": "growth"}, "growth", False),
+        ({"plan": "free"}, "free", False),
+        ({"plan": "free", "subscription_status": "canceled"}, "free", False),
+        ({}, "free", False),
+    ],
+)
+async def test_verify_token_extracts_subscription_tier_from_jwt_claims(
+    app_metadata: dict,
+    expected_plan: str,
+    expected_is_paid: bool,
+) -> None:
+    """Extracts plan tier and paid status strictly from verified JWT app_metadata."""
+    from app.auth.dependencies import _verify_token
+
+    token = make_token(app_metadata=app_metadata)
+    with patch("app.auth.dependencies.settings") as mock_settings:
+        mock_settings.supabase_jwt_algorithm = "HS256"
+        mock_settings.supabase_jwt_secret = TEST_JWT_SECRET
+        user = await _verify_token(token)
+
+    assert user.plan == expected_plan
+    assert user.is_paid is expected_is_paid

@@ -4,7 +4,7 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -77,19 +77,22 @@ async def list_organizations(
     ]
 
 
+@router.post("", response_model=OrganizationOut, status_code=status.HTTP_201_CREATED)
 @router.post("/setup", response_model=OrganizationOut, status_code=status.HTTP_201_CREATED)
 async def setup_initial_organization(
     body: OrganizationCreate,
     current_user: AuthenticatedUser,
     db: DbSession,
 ) -> OrganizationOut:
-    """Create the user's first organization and set them as owner.
+    """Create an organization and set the authenticated user as owner.
 
-    Idempotency: if the user already owns an organization, returns 409 Conflict.
-    This prevents accidental duplicate organizations on retries.
+    Business rules:
+    - Free plan: maximum 1 owned organization. Attempting to create a second returns 403 Forbidden.
+    - Paid plan: can create multiple owned organizations.
+    - Non-owner memberships (member, admin) do not count toward this limit.
     """
     # Acquire a transaction-level advisory lock scoped to the user ID to serialize
-    # concurrent initial-setup attempts for the same user (preventing TOCTOU races).
+    # concurrent creation attempts for the same user (preventing TOCTOU races).
     bind = db.get_bind()
     if bind is not None and bind.dialect.name == "postgresql":
         lock_key = int(current_user.id.int % 2147483647)
@@ -99,17 +102,21 @@ async def setup_initial_organization(
         )
 
     try:
-        # Check whether this user already owns any organization
-        existing = await db.execute(
-            select(OrganizationMember).where(
+        # Check count of organizations this user owns (non-owner memberships do not count)
+        owned_count_query = (
+            select(func.count())
+            .select_from(OrganizationMember)
+            .where(
                 OrganizationMember.user_id == current_user.id,
                 OrganizationMember.role == MemberRole.owner,
             )
         )
-        if existing.scalar_one_or_none() is not None:
+        owned_count = (await db.scalar(owned_count_query)) or 0
+
+        if owned_count >= 1 and not current_user.is_paid:
             raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="User already owns an organization",
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Free plan is limited to 1 organization. Upgrade to create more organizations.",
             )
 
         org = Organization(name=body.name)
@@ -126,11 +133,13 @@ async def setup_initial_organization(
         await db.refresh(org)
 
         return OrganizationOut.model_validate(org)
+    except HTTPException:
+        raise
     except IntegrityError:
         await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="User already owns an organization",
+            detail="Conflict creating organization",
         )
 
 

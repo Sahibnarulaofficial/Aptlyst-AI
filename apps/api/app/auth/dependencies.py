@@ -34,6 +34,63 @@ _bearer = HTTPBearer(auto_error=True)
 class CurrentUser:
     id: uuid.UUID
     email: str | None
+    plan: str = "free"
+    is_paid: bool = False
+
+
+# Permitted paid plan tiers. Note: automated subscription management / billing
+# is not yet implemented in this milestone; paid access is currently manually
+# provisioned via Supabase service-role admin metadata.
+PAID_PLANS = frozenset({"pro", "enterprise"})
+INACTIVE_SUBSCRIPTION_STATUSES = frozenset(
+    {"canceled", "past_due", "unpaid", "incomplete", "incomplete_expired"}
+)
+
+
+def determine_user_entitlement(app_metadata: Any) -> tuple[str, bool]:
+    """Derive user plan and paid entitlement strictly from trusted JWT app_metadata.
+
+    NOTE: Billing and automated subscription management (e.g. Stripe checkout/webhooks)
+    are not yet implemented in this milestone; paid access is currently manually
+    provisioned via Supabase service-role admin metadata.
+
+    Single Entitlement Rule:
+    - Fail-closed: If app_metadata is not a dict, default to ('free', False).
+    - Explicit revocation: If `is_paid` is explicitly False or `subscription_status`
+      is inactive ('canceled', 'past_due', 'unpaid', 'incomplete', 'incomplete_expired'),
+      entitlement is False regardless of plan name.
+    - Grant: User is granted paid access if:
+        1. `is_paid` is explicitly True (manual admin override flag), OR
+        2. `plan` is in PAID_PLANS ('pro', 'enterprise') AND `subscription_status`
+           (if provided) is in {'active', 'trialing'}.
+    - Any other plan (including 'free', unknown/unrecognized strings, or missing plan)
+      evaluates to False.
+    """
+    if not isinstance(app_metadata, dict):
+        return "free", False
+
+    raw_plan = str(app_metadata.get("plan", "free")).strip().lower() or "free"
+    is_paid_val = app_metadata.get("is_paid")
+
+    raw_status = app_metadata.get("subscription_status")
+    status_str = str(raw_status).strip().lower() if raw_status is not None else None
+
+    # Explicit revocation:
+    if is_paid_val is False:
+        return raw_plan, False
+
+    if status_str is not None and status_str in INACTIVE_SUBSCRIPTION_STATUSES:
+        return raw_plan, False
+
+    # Positive grants:
+    if is_paid_val is True:
+        return raw_plan, True
+
+    if raw_plan in PAID_PLANS:
+        if status_str is None or status_str in {"active", "trialing"}:
+            return raw_plan, True
+
+    return raw_plan, False
 
 
 class JWKSCache:
@@ -281,9 +338,14 @@ async def _verify_token(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    app_metadata = payload.get("app_metadata")
+    plan, is_paid = determine_user_entitlement(app_metadata)
+
     return CurrentUser(
         id=user_id,
         email=payload.get("email"),
+        plan=plan,
+        is_paid=is_paid,
     )
 
 

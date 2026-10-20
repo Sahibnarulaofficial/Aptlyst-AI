@@ -1,7 +1,7 @@
 'use client';
 
 import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
-import type { OrganizationWithRole } from '@/lib/types';
+import type { Organization, OrganizationWithRole } from '@/lib/types';
 import { listOrganizations, setupOrganization, ApiError } from '@/lib/api';
 
 export interface OrganizationContextType {
@@ -11,7 +11,7 @@ export interface OrganizationContextType {
   isLoading: boolean;
   error: string | null;
   refetchOrganizations: () => Promise<OrganizationWithRole[]>;
-  createOrganization: (name: string) => Promise<void>;
+  createOrganization: (name: string) => Promise<Organization>;
   isCreating: boolean;
   createError: string | null;
   clearCreateError: () => void;
@@ -97,18 +97,25 @@ export function OrganizationProvider({ children }: { children: React.ReactNode }
   }, []);
 
   const createOrg = useCallback(
-    async (name: string): Promise<void> => {
-      if (isCreating) return;
+    async (name: string): Promise<Organization> => {
+      if (isCreating) {
+        throw new Error('An organization creation request is already in progress');
+      }
       setIsCreating(true);
       setCreateError(null);
 
       try {
-        await setupOrganization(name);
-        // Refresh organization list and establish active organization from membership data
+        const created = await setupOrganization(name);
+        // Refresh organization list and establish active organization from newly created org
         await fetchOrgs();
+        if (created?.id) {
+          setCurrentOrgId(created.id);
+        }
+        return created;
       } catch (err: unknown) {
         if (err instanceof ApiError && err.status === 409) {
-          // 409 Conflict: user may already own an org. Refetch to sync state first.
+          // 409 Conflict: user already owns an org (e.g. concurrent onboarding).
+          // Refetch to sync state; only set error if no org was found.
           const refreshed = await fetchOrgs();
           if (refreshed.length === 0) {
             setCreateError(err.message);

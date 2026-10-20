@@ -59,6 +59,9 @@ class OrganizationManager {
     try {
       const created = await setupOrganization(name, 'test-token');
       await this.loadOrganizations();
+      if (created?.id) {
+        this.currentOrgId = created.id;
+      }
       return created;
     } catch (err: unknown) {
       if (err instanceof ApiError && err.status === 409) {
@@ -341,5 +344,349 @@ describe('Organization Context & Tenant Logic (lib/organization-context.tsx)', (
 
     await firstCall;
     assert.equal(manager.isCreating, false);
+  });
+
+  describe('Organization Switcher Logic (components/organization/org-switcher.tsx)', () => {
+    it('manages single-organization display and prevents switching to invalid orgs', async () => {
+      globalThis.fetch = async () => {
+        return new Response(
+          JSON.stringify([
+            {
+              id: 'org-only-1',
+              name: 'PortfolioSite',
+              role: 'owner',
+              created_at: '2026-10-20T10:00:00Z',
+              updated_at: '2026-10-20T10:00:00Z',
+            },
+          ]),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      };
+
+      const manager = new OrganizationManager();
+      await manager.loadOrganizations();
+
+      assert.equal(manager.organizations.length, 1);
+      assert.equal(manager.currentOrg?.id, 'org-only-1');
+      assert.equal(manager.currentOrg?.name, 'PortfolioSite');
+      assert.equal(manager.currentOrg?.role, 'owner');
+
+      // Attempting to select non-existent org does not alter currentOrg
+      manager.selectOrganization('org-fake');
+      assert.equal(manager.currentOrg?.id, 'org-only-1');
+    });
+
+    it('manages multi-organization selection and updates active organization state without duplicating state', async () => {
+      globalThis.fetch = async () => {
+        return new Response(
+          JSON.stringify([
+            {
+              id: 'org-1',
+              name: 'Alpha Corp',
+              role: 'owner',
+              created_at: '2026-10-20T10:00:00Z',
+              updated_at: '2026-10-20T10:00:00Z',
+            },
+            {
+              id: 'org-2',
+              name: 'Beta LLC',
+              role: 'member',
+              created_at: '2026-10-20T11:00:00Z',
+              updated_at: '2026-10-20T11:00:00Z',
+            },
+          ]),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      };
+
+      const manager = new OrganizationManager();
+      await manager.loadOrganizations();
+
+      assert.equal(manager.organizations.length, 2);
+      assert.equal(manager.currentOrg?.id, 'org-1');
+      assert.equal(manager.currentOrg?.role, 'owner');
+
+      // Switch to org-2
+      manager.selectOrganization('org-2');
+      assert.equal(manager.currentOrg?.id, 'org-2');
+      assert.equal(manager.currentOrg?.name, 'Beta LLC');
+      assert.equal(manager.currentOrg?.role, 'member');
+
+      // Switch back to org-1
+      manager.selectOrganization('org-1');
+      assert.equal(manager.currentOrg?.id, 'org-1');
+      assert.equal(manager.currentOrg?.name, 'Alpha Corp');
+    });
+
+    it('creates a new organization, refreshes list, and automatically selects it', async () => {
+      const orgsInBackend = [
+        {
+          id: 'org-1',
+          name: 'PortfolioSite',
+          role: 'owner' as const,
+          created_at: '2026-10-20T10:00:00Z',
+          updated_at: '2026-10-20T10:00:00Z',
+        },
+      ];
+
+      globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method || 'GET';
+
+        if (url.includes('/setup') && method === 'POST') {
+          const body = JSON.parse(String(init?.body || '{}'));
+          const newOrg = {
+            id: 'org-2-new',
+            name: body.name,
+            role: 'owner' as const,
+            created_at: '2026-10-20T12:00:00Z',
+            updated_at: '2026-10-20T12:00:00Z',
+          };
+          orgsInBackend.push(newOrg);
+          return new Response(JSON.stringify(newOrg), {
+            status: 201,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+
+        return new Response(JSON.stringify(orgsInBackend), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      };
+
+      const manager = new OrganizationManager();
+      await manager.loadOrganizations();
+
+      assert.equal(manager.organizations.length, 1);
+      assert.equal(manager.currentOrg?.id, 'org-1');
+
+      // Create new organization through manager
+      const created = await manager.createOrganization('Beta Workspace');
+      assert.equal(created?.name, 'Beta Workspace');
+      assert.equal(created?.id, 'org-2-new');
+
+      // Organization list must be refreshed with 2 orgs
+      assert.equal(manager.organizations.length, 2);
+
+      // The new organization must be automatically selected as currentOrg
+      assert.equal(manager.currentOrg?.id, 'org-2-new');
+      assert.equal(manager.currentOrg?.name, 'Beta Workspace');
+    });
+
+    it('handles organization creation API failure without losing active organization', async () => {
+      globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method || 'GET';
+
+        if (url.includes('/setup') && method === 'POST') {
+          return new Response(
+            JSON.stringify({ detail: 'User already owns an organization' }),
+            { status: 409, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+
+        return new Response(
+          JSON.stringify([
+            {
+              id: 'org-1',
+              name: 'PortfolioSite',
+              role: 'owner' as const,
+              created_at: '2026-10-20T10:00:00Z',
+              updated_at: '2026-10-20T10:00:00Z',
+            },
+          ]),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      };
+
+      const manager = new OrganizationManager();
+      await manager.loadOrganizations();
+      assert.equal(manager.currentOrg?.id, 'org-1');
+
+      // Attempt to create second organization (fails with 409)
+      await assert.rejects(
+        async () => {
+          await manager.createOrganization('Second Site');
+        },
+        (err: unknown) => {
+          assert(err instanceof ApiError);
+          assert.equal(err.status, 409);
+          assert.equal(err.message, 'User already owns an organization');
+          return true;
+        },
+      );
+
+      // Current organization and list must be preserved
+      assert.equal(manager.currentOrg?.id, 'org-1');
+      assert.equal(manager.currentOrg?.name, 'PortfolioSite');
+      assert.equal(manager.organizations.length, 1);
+    });
+
+    it('handles 403 forbidden plan limit error with upgrade message and preserves active organization', async () => {
+      globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method || 'GET';
+
+        if (url.includes('/setup') && method === 'POST') {
+          return new Response(
+            JSON.stringify({
+              detail: 'Free plan is limited to 1 organization. Upgrade to create more organizations.',
+            }),
+            { status: 403, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+
+        return new Response(
+          JSON.stringify([
+            {
+              id: 'org-free-1',
+              name: 'My Free Org',
+              role: 'owner' as const,
+              created_at: '2026-10-20T10:00:00Z',
+              updated_at: '2026-10-20T10:00:00Z',
+            },
+          ]),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      };
+
+      const manager = new OrganizationManager();
+      await manager.loadOrganizations();
+      assert.equal(manager.currentOrg?.id, 'org-free-1');
+      assert.equal(manager.currentOrg?.name, 'My Free Org');
+
+      // Attempt to create second organization on free plan
+      await assert.rejects(
+        async () => {
+          await manager.createOrganization('Second Site');
+        },
+        (err: unknown) => {
+          assert(err instanceof ApiError);
+          assert.equal(err.status, 403);
+          assert.match(err.message, /Free plan is limited to 1 organization/i);
+          assert.match(err.message, /Upgrade to create more organizations/i);
+          return true;
+        },
+      );
+
+      // Verify createError was set with the upgrade detail message
+      assert.equal(
+        manager.createError,
+        'Free plan is limited to 1 organization. Upgrade to create more organizations.',
+      );
+
+      // Current organization and list must remain intact
+      assert.equal(manager.currentOrg?.id, 'org-free-1');
+      assert.equal(manager.organizations.length, 1);
+    });
+
+    it('supports multiple organization creations for users with paid plan', async () => {
+      const backendOrgs: OrganizationWithRole[] = [
+        {
+          id: 'org-paid-1',
+          name: 'Pro Corp 1',
+          role: 'owner',
+          created_at: '2026-10-20T10:00:00Z',
+          updated_at: '2026-10-20T10:00:00Z',
+        },
+      ];
+
+      let orgCounter = 2;
+      globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method || 'GET';
+
+        if (url.includes('/setup') && method === 'POST') {
+          const body = JSON.parse(String(init?.body || '{}'));
+          const newOrg: OrganizationWithRole = {
+            id: `org-paid-${orgCounter++}`,
+            name: body.name,
+            role: 'owner',
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          };
+          backendOrgs.push(newOrg);
+          return new Response(JSON.stringify(newOrg), {
+            status: 201,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+
+        return new Response(JSON.stringify(backendOrgs), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      };
+
+      const manager = new OrganizationManager();
+      await manager.loadOrganizations();
+      assert.equal(manager.organizations.length, 1);
+
+      // Paid user creates second org
+      const second = await manager.createOrganization('Pro Corp 2');
+      assert.equal(second?.name, 'Pro Corp 2');
+      assert.equal(manager.organizations.length, 2);
+      assert.equal(manager.currentOrg?.name, 'Pro Corp 2');
+
+      // Paid user creates third org
+      const third = await manager.createOrganization('Pro Corp 3');
+      assert.equal(third?.name, 'Pro Corp 3');
+      assert.equal(manager.organizations.length, 3);
+      assert.equal(manager.currentOrg?.name, 'Pro Corp 3');
+    });
+
+    it('enforces fail-closed behavior when subscription lookup fails or is unconfirmed for single-org owner', async () => {
+      // Helper simulating client-side entitlement check logic in OrgSwitcher
+      function checkIsLimitReached(
+        orgs: OrganizationWithRole[],
+        isPaid: boolean | null,
+        dialogErr: string | null,
+      ): boolean {
+        const owned = orgs.filter((o) => o.role === 'owner').length;
+        const isOwner = owned >= 1;
+        // Fail-closed rule: if owner and not confirmed paid (null or false), limit is reached
+        return (
+          (isOwner && isPaid !== true) ||
+          Boolean(
+            dialogErr &&
+              (dialogErr.toLowerCase().includes('free plan') ||
+                dialogErr.toLowerCase().includes('upgrade') ||
+                dialogErr.toLowerCase().includes('limit')),
+          )
+        );
+      }
+
+      const ownedOrgs: OrganizationWithRole[] = [
+        {
+          id: 'org-1',
+          name: 'My Owned Org',
+          role: 'owner',
+          created_at: '2026-10-20T10:00:00Z',
+          updated_at: '2026-10-20T10:00:00Z',
+        },
+      ];
+
+      // Case 1: Subscription lookup in progress or failed (isPaid = null) -> limit reached (fail-closed)
+      assert.equal(checkIsLimitReached(ownedOrgs, null, null), true);
+
+      // Case 2: Subscription lookup explicitly confirmed free (isPaid = false) -> limit reached
+      assert.equal(checkIsLimitReached(ownedOrgs, false, null), true);
+
+      // Case 3: Confirmed paid subscription (isPaid = true) -> limit NOT reached
+      assert.equal(checkIsLimitReached(ownedOrgs, true, null), false);
+
+      // Case 4: Zero owned orgs (e.g. member only) even with isPaid = false -> limit NOT reached
+      const memberOrgs: OrganizationWithRole[] = [
+        {
+          id: 'org-member',
+          name: 'Member Org',
+          role: 'member',
+          created_at: '2026-10-20T10:00:00Z',
+          updated_at: '2026-10-20T10:00:00Z',
+        },
+      ];
+      assert.equal(checkIsLimitReached(memberOrgs, false, null), false);
+    });
   });
 });

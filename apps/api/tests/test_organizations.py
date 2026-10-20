@@ -66,7 +66,7 @@ async def test_setup_organization_creates_org_and_owner(client: AsyncClient) -> 
 
 
 @pytest.mark.anyio
-async def test_setup_organization_duplicate_returns_409(client: AsyncClient) -> None:
+async def test_setup_organization_free_plan_limit_returns_403(client: AsyncClient) -> None:
     user_id = uuid.uuid4()
     token = make_token(user_id=str(user_id))
     org_id = None
@@ -88,8 +88,163 @@ async def test_setup_organization_duplicate_returns_409(client: AsyncClient) -> 
                 headers={"Authorization": f"Bearer {token}"},
                 json={"name": "Second Org"},
             )
-            assert r2.status_code == 409
-            assert "already owns an organization" in r2.json()["detail"]
+            assert r2.status_code == 403
+            assert "Free plan is limited to 1 organization" in r2.json()["detail"]
+    finally:
+        if org_id:
+            async with AsyncSessionLocal() as session:
+                await session.execute(delete(Organization).where(Organization.id == org_id))
+                await session.commit()
+
+
+@pytest.mark.anyio
+async def test_setup_organization_paid_plan_allows_multiple_orgs(client: AsyncClient) -> None:
+    """Paid users (e.g. Pro) can create multiple owned organizations."""
+    user_id = uuid.uuid4()
+    token = make_token(user_id=str(user_id), app_metadata={"plan": "pro"})
+    created_org_ids = []
+
+    try:
+        with patch("app.auth.dependencies.settings") as mock_settings:
+            mock_settings.supabase_jwt_algorithm = "HS256"
+            mock_settings.supabase_jwt_secret = TEST_JWT_SECRET
+
+            r1 = await client.post(
+                "/api/v1/organizations/setup",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"name": "Paid Org One"},
+            )
+            assert r1.status_code == 201
+            created_org_ids.append(uuid.UUID(r1.json()["id"]))
+
+            r2 = await client.post(
+                "/api/v1/organizations/setup",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"name": "Paid Org Two"},
+            )
+            assert r2.status_code == 201
+            created_org_ids.append(uuid.UUID(r2.json()["id"]))
+
+            r3 = await client.post(
+                "/api/v1/organizations",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"name": "Paid Org Three"},
+            )
+            assert r3.status_code == 201
+            created_org_ids.append(uuid.UUID(r3.json()["id"]))
+
+        async with AsyncSessionLocal() as session:
+            members = (
+                await session.scalars(
+                    select(OrganizationMember).where(
+                        OrganizationMember.user_id == user_id,
+                        OrganizationMember.role == MemberRole.owner,
+                    )
+                )
+            ).all()
+            assert len(members) == 3
+    finally:
+        if created_org_ids:
+            async with AsyncSessionLocal() as session:
+                for oid in created_org_ids:
+                    await session.execute(delete(Organization).where(Organization.id == oid))
+                await session.commit()
+
+
+@pytest.mark.anyio
+async def test_free_user_non_owner_memberships_do_not_count_towards_limit(
+    client: AsyncClient,
+) -> None:
+    """Non-owner memberships (admin, member) do not count toward the owned organization limit."""
+    owner_user_id = uuid.uuid4()
+    free_user_id = uuid.uuid4()
+    owner_token = make_token(user_id=str(owner_user_id))
+    free_token = make_token(user_id=str(free_user_id))
+    created_org_ids = []
+
+    try:
+        with patch("app.auth.dependencies.settings") as mock_settings:
+            mock_settings.supabase_jwt_algorithm = "HS256"
+            mock_settings.supabase_jwt_secret = TEST_JWT_SECRET
+
+            # 1. First user creates an org
+            r_owner = await client.post(
+                "/api/v1/organizations/setup",
+                headers={"Authorization": f"Bearer {owner_token}"},
+                json={"name": "Owner Org"},
+            )
+            assert r_owner.status_code == 201
+            org1_id = uuid.UUID(r_owner.json()["id"])
+            created_org_ids.append(org1_id)
+
+            # 2. Add free_user as a regular member to Org 1
+            async with AsyncSessionLocal() as session:
+                session.add(
+                    OrganizationMember(
+                        organization_id=org1_id,
+                        user_id=free_user_id,
+                        role=MemberRole.member,
+                    )
+                )
+                await session.commit()
+
+            # 3. Free user creates their 1 allowed owned organization -> should succeed (201)
+            r_free_1 = await client.post(
+                "/api/v1/organizations/setup",
+                headers={"Authorization": f"Bearer {free_token}"},
+                json={"name": "Free User Org"},
+            )
+            assert r_free_1.status_code == 201
+            created_org_ids.append(uuid.UUID(r_free_1.json()["id"]))
+
+            # 4. Free user attempts second owned org -> must fail with 403
+            r_free_2 = await client.post(
+                "/api/v1/organizations/setup",
+                headers={"Authorization": f"Bearer {free_token}"},
+                json={"name": "Free User Org Two"},
+            )
+            assert r_free_2.status_code == 403
+            assert "Free plan is limited to 1 organization" in r_free_2.json()["detail"]
+    finally:
+        if created_org_ids:
+            async with AsyncSessionLocal() as session:
+                for oid in created_org_ids:
+                    await session.execute(delete(Organization).where(Organization.id == oid))
+                await session.commit()
+
+
+@pytest.mark.anyio
+async def test_frontend_payload_cannot_spoof_paid_plan(client: AsyncClient) -> None:
+    """Extra fields in the request body (e.g. plan='pro', is_paid=True) are ignored."""
+    user_id = uuid.uuid4()
+    token = make_token(user_id=str(user_id))
+    org_id = None
+
+    try:
+        with patch("app.auth.dependencies.settings") as mock_settings:
+            mock_settings.supabase_jwt_algorithm = "HS256"
+            mock_settings.supabase_jwt_secret = TEST_JWT_SECRET
+
+            r1 = await client.post(
+                "/api/v1/organizations/setup",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"name": "Legit Org"},
+            )
+            assert r1.status_code == 201
+            org_id = uuid.UUID(r1.json()["id"])
+
+            # Attempt to bypass limit by sending spoofed plan fields in request payload
+            r2 = await client.post(
+                "/api/v1/organizations/setup",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "name": "Spoofed Org",
+                    "plan": "pro",
+                    "is_paid": True,
+                },
+            )
+            assert r2.status_code == 403
+            assert "Free plan is limited to 1 organization" in r2.json()["detail"]
     finally:
         if org_id:
             async with AsyncSessionLocal() as session:
@@ -124,7 +279,7 @@ async def test_setup_organization_concurrency_race_condition(client: AsyncClient
 
         status_codes = [res1.status_code, res2.status_code]
         assert 201 in status_codes, f"Expected at least one 201, got {status_codes}"
-        assert 409 in status_codes, f"Expected at least one 409, got {status_codes}"
+        assert 403 in status_codes, f"Expected at least one 403, got {status_codes}"
 
         for r in (res1, res2):
             if r.status_code == 201:
