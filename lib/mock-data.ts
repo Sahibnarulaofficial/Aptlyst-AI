@@ -1,6 +1,6 @@
-import { Chatbot, Conversation, Lead } from './types';
+import { MockChatbot, Conversation, Lead } from './types';
 
-export const mockChatbots: Chatbot[] = [
+export const mockChatbots: MockChatbot[] = [
   {
     id: "bot_1",
     name: "Customer Support Bot",

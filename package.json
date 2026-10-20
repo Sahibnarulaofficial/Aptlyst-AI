@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --experimental-strip-types --test tests/redirect.test.ts tests/api.test.ts tests/organization.test.ts"
+    "test": "node --experimental-strip-types --test tests/redirect.test.ts tests/api.test.ts tests/organization.test.ts tests/chatbots.test.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.5.2",

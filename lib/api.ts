@@ -1,4 +1,9 @@
-import type { Organization, OrganizationWithRole } from '@/lib/types';
+import type {
+  Chatbot,
+  ChatbotCreateInput,
+  Organization,
+  OrganizationWithRole,
+} from '@/lib/types';
 
 /**
  * Frontend-to-backend API client for Aptlyst AI.
@@ -130,6 +135,41 @@ export async function updateOrganization(
   return apiFetch<Organization>(`/api/v1/organizations/${orgId}`, {
     method: 'PATCH',
     body: JSON.stringify({ name }),
+    token,
+  });
+}
+
+// ─── Chatbot API Methods ─────────────────────────────────────────────────────
+
+export async function listChatbots(
+  orgId: string,
+  token?: string,
+): Promise<Chatbot[]> {
+  return apiFetch<Chatbot[]>(`/api/v1/organizations/${orgId}/chatbots`, {
+    method: 'GET',
+    token,
+  });
+}
+
+export async function createChatbot(
+  orgId: string,
+  payload: ChatbotCreateInput,
+  token?: string,
+): Promise<Chatbot> {
+  return apiFetch<Chatbot>(`/api/v1/organizations/${orgId}/chatbots`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+    token,
+  });
+}
+
+export async function getChatbot(
+  orgId: string,
+  botId: string,
+  token?: string,
+): Promise<Chatbot> {
+  return apiFetch<Chatbot>(`/api/v1/organizations/${orgId}/chatbots/${botId}`, {
+    method: 'GET',
     token,
   });
 }

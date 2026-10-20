@@ -2,12 +2,18 @@
 
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { ArrowLeft, Save } from 'lucide-react';
+import { ArrowLeft, Save, AlertCircle } from 'lucide-react';
 import Link from 'next/link';
+import { useOrganization } from '@/lib/organization-context';
+import { createChatbot, ApiError } from '@/lib/api';
+import type { ChatbotCreateInput } from '@/lib/types';
 
 export default function NewChatbotPage() {
   const router = useRouter();
-  const [isLoading, setIsLoading] = useState(false);
+  const { currentOrg } = useOrganization();
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
   const [formData, setFormData] = useState({
     name: '',
     websiteUrl: '',
@@ -17,23 +23,59 @@ export default function NewChatbotPage() {
     instructions: '',
   });
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setIsLoading(true);
-    
-    // Simulate network delay and mock creation
-    setTimeout(() => {
-      // In a real app, we'd make an API call here.
-      // For this milestone, just mock a new ID and redirect.
-      const newId = `bot_new_${Date.now()}`;
-      router.push(`/chatbots/${newId}`);
-    }, 600);
+    if (isSubmitting) return;
+
+    if (!currentOrg?.id) {
+      setError('No active organization selected. Please select or create an organization first.');
+      return;
+    }
+
+    const trimmedName = formData.name.trim();
+    if (!trimmedName) {
+      setError('Chatbot name is required.');
+      return;
+    }
+
+    const trimmedUrl = formData.websiteUrl.trim();
+    if (trimmedUrl && !trimmedUrl.startsWith('http://') && !trimmedUrl.startsWith('https://')) {
+      setError('Website URL must start with http:// or https://');
+      return;
+    }
+
+    setIsSubmitting(true);
+    setError(null);
+
+    const payload: ChatbotCreateInput = {
+      name: trimmedName,
+      description: formData.description.trim() || null,
+      website_url: trimmedUrl || null,
+      welcome_message: formData.welcomeMessage.trim() || null,
+      instructions: formData.instructions.trim() || null,
+      primary_color: formData.primaryColor || '#3b82f6',
+      status: 'draft',
+    };
+
+    try {
+      const createdBot = await createChatbot(currentOrg.id, payload);
+      router.push(`/chatbots/${createdBot.id}`);
+    } catch (err: unknown) {
+      const message =
+        err instanceof ApiError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : 'Failed to create chatbot';
+      setError(message);
+      setIsSubmitting(false);
+    }
   };
 
   return (
     <div className="p-8 max-w-4xl mx-auto space-y-8">
       <div className="flex items-center gap-4">
-        <Link 
+        <Link
           href="/chatbots"
           className="inline-flex items-center justify-center h-10 w-10 rounded-lg text-slate-400 hover:text-slate-100 hover:bg-slate-900 transition-colors"
         >
@@ -46,16 +88,24 @@ export default function NewChatbotPage() {
       </div>
 
       <form onSubmit={handleSubmit} className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden">
+        {error && (
+          <div className="p-4 mx-6 mt-6 bg-red-950/40 border border-red-800/60 rounded-lg flex items-center gap-3 text-red-300 text-sm">
+            <AlertCircle className="h-5 w-5 shrink-0 text-red-400" />
+            <span>{error}</span>
+          </div>
+        )}
+
         <div className="p-6 sm:p-8 space-y-8">
-          
           {/* Basic Info */}
           <div className="space-y-4 border-b border-slate-800 pb-8">
             <h2 className="text-lg font-medium text-slate-200">Basic Information</h2>
-            
+
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
               <div className="space-y-2">
-                <label htmlFor="name" className="text-sm font-medium text-slate-300">Chatbot Name *</label>
-                <input 
+                <label htmlFor="name" className="text-sm font-medium text-slate-300">
+                  Chatbot Name *
+                </label>
+                <input
                   id="name"
                   required
                   value={formData.name}
@@ -65,8 +115,10 @@ export default function NewChatbotPage() {
                 />
               </div>
               <div className="space-y-2">
-                <label htmlFor="websiteUrl" className="text-sm font-medium text-slate-300">Website URL</label>
-                <input 
+                <label htmlFor="websiteUrl" className="text-sm font-medium text-slate-300">
+                  Website URL
+                </label>
+                <input
                   id="websiteUrl"
                   type="url"
                   value={formData.websiteUrl}
@@ -78,8 +130,10 @@ export default function NewChatbotPage() {
             </div>
 
             <div className="space-y-2">
-              <label htmlFor="description" className="text-sm font-medium text-slate-300">Description</label>
-              <input 
+              <label htmlFor="description" className="text-sm font-medium text-slate-300">
+                Description
+              </label>
+              <input
                 id="description"
                 value={formData.description}
                 onChange={(e) => setFormData({ ...formData, description: e.target.value })}
@@ -92,10 +146,12 @@ export default function NewChatbotPage() {
           {/* Behavior & Appearance */}
           <div className="space-y-4">
             <h2 className="text-lg font-medium text-slate-200">Behavior & Appearance</h2>
-            
+
             <div className="space-y-2">
-              <label htmlFor="welcomeMessage" className="text-sm font-medium text-slate-300">Welcome Message</label>
-              <input 
+              <label htmlFor="welcomeMessage" className="text-sm font-medium text-slate-300">
+                Welcome Message
+              </label>
+              <input
                 id="welcomeMessage"
                 value={formData.welcomeMessage}
                 onChange={(e) => setFormData({ ...formData, welcomeMessage: e.target.value })}
@@ -105,8 +161,10 @@ export default function NewChatbotPage() {
             </div>
 
             <div className="space-y-2">
-              <label htmlFor="instructions" className="text-sm font-medium text-slate-300">Basic Instructions</label>
-              <textarea 
+              <label htmlFor="instructions" className="text-sm font-medium text-slate-300">
+                Basic Instructions
+              </label>
+              <textarea
                 id="instructions"
                 rows={4}
                 value={formData.instructions}
@@ -117,9 +175,11 @@ export default function NewChatbotPage() {
             </div>
 
             <div className="space-y-2">
-              <label htmlFor="primaryColor" className="text-sm font-medium text-slate-300">Primary Brand Color</label>
+              <label htmlFor="primaryColor" className="text-sm font-medium text-slate-300">
+                Primary Brand Color
+              </label>
               <div className="flex items-center gap-3">
-                <input 
+                <input
                   id="primaryColor"
                   type="color"
                   value={formData.primaryColor}
@@ -130,22 +190,23 @@ export default function NewChatbotPage() {
               </div>
             </div>
           </div>
-
         </div>
-        
+
         <div className="p-6 bg-slate-900/50 border-t border-slate-800 flex justify-end gap-3">
-          <Link 
+          <Link
             href="/chatbots"
             className="px-4 py-2 text-sm font-medium text-slate-300 hover:text-white transition-colors"
           >
             Cancel
           </Link>
-          <button 
+          <button
             type="submit"
-            disabled={isLoading}
+            disabled={isSubmitting || !currentOrg}
             className="inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-6 py-2 rounded-lg font-medium transition-colors text-sm"
           >
-            {isLoading ? 'Creating...' : (
+            {isSubmitting ? (
+              'Creating...'
+            ) : (
               <>
                 <Save className="h-4 w-4" />
                 Create Chatbot

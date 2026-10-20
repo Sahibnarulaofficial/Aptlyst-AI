@@ -1,8 +1,37 @@
+export type ChatbotStatus = 'draft' | 'active' | 'inactive';
+
 export type Chatbot = {
+  id: string;
+  organization_id: string;
+  name: string;
+  description: string | null;
+  website_url: string | null;
+  welcome_message: string | null;
+  instructions: string | null;
+  primary_color: string | null;
+  status: ChatbotStatus;
+  conversations_count: number;
+  leads_count: number;
+  last_active: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ChatbotCreateInput = {
+  name: string;
+  description?: string | null;
+  website_url?: string | null;
+  welcome_message?: string | null;
+  instructions?: string | null;
+  primary_color?: string | null;
+  status?: ChatbotStatus;
+};
+
+export type MockChatbot = {
   id: string;
   name: string;
   description: string;
-  status: "active" | "draft" | "inactive";
+  status: 'active' | 'draft' | 'inactive';
   conversationsCount: number;
   leadsCount: number;
   lastActive: string;
@@ -43,4 +72,3 @@ export type OrganizationWithRole = {
   created_at: string;
   updated_at: string;
 };
-
