@@ -597,5 +597,71 @@ describe('Chatbot Management Frontend Integration', () => {
         '/chatbots/[id]/page.tsx must not use bot_new_ mock IDs',
       );
     });
+
+    it('verifies dashboard and recent activity do not import or use mock data', () => {
+      const dashboardSource = readFileSync(
+        resolve(__dirname, '../app/(app)/dashboard/page.tsx'),
+        'utf-8',
+      );
+      const activitySource = readFileSync(
+        resolve(__dirname, '../components/dashboard/recent-activity.tsx'),
+        'utf-8',
+      );
+
+      assert.equal(
+        dashboardSource.includes('@/lib/mock-data'),
+        false,
+        'app/(app)/dashboard/page.tsx must not import @/lib/mock-data',
+      );
+      assert.equal(
+        dashboardSource.includes('getDashboardStats'),
+        false,
+        'app/(app)/dashboard/page.tsx must not reference getDashboardStats',
+      );
+      assert.equal(
+        activitySource.includes('@/lib/mock-data'),
+        false,
+        'components/dashboard/recent-activity.tsx must not import @/lib/mock-data',
+      );
+      assert.equal(
+        activitySource.includes('mockConversations'),
+        false,
+        'components/dashboard/recent-activity.tsx must not reference mockConversations',
+      );
+      assert.equal(
+        activitySource.includes('mockChatbots'),
+        false,
+        'components/dashboard/recent-activity.tsx must not reference mockChatbots',
+      );
+
+      // Verify dashboard uses real organization-scoped API and displays honest placeholders
+      assert.equal(
+        dashboardSource.includes('useOrganization'),
+        true,
+        'app/(app)/dashboard/page.tsx must use useOrganization for tenant scoping',
+      );
+      assert.equal(
+        dashboardSource.includes('listChatbots'),
+        true,
+        'app/(app)/dashboard/page.tsx must query listChatbots for real chatbot count',
+      );
+      assert.equal(
+        dashboardSource.includes('Analytics not yet available'),
+        true,
+        'app/(app)/dashboard/page.tsx must display honest placeholder for conversations',
+      );
+      assert.equal(
+        dashboardSource.includes('Lead tracking not yet available'),
+        true,
+        'app/(app)/dashboard/page.tsx must display honest placeholder for leads',
+      );
+
+      // Verify recent activity shows honest empty state
+      assert.equal(
+        activitySource.includes('No conversations yet'),
+        true,
+        'components/dashboard/recent-activity.tsx must display honest empty state',
+      );
+    });
   });
 });

@@ -1,11 +1,73 @@
+'use client';
+
+import { useState, useEffect } from 'react';
+import Link from 'next/link';
+import { Bot, MessageSquare, Users, Plus, Loader2 } from 'lucide-react';
 import { StatCard } from '@/components/dashboard/stat-card';
 import { RecentActivity } from '@/components/dashboard/recent-activity';
-import { getDashboardStats } from '@/lib/mock-data';
-import { Bot, MessageSquare, Users, Plus } from 'lucide-react';
-import Link from 'next/link';
+import { useOrganization } from '@/lib/organization-context';
+import { listChatbots } from '@/lib/api';
 
 export default function DashboardPage() {
-  const stats = getDashboardStats();
+  const { currentOrg } = useOrganization();
+  const [chatbotCount, setChatbotCount] = useState<number | null>(null);
+  const [isLoading, setIsLoading] = useState<boolean>(Boolean(currentOrg?.id));
+
+  // Synchronize state during render when organization changes (prevents stale leaks)
+  const [prevOrgId, setPrevOrgId] = useState(currentOrg?.id);
+  if (prevOrgId !== currentOrg?.id) {
+    setPrevOrgId(currentOrg?.id);
+    setChatbotCount(null);
+    setIsLoading(Boolean(currentOrg?.id));
+  }
+
+  useEffect(() => {
+    if (!currentOrg?.id) {
+      return;
+    }
+
+    const orgId = currentOrg.id;
+    let ignore = false;
+
+    async function load(targetOrgId: string) {
+      try {
+        const data = await listChatbots(targetOrgId);
+        if (!ignore) {
+          setChatbotCount(data.length);
+        }
+      } catch {
+        if (!ignore) {
+          setChatbotCount(null);
+        }
+      } finally {
+        if (!ignore) {
+          setIsLoading(false);
+        }
+      }
+    }
+
+    load(orgId);
+
+    return () => {
+      ignore = true;
+    };
+  }, [currentOrg?.id]);
+
+  const chatbotDisplayValue = isLoading ? (
+    <Loader2 className="h-7 w-7 animate-spin text-blue-500 my-0.5" />
+  ) : chatbotCount !== null ? (
+    chatbotCount
+  ) : (
+    '—'
+  );
+
+  const chatbotDescription = isLoading
+    ? 'Loading chatbots…'
+    : chatbotCount !== null
+      ? chatbotCount === 1
+        ? '1 active or drafted bot'
+        : `${chatbotCount} active and drafted bots`
+      : 'Active and drafted bots';
 
   return (
     <div className="p-8 max-w-7xl mx-auto space-y-8">
@@ -26,21 +88,21 @@ export default function DashboardPage() {
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
         <StatCard
           title="Total Chatbots"
-          value={stats.totalChatbots}
+          value={chatbotDisplayValue}
           icon={<Bot className="h-5 w-5" />}
-          description="Active and drafted bots"
+          description={chatbotDescription}
         />
         <StatCard
           title="Total Conversations"
-          value={stats.totalConversations}
+          value="—"
           icon={<MessageSquare className="h-5 w-5" />}
-          description="Across all your chatbots"
+          description="Analytics not yet available"
         />
         <StatCard
           title="Total Leads"
-          value={stats.totalLeads}
+          value="—"
           icon={<Users className="h-5 w-5" />}
-          description="Captured contact details"
+          description="Lead tracking not yet available"
         />
       </div>
 
@@ -58,7 +120,7 @@ export default function DashboardPage() {
             href="/chatbots/new"
             className="inline-flex items-center gap-2 bg-slate-100 hover:bg-white text-slate-900 px-4 py-2 rounded-lg font-medium transition-colors text-sm"
           >
-            Create another chatbot
+            Create chatbot
           </Link>
         </div>
       </div>
