@@ -8,6 +8,7 @@ import {
   createChatbot,
   getChatbot,
   updateChatbot,
+  deleteChatbot,
   ApiError,
 } from '../lib/api.ts';
 import type { Chatbot, ChatbotCreateInput, ChatbotUpdateInput, ChatbotStatus } from '../lib/types.ts';
@@ -25,11 +26,13 @@ class ChatbotListController {
   isLoading = false;
   error: string | null = null;
   activeOrgId: string | null = null;
+  deletedMessage: string | null = null;
 
   async setOrganization(orgId: string | null): Promise<void> {
     // Clear previous organization's data immediately to prevent stale cross-tenant leakage
     this.chatbots = [];
     this.error = null;
+    this.deletedMessage = null;
     this.activeOrgId = orgId;
 
     if (!orgId) {
@@ -153,6 +156,21 @@ class ChatbotDetailController {
   isSaving = false;
   saveError: string | null = null;
   saveSuccess = false;
+  isDeleteDialogOpen = false;
+  isDeleting = false;
+  deleteError: string | null = null;
+  navigatedTo: string | null = null;
+
+  openDeleteDialog(): void {
+    this.deleteError = null;
+    this.isDeleteDialogOpen = true;
+  }
+
+  cancelDeleteDialog(): void {
+    if (this.isDeleting) return;
+    this.deleteError = null;
+    this.isDeleteDialogOpen = false;
+  }
 
   async loadDetail(orgId: string | null, botId: string | null): Promise<void> {
     // Clear previous chatbot state immediately
@@ -161,6 +179,10 @@ class ChatbotDetailController {
     this.isNotFound = false;
     this.saveError = null;
     this.saveSuccess = false;
+    this.isDeleteDialogOpen = false;
+    this.isDeleting = false;
+    this.deleteError = null;
+    this.navigatedTo = null;
     this.activeOrgId = orgId;
     this.activeBotId = botId;
 
@@ -280,6 +302,30 @@ class ChatbotDetailController {
       return null;
     } finally {
       this.isSaving = false;
+    }
+  }
+
+  async delete(orgId: string | null, botId: string | null): Promise<boolean> {
+    if (this.isDeleting || !this.bot || !orgId || !botId) return false;
+
+    this.isDeleting = true;
+    this.deleteError = null;
+
+    try {
+      await deleteChatbot(orgId, botId);
+      this.isDeleteDialogOpen = false;
+      this.navigatedTo = '/chatbots';
+      return true;
+    } catch (err: unknown) {
+      this.deleteError =
+        err instanceof ApiError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : 'Failed to delete chatbot';
+      return false;
+    } finally {
+      this.isDeleting = false;
     }
   }
 }
@@ -455,6 +501,49 @@ describe('Chatbot Management Frontend Integration', () => {
         },
       );
     });
+
+    it('deleteChatbot calls DELETE /api/v1/organizations/{org_id}/chatbots/{bot_id} and handles 204 No Content', async () => {
+      let capturedUrl = '';
+      let capturedMethod = '';
+      let capturedAuth = '';
+
+      globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        capturedUrl = String(input);
+        capturedMethod = init?.method || '';
+        const headers = init?.headers as Headers | undefined;
+        capturedAuth = headers?.get('Authorization') || '';
+        return new Response(null, {
+          status: 204,
+        });
+      };
+
+      await deleteChatbot('org-123', 'bot-456', 'test-token');
+      assert.equal(
+        capturedUrl,
+        'http://localhost:8000/api/v1/organizations/org-123/chatbots/bot-456',
+      );
+      assert.equal(capturedMethod, 'DELETE');
+      assert.equal(capturedAuth, 'Bearer test-token');
+    });
+
+    it('deleteChatbot throws ApiError on failure', async () => {
+      globalThis.fetch = async () => {
+        return new Response(JSON.stringify({ detail: 'Chatbot not found' }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      };
+
+      await assert.rejects(
+        () => deleteChatbot('org-123', 'bot-456'),
+        (err: unknown) => {
+          assert.ok(err instanceof ApiError);
+          assert.equal(err.status, 404);
+          assert.equal(err.message, 'Chatbot not found');
+          return true;
+        },
+      );
+    });
   });
 
   describe('Chatbot List Flow (/chatbots)', () => {
@@ -582,6 +671,24 @@ describe('Chatbot Management Frontend Integration', () => {
       // Stale response must NOT overwrite org-fast data!
       assert.equal(controller.chatbots.length, 1);
       assert.equal(controller.chatbots[0].name, 'Fast Bot');
+    });
+
+    it('displays deletion feedback message and clears on organization switch', async () => {
+      const controller = new ChatbotListController();
+      controller.deletedMessage = 'Chatbot "Sales Bot" was successfully deleted.';
+
+      assert.equal(controller.deletedMessage, 'Chatbot "Sales Bot" was successfully deleted.');
+
+      globalThis.fetch = async () => {
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      };
+
+      // When switching organization, feedback is reset immediately
+      await controller.setOrganization('org-bbb');
+      assert.equal(controller.deletedMessage, null);
     });
   });
 
@@ -920,6 +1027,95 @@ describe('Chatbot Management Frontend Integration', () => {
 
       const firstSaveResult = await firstSavePromise;
       assert.equal(firstSaveResult?.name, 'First Save');
+    });
+
+    it('requires confirmation dialog before deleting and leaves chatbot untouched if canceled', async () => {
+      const controller = new ChatbotDetailController();
+      controller.bot = { ...mockApiChatbot };
+
+      assert.equal(controller.isDeleteDialogOpen, false);
+      controller.openDeleteDialog();
+      assert.equal(controller.isDeleteDialogOpen, true);
+
+      // User cancels dialog
+      controller.cancelDeleteDialog();
+      assert.equal(controller.isDeleteDialogOpen, false);
+      assert.equal(controller.navigatedTo, null);
+      assert.notEqual(controller.bot, null);
+    });
+
+    it('successfully deletes chatbot, closes dialog, and navigates back to /chatbots', async () => {
+      let capturedMethod = '';
+      globalThis.fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
+        capturedMethod = init?.method || '';
+        return new Response(null, { status: 204 });
+      };
+
+      const controller = new ChatbotDetailController();
+      controller.bot = { ...mockApiChatbot };
+      controller.openDeleteDialog();
+
+      const success = await controller.delete('org-aaa', mockApiChatbot.id);
+      assert.equal(success, true);
+      assert.equal(capturedMethod, 'DELETE');
+      assert.equal(controller.isDeleteDialogOpen, false);
+      assert.equal(controller.deleteError, null);
+      assert.equal(controller.navigatedTo, '/chatbots');
+    });
+
+    it('handles delete API failure with error in dialog and prevents navigation', async () => {
+      globalThis.fetch = async () => {
+        return new Response(JSON.stringify({ detail: 'Failed to delete chatbot' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      };
+
+      const controller = new ChatbotDetailController();
+      controller.bot = { ...mockApiChatbot };
+      controller.openDeleteDialog();
+
+      const success = await controller.delete('org-aaa', mockApiChatbot.id);
+      assert.equal(success, false);
+      assert.equal(controller.isDeleteDialogOpen, true);
+      assert.equal(controller.deleteError, 'Failed to delete chatbot');
+      assert.equal(controller.navigatedTo, null);
+      assert.equal(controller.isDeleting, false);
+    });
+
+    it('prevents concurrent duplicate deletion submissions while deletion is in flight', async () => {
+      let resolveFirstFetch: (res: Response) => void;
+      const firstFetchPromise = new Promise<Response>((resolve) => {
+        resolveFirstFetch = resolve;
+      });
+
+      globalThis.fetch = async () => firstFetchPromise;
+
+      const controller = new ChatbotDetailController();
+      controller.bot = { ...mockApiChatbot };
+      controller.openDeleteDialog();
+
+      const firstDeletePromise = controller.delete('org-aaa', mockApiChatbot.id);
+      const secondDeleteResult = await controller.delete('org-aaa', mockApiChatbot.id);
+
+      assert.equal(secondDeleteResult, false, 'Second delete must be rejected while first is in-flight');
+
+      resolveFirstFetch!(new Response(null, { status: 204 }));
+      const firstResult = await firstDeletePromise;
+      assert.equal(firstResult, true);
+    });
+
+    it('safely handles organization switching during deletion flow', async () => {
+      const controller = new ChatbotDetailController();
+      controller.bot = { ...mockApiChatbot };
+      controller.openDeleteDialog();
+      assert.equal(controller.isDeleteDialogOpen, true);
+
+      // Switching organization resets delete dialog state and prevents deleting in wrong tenant
+      await controller.loadDetail('org-bbb', 'bot-2');
+      assert.equal(controller.isDeleteDialogOpen, false);
+      assert.equal(controller.deleteError, null);
+      assert.equal(controller.navigatedTo, null);
     });
   });
 

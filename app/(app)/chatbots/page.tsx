@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import Link from 'next/link';
-import { Plus, Search, Bot, ArrowRight, Loader2, AlertCircle } from 'lucide-react';
+import { Plus, Search, Bot, ArrowRight, Loader2, AlertCircle, CheckCircle2, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useOrganization } from '@/lib/organization-context';
 import { listChatbots, ApiError } from '@/lib/api';
@@ -14,6 +14,20 @@ export default function ChatbotsPage() {
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState<string>('');
+  const [deletedMessage, setDeletedMessage] = useState<string | null>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const deletedName = sessionStorage.getItem('aptlyst_deleted_bot');
+        if (deletedName) {
+          sessionStorage.removeItem('aptlyst_deleted_bot');
+          return `Chatbot "${deletedName}" was successfully deleted.`;
+        }
+      } catch {
+        // sessionStorage unavailable
+      }
+    }
+    return null;
+  });
 
   // Adjust state during render when organization changes (React idiomatic pattern)
   const [prevOrgId, setPrevOrgId] = useState(currentOrg?.id);
@@ -21,6 +35,7 @@ export default function ChatbotsPage() {
     setPrevOrgId(currentOrg?.id);
     setChatbots([]);
     setError(null);
+    setDeletedMessage(null);
     setIsLoading(Boolean(currentOrg?.id));
   }
 
@@ -107,6 +122,23 @@ export default function ChatbotsPage() {
           Create Chatbot
         </Link>
       </div>
+
+      {deletedMessage && (
+        <div className="p-4 bg-emerald-950/30 border border-emerald-800/50 rounded-xl flex items-center justify-between gap-3 text-emerald-300 text-sm">
+          <div className="flex items-center gap-2.5">
+            <CheckCircle2 className="h-5 w-5 shrink-0 text-emerald-400" />
+            <span>{deletedMessage}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setDeletedMessage(null)}
+            className="text-emerald-400 hover:text-emerald-200 p-1 rounded-md transition-colors"
+            aria-label="Dismiss message"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
 
       <div className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden">
         <div className="p-4 border-b border-slate-800 flex items-center gap-4">

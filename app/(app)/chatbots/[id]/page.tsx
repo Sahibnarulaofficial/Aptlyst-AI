@@ -2,6 +2,7 @@
 
 import { useState, useEffect, use, useCallback } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import {
   ArrowLeft,
   Bot,
@@ -20,10 +21,12 @@ import {
   Settings as SettingsIcon,
   Sparkles,
   Sliders,
+  Trash2,
+  X,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useOrganization } from '@/lib/organization-context';
-import { getChatbot, updateChatbot, ApiError } from '@/lib/api';
+import { getChatbot, updateChatbot, deleteChatbot, ApiError } from '@/lib/api';
 import type { Chatbot, ChatbotStatus, ChatbotUpdateInput } from '@/lib/types';
 
 const TABS = [
@@ -39,6 +42,7 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
   const resolvedParams = use(params);
   const botId = resolvedParams.id;
   const { currentOrg } = useOrganization();
+  const router = useRouter();
 
   const [activeTab, setActiveTab] = useState('overview');
   const [copied, setCopied] = useState(false);
@@ -61,6 +65,11 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
 
+  // Delete modal state
+  const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   // Adjust state during render when organization or botId changes (React idiomatic pattern)
   const currentKey = `${currentOrg?.id}:${botId}`;
   const [prevKey, setPrevKey] = useState(currentKey);
@@ -71,6 +80,9 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
     setIsNotFound(false);
     setSaveError(null);
     setSaveSuccess(false);
+    setIsDeleteDialogOpen(false);
+    setIsDeleting(false);
+    setDeleteError(null);
     setIsLoading(Boolean(currentOrg?.id && botId));
   }
 
@@ -236,6 +248,40 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
       setSaveSuccess(false);
     } finally {
       setIsSaving(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (isDeleting || !bot || !currentOrg?.id) return;
+
+    const targetOrgId = currentOrg.id;
+    const targetBotId = bot.id;
+    const deletedName = bot.name;
+
+    setIsDeleting(true);
+    setDeleteError(null);
+
+    try {
+      await deleteChatbot(targetOrgId, targetBotId);
+      if (typeof window !== 'undefined') {
+        try {
+          sessionStorage.setItem('aptlyst_deleted_bot', deletedName);
+        } catch {
+          // sessionStorage may fail in private browsing
+        }
+      }
+      setIsDeleteDialogOpen(false);
+      router.push('/chatbots');
+    } catch (err: unknown) {
+      const message =
+        err instanceof ApiError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : 'Failed to delete chatbot';
+      setDeleteError(message);
+    } finally {
+      setIsDeleting(false);
     }
   };
 
@@ -580,7 +626,8 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
 
           {/* SETTINGS TAB */}
           {activeTab === 'settings' && (
-            <form onSubmit={handleSave} className="max-w-4xl space-y-6">
+            <div className="max-w-4xl space-y-8">
+              <form onSubmit={handleSave} className="space-y-6">
               <div className="flex items-center justify-between">
                 <div>
                   <h2 className="text-lg font-medium text-slate-100 flex items-center gap-2">
@@ -874,7 +921,36 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
                 </button>
               </div>
             </form>
-          )}
+
+            {/* Danger Zone */}
+            <div className="pt-6 border-t border-slate-800">
+              <div className="border border-red-900/40 bg-red-950/10 rounded-xl p-6 sm:p-8 space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+                  <div className="space-y-1">
+                    <h3 className="text-xs font-semibold uppercase tracking-wider text-red-400">
+                      Danger Zone
+                    </h3>
+                    <p className="text-sm font-medium text-slate-200">Delete this chatbot</p>
+                    <p className="text-xs text-slate-400 max-w-xl leading-relaxed">
+                      Once deleted, this chatbot and all of its configuration will be permanently removed. This action cannot be undone.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDeleteError(null);
+                      setIsDeleteDialogOpen(true);
+                    }}
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-red-400 hover:text-red-300 bg-red-950/40 hover:bg-red-900/40 border border-red-800/60 transition-colors shrink-0"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                    <span>Delete Chatbot</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
           {/* INTEGRATE TAB */}
           {activeTab === 'integrate' && (
@@ -929,6 +1005,109 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
           )}
         </div>
       </div>
+
+      {/* Delete Confirmation Dialog */}
+      {isDeleteDialogOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="delete-dialog-title"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
+          onClick={(e) => {
+            if (e.target === e.currentTarget && !isDeleting) {
+              setIsDeleteDialogOpen(false);
+              setDeleteError(null);
+            }
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape' && !isDeleting) {
+              setIsDeleteDialogOpen(false);
+              setDeleteError(null);
+            }
+          }}
+        >
+          <div className="w-full max-w-md bg-slate-950 border border-slate-800 rounded-xl p-6 shadow-2xl space-y-5 animate-in fade-in-50 zoom-in-95 duration-150">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="h-9 w-9 rounded-lg bg-red-950/50 border border-red-800/60 flex items-center justify-center text-red-400">
+                  <Trash2 className="h-5 w-5" />
+                </div>
+                <div>
+                  <h2 id="delete-dialog-title" className="text-base font-semibold text-slate-100">
+                    Delete Chatbot
+                  </h2>
+                  <p className="text-xs text-slate-400">Permanently delete this agent</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!isDeleting) {
+                    setIsDeleteDialogOpen(false);
+                    setDeleteError(null);
+                  }
+                }}
+                disabled={isDeleting}
+                className="text-slate-400 hover:text-slate-200 p-1.5 rounded-lg transition-colors disabled:opacity-50"
+                aria-label="Close dialog"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {deleteError && (
+              <div
+                role="alert"
+                className="p-3 bg-red-950/40 border border-red-800/60 rounded-lg flex items-start gap-2.5 text-red-300 text-xs"
+              >
+                <AlertCircle className="h-4 w-4 shrink-0 text-red-400 mt-0.5" />
+                <span>{deleteError}</span>
+              </div>
+            )}
+
+            <div className="space-y-2 text-sm text-slate-300">
+              <p>
+                Are you sure you want to delete <span className="font-semibold text-slate-100">&ldquo;{bot?.name}&rdquo;</span>?
+              </p>
+              <p className="text-xs text-slate-400 leading-relaxed">
+                This action is irreversible. All configuration, prompt instructions, branding, and status settings for this chatbot will be permanently removed.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-3 pt-2 border-t border-slate-800/80">
+              <button
+                type="button"
+                onClick={() => {
+                  setIsDeleteDialogOpen(false);
+                  setDeleteError(null);
+                }}
+                disabled={isDeleting}
+                className="px-4 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-900 transition-colors disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleDelete}
+                disabled={isDeleting}
+                className="inline-flex items-center gap-2 bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg font-medium transition-colors text-sm disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+              >
+                {isDeleting ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    <span>Deleting…</span>
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="h-4 w-4" />
+                    <span>Delete Chatbot</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

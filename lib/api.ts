@@ -187,3 +187,14 @@ export async function updateChatbot(
     token,
   });
 }
+
+export async function deleteChatbot(
+  orgId: string,
+  botId: string,
+  token?: string,
+): Promise<void> {
+  return apiFetch<void>(`/api/v1/organizations/${orgId}/chatbots/${botId}`, {
+    method: 'DELETE',
+    token,
+  });
+}

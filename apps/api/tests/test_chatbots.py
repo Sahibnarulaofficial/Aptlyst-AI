@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from app.db.session import AsyncSessionLocal
 from app.main import app
@@ -301,6 +301,12 @@ async def test_chatbot_unauthenticated_requests_rejected(client: AsyncClient) ->
         json={"name": "New Name"},
     )
     assert res_no_auth_patch.status_code == 403
+
+    # Unauthenticated DELETE -> 403 Forbidden
+    res_no_auth_del = await client.delete(
+        f"/api/v1/organizations/{random_org}/chatbots/{uuid.uuid4()}",
+    )
+    assert res_no_auth_del.status_code == 403
 
 
 @pytest.mark.anyio
@@ -679,6 +685,237 @@ async def test_chatbot_color_validation_consistency_and_editing_regression(
             )
             assert res_empty_color.status_code == 200
             assert res_empty_color.json()["primary_color"] == "#3b82f6"
+    finally:
+        if org_id:
+            async with AsyncSessionLocal() as session:
+                await session.execute(delete(Organization).where(Organization.id == org_id))
+                await session.commit()
+
+
+@pytest.mark.anyio
+async def test_delete_chatbot_successful_and_cross_tenant_isolation(
+    client: AsyncClient,
+) -> None:
+    """Verifies successful 204 deletion, 404 for deleted or nonexistent bot, and cross-tenant isolation."""
+    user_a = uuid.uuid4()
+    user_b = uuid.uuid4()
+    token_a = make_token(user_id=str(user_a))
+    token_b = make_token(user_id=str(user_b))
+    org_a_id = None
+    org_b_id = None
+
+    try:
+        with patch("app.auth.dependencies.settings") as mock_settings:
+            mock_settings.supabase_jwt_algorithm = "HS256"
+            mock_settings.supabase_jwt_secret = TEST_JWT_SECRET
+
+            # Setup Org A with two bots
+            res_org_a = await client.post(
+                "/api/v1/organizations/setup",
+                headers={"Authorization": f"Bearer {token_a}"},
+                json={"name": "Org A Delete"},
+            )
+            assert res_org_a.status_code == 201
+            org_a_id = uuid.UUID(res_org_a.json()["id"])
+
+            res_bot_1 = await client.post(
+                f"/api/v1/organizations/{org_a_id}/chatbots",
+                headers={"Authorization": f"Bearer {token_a}"},
+                json={"name": "Bot 1"},
+            )
+            assert res_bot_1.status_code == 201
+            bot_1_id = res_bot_1.json()["id"]
+
+            res_bot_2 = await client.post(
+                f"/api/v1/organizations/{org_a_id}/chatbots",
+                headers={"Authorization": f"Bearer {token_a}"},
+                json={"name": "Bot 2"},
+            )
+            assert res_bot_2.status_code == 201
+            bot_2_id = res_bot_2.json()["id"]
+
+            # 1. Delete Bot 1 -> 204 No Content
+            res_del_1 = await client.delete(
+                f"/api/v1/organizations/{org_a_id}/chatbots/{bot_1_id}",
+                headers={"Authorization": f"Bearer {token_a}"},
+            )
+            assert res_del_1.status_code == 204
+            assert res_del_1.content == b""
+
+            # 2. GET on deleted Bot 1 -> 404 Not Found
+            res_get_del = await client.get(
+                f"/api/v1/organizations/{org_a_id}/chatbots/{bot_1_id}",
+                headers={"Authorization": f"Bearer {token_a}"},
+            )
+            assert res_get_del.status_code == 404
+            assert res_get_del.json()["detail"] == "Not found"
+
+            # 3. Listing chatbots in Org A only returns Bot 2
+            res_list = await client.get(
+                f"/api/v1/organizations/{org_a_id}/chatbots",
+                headers={"Authorization": f"Bearer {token_a}"},
+            )
+            assert res_list.status_code == 200
+            bots = res_list.json()
+            assert len(bots) == 1
+            assert bots[0]["id"] == bot_2_id
+
+            # 4. Subsequent deletion of Bot 1 -> 404 Not Found
+            res_del_again = await client.delete(
+                f"/api/v1/organizations/{org_a_id}/chatbots/{bot_1_id}",
+                headers={"Authorization": f"Bearer {token_a}"},
+            )
+            assert res_del_again.status_code == 404
+
+            # 5. Delete nonexistent random bot -> 404 Not Found
+            random_bot = uuid.uuid4()
+            res_del_random = await client.delete(
+                f"/api/v1/organizations/{org_a_id}/chatbots/{random_bot}",
+                headers={"Authorization": f"Bearer {token_a}"},
+            )
+            assert res_del_random.status_code == 404
+
+            # 6. Cross-tenant isolation: Setup Org B for User B
+            res_org_b = await client.post(
+                "/api/v1/organizations/setup",
+                headers={"Authorization": f"Bearer {token_b}"},
+                json={"name": "Org B Delete"},
+            )
+            assert res_org_b.status_code == 201
+            org_b_id = uuid.UUID(res_org_b.json()["id"])
+
+            # User B attempts to delete Bot 2 in Org A using Org A path -> 404
+            res_cross_a = await client.delete(
+                f"/api/v1/organizations/{org_a_id}/chatbots/{bot_2_id}",
+                headers={"Authorization": f"Bearer {token_b}"},
+            )
+            assert res_cross_a.status_code == 404
+
+            # User B attempts to delete Bot 2 using Org B path -> 404 (scoped to org)
+            res_cross_b = await client.delete(
+                f"/api/v1/organizations/{org_b_id}/chatbots/{bot_2_id}",
+                headers={"Authorization": f"Bearer {token_b}"},
+            )
+            assert res_cross_b.status_code == 404
+
+            # Verify Bot 2 still exists and is untouched in Org A
+            res_bot_2_check = await client.get(
+                f"/api/v1/organizations/{org_a_id}/chatbots/{bot_2_id}",
+                headers={"Authorization": f"Bearer {token_a}"},
+            )
+            assert res_bot_2_check.status_code == 200
+            assert res_bot_2_check.json()["name"] == "Bot 2"
+    finally:
+        async with AsyncSessionLocal() as session:
+            if org_a_id:
+                await session.execute(delete(Organization).where(Organization.id == org_a_id))
+            if org_b_id:
+                await session.execute(delete(Organization).where(Organization.id == org_b_id))
+            await session.commit()
+
+
+@pytest.mark.anyio
+async def test_delete_chatbot_roles_and_transaction_safety(
+    client: AsyncClient,
+) -> None:
+    """Verifies role authorization (member, admin, owner can delete; outsider rejected) and transaction safety."""
+    user_owner = uuid.uuid4()
+    user_admin = uuid.uuid4()
+    user_member = uuid.uuid4()
+    user_outsider = uuid.uuid4()
+
+    token_owner = make_token(user_id=str(user_owner))
+    token_admin = make_token(user_id=str(user_admin))
+    token_member = make_token(user_id=str(user_member))
+    token_outsider = make_token(user_id=str(user_outsider))
+    org_id = None
+
+    try:
+        with patch("app.auth.dependencies.settings") as mock_settings:
+            mock_settings.supabase_jwt_algorithm = "HS256"
+            mock_settings.supabase_jwt_secret = TEST_JWT_SECRET
+
+            # Setup Org
+            res_org = await client.post(
+                "/api/v1/organizations/setup",
+                headers={"Authorization": f"Bearer {token_owner}"},
+                json={"name": "Role Org"},
+            )
+            assert res_org.status_code == 201
+            org_id = uuid.UUID(res_org.json()["id"])
+
+            # Add admin and member
+            async with AsyncSessionLocal() as session:
+                session.add(
+                    OrganizationMember(
+                        organization_id=org_id,
+                        user_id=user_admin,
+                        role=MemberRole.admin,
+                    )
+                )
+                session.add(
+                    OrganizationMember(
+                        organization_id=org_id,
+                        user_id=user_member,
+                        role=MemberRole.member,
+                    )
+                )
+                await session.commit()
+
+            # Create 4 bots
+            bot_ids = []
+            for i in range(1, 5):
+                res_create = await client.post(
+                    f"/api/v1/organizations/{org_id}/chatbots",
+                    headers={"Authorization": f"Bearer {token_owner}"},
+                    json={"name": f"Bot {i}"},
+                )
+                assert res_create.status_code == 201
+                bot_ids.append(res_create.json()["id"])
+
+            # 1. Member deletes Bot 1 -> 204
+            res_del_member = await client.delete(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_ids[0]}",
+                headers={"Authorization": f"Bearer {token_member}"},
+            )
+            assert res_del_member.status_code == 204
+
+            # 2. Admin deletes Bot 2 -> 204
+            res_del_admin = await client.delete(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_ids[1]}",
+                headers={"Authorization": f"Bearer {token_admin}"},
+            )
+            assert res_del_admin.status_code == 204
+
+            # 3. Owner deletes Bot 3 -> 204
+            res_del_owner = await client.delete(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_ids[2]}",
+                headers={"Authorization": f"Bearer {token_owner}"},
+            )
+            assert res_del_owner.status_code == 204
+
+            # 4. Outsider attempts to delete Bot 4 -> 404 Not Found
+            res_del_outsider = await client.delete(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_ids[3]}",
+                headers={"Authorization": f"Bearer {token_outsider}"},
+            )
+            assert res_del_outsider.status_code == 404
+
+            # Bot 4 still exists
+            res_get_4 = await client.get(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_ids[3]}",
+                headers={"Authorization": f"Bearer {token_owner}"},
+            )
+            assert res_get_4.status_code == 200
+
+            # 5. Schema check: deleting chatbots leaves organization and members intact
+            async with AsyncSessionLocal() as session:
+                org_check = await session.get(Organization, org_id)
+                assert org_check is not None
+                members_result = await session.execute(
+                    select(OrganizationMember).where(OrganizationMember.organization_id == org_id)
+                )
+                assert len(members_result.scalars().all()) == 3
     finally:
         if org_id:
             async with AsyncSessionLocal() as session:

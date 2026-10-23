@@ -3,7 +3,7 @@
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -198,3 +198,32 @@ async def update_chatbot(
         created_at=bot.created_at,
         updated_at=bot.updated_at,
     )
+
+
+@router.delete("/{bot_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_chatbot(
+    org_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    current_user: AuthenticatedUser,
+    db: DbSession,
+) -> Response:
+    """Delete a chatbot scoped to the specified organization.
+
+    Requires member role or higher in the organization. Returns 404 if not found or non-member.
+    """
+    await _require_org_role(org_id, current_user.id, db, minimum_role=MemberRole.member)
+
+    result = await db.execute(
+        select(Chatbot).where(
+            Chatbot.id == bot_id,
+            Chatbot.organization_id == org_id,
+        )
+    )
+    bot = result.scalar_one_or_none()
+    if bot is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+    await db.delete(bot)
+    await db.commit()
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
