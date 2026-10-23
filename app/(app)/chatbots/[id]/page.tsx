@@ -13,18 +13,25 @@ import {
   MessageSquare,
   Loader2,
   AlertCircle,
+  Save,
+  RotateCcw,
+  CheckCircle2,
+  Info,
+  Settings as SettingsIcon,
+  Sparkles,
+  Sliders,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useOrganization } from '@/lib/organization-context';
-import { getChatbot, ApiError } from '@/lib/api';
-import type { Chatbot } from '@/lib/types';
+import { getChatbot, updateChatbot, ApiError } from '@/lib/api';
+import type { Chatbot, ChatbotStatus, ChatbotUpdateInput } from '@/lib/types';
 
 const TABS = [
   { id: 'overview', label: 'Overview' },
+  { id: 'settings', label: 'Settings' },
   { id: 'knowledge', label: 'Knowledge' },
   { id: 'conversations', label: 'Conversations' },
   { id: 'leads', label: 'Leads' },
-  { id: 'appearance', label: 'Appearance' },
   { id: 'integrate', label: 'Integrate' },
 ];
 
@@ -40,6 +47,20 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
   const [error, setError] = useState<string | null>(null);
   const [isNotFound, setIsNotFound] = useState<boolean>(false);
 
+  // Form state for editing
+  const [formData, setFormData] = useState({
+    name: '',
+    status: 'draft' as ChatbotStatus,
+    description: '',
+    websiteUrl: '',
+    welcomeMessage: '',
+    instructions: '',
+    primaryColor: '#3b82f6',
+  });
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saveSuccess, setSaveSuccess] = useState(false);
+
   // Adjust state during render when organization or botId changes (React idiomatic pattern)
   const currentKey = `${currentOrg?.id}:${botId}`;
   const [prevKey, setPrevKey] = useState(currentKey);
@@ -48,8 +69,25 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
     setBot(null);
     setError(null);
     setIsNotFound(false);
+    setSaveError(null);
+    setSaveSuccess(false);
     setIsLoading(Boolean(currentOrg?.id && botId));
   }
+
+  const applyBotData = useCallback((data: Chatbot) => {
+    setBot(data);
+    setFormData({
+      name: data.name,
+      status: data.status,
+      description: data.description || '',
+      websiteUrl: data.website_url || '',
+      welcomeMessage: data.welcome_message || '',
+      instructions: data.instructions || '',
+      primaryColor: data.primary_color || '#3b82f6',
+    });
+    setSaveError(null);
+    setSaveSuccess(false);
+  }, []);
 
   const fetchBot = useCallback(
     async (orgId: string, id: string) => {
@@ -58,7 +96,7 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
         setError(null);
         setIsNotFound(false);
         const data = await getChatbot(orgId, id);
-        setBot(data);
+        applyBotData(data);
       } catch (err: unknown) {
         if (err instanceof ApiError && err.status === 404) {
           setIsNotFound(true);
@@ -75,7 +113,7 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
         setIsLoading(false);
       }
     },
-    [],
+    [applyBotData],
   );
 
   useEffect(() => {
@@ -89,7 +127,7 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
       try {
         const data = await getChatbot(targetOrgId, targetBotId);
         if (!ignore) {
-          setBot(data);
+          applyBotData(data);
         }
       } catch (err: unknown) {
         if (!ignore) {
@@ -117,11 +155,87 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
     return () => {
       ignore = true;
     };
-  }, [currentOrg?.id, botId]);
+  }, [currentOrg?.id, botId, applyBotData]);
 
   const handleRetry = () => {
     if (currentOrg?.id && botId) {
       fetchBot(currentOrg.id, botId);
+    }
+  };
+
+  const isDirty = Boolean(
+    bot &&
+      (formData.name !== bot.name ||
+        formData.status !== bot.status ||
+        formData.description !== (bot.description || '') ||
+        formData.websiteUrl !== (bot.website_url || '') ||
+        formData.welcomeMessage !== (bot.welcome_message || '') ||
+        formData.instructions !== (bot.instructions || '') ||
+        formData.primaryColor !== (bot.primary_color || '#3b82f6')),
+  );
+
+  const handleResetForm = () => {
+    if (!bot) return;
+    setFormData({
+      name: bot.name,
+      status: bot.status,
+      description: bot.description || '',
+      websiteUrl: bot.website_url || '',
+      welcomeMessage: bot.welcome_message || '',
+      instructions: bot.instructions || '',
+      primaryColor: bot.primary_color || '#3b82f6',
+    });
+    setSaveError(null);
+    setSaveSuccess(false);
+  };
+
+  const handleSave = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (isSaving || !bot || !currentOrg?.id) return;
+
+    const trimmedName = formData.name.trim();
+    if (!trimmedName) {
+      setSaveError('Chatbot name is required.');
+      setSaveSuccess(false);
+      return;
+    }
+
+    const trimmedUrl = formData.websiteUrl.trim();
+    if (trimmedUrl && !trimmedUrl.startsWith('http://') && !trimmedUrl.startsWith('https://')) {
+      setSaveError('Website URL must start with http:// or https://');
+      setSaveSuccess(false);
+      return;
+    }
+
+    setIsSaving(true);
+    setSaveError(null);
+    setSaveSuccess(false);
+
+    const payload: ChatbotUpdateInput = {
+      name: trimmedName,
+      status: formData.status,
+      description: formData.description.trim() || null,
+      website_url: trimmedUrl || null,
+      welcome_message: formData.welcomeMessage.trim() || null,
+      instructions: formData.instructions.trim() || null,
+      primary_color: formData.primaryColor || '#3b82f6',
+    };
+
+    try {
+      const updated = await updateChatbot(currentOrg.id, bot.id, payload);
+      applyBotData(updated);
+      setSaveSuccess(true);
+    } catch (err: unknown) {
+      const message =
+        err instanceof ApiError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : 'Failed to update chatbot';
+      setSaveError(message);
+      setSaveSuccess(false);
+    } finally {
+      setIsSaving(false);
     }
   };
 
@@ -232,7 +346,7 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div className="flex items-center gap-4">
               <div
-                className="h-12 w-12 rounded-lg flex items-center justify-center shrink-0"
+                className="h-12 w-12 rounded-lg flex items-center justify-center shrink-0 transition-colors"
                 style={{ backgroundColor: bot.primary_color || '#1e293b' }}
               >
                 <Bot className="h-6 w-6 text-white" />
@@ -242,20 +356,22 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
                   {bot.name}
                   <span
                     className={cn(
-                      'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border',
+                      'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border capitalize',
                       bot.status === 'active'
                         ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
-                        : 'bg-slate-800 text-slate-400 border-slate-700',
+                        : bot.status === 'inactive'
+                          ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                          : 'bg-slate-800 text-slate-400 border-slate-700',
                     )}
                   >
-                    {bot.status.charAt(0).toUpperCase() + bot.status.slice(1)}
+                    {bot.status}
                   </span>
                 </h1>
                 <p className="text-slate-400 text-sm mt-1">{bot.description || 'No description provided'}</p>
               </div>
             </div>
 
-            <div className="flex gap-3">
+            <div className="flex items-center gap-3">
               {bot.website_url && (
                 <a
                   href={bot.website_url}
@@ -266,6 +382,16 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
                   <ExternalLink className="h-4 w-4" />
                   View Site
                 </a>
+              )}
+              {activeTab !== 'settings' && (
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('settings')}
+                  className="inline-flex items-center gap-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 px-4 py-2 rounded-lg font-medium transition-colors text-sm"
+                >
+                  <SettingsIcon className="h-4 w-4" />
+                  Edit Settings
+                </button>
               )}
             </div>
           </div>
@@ -283,6 +409,9 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
                 )}
               >
                 {tab.label}
+                {tab.id === 'settings' && isDirty && (
+                  <span className="ml-1.5 inline-block h-2 w-2 rounded-full bg-amber-400" title="Unsaved changes" />
+                )}
                 {activeTab === tab.id && (
                   <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-blue-500 rounded-t-full" />
                 )}
@@ -295,8 +424,43 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-6 sm:p-8">
         <div className="max-w-7xl mx-auto">
+          {/* OVERVIEW TAB */}
           {activeTab === 'overview' && (
             <div className="space-y-6">
+              {/* Status explanation alert */}
+              {bot.status === 'active' ? (
+                <div className="p-4 bg-emerald-950/20 border border-emerald-800/40 rounded-xl flex items-start gap-3">
+                  <CheckCircle2 className="h-5 w-5 text-emerald-400 shrink-0 mt-0.5" />
+                  <div className="text-sm">
+                    <p className="font-medium text-emerald-300">Status: Active</p>
+                    <p className="text-slate-400 text-xs mt-0.5 leading-relaxed">
+                      Chatbot configuration is active and saved. Website deployment will be activated once the public widget service milestone is released.
+                    </p>
+                  </div>
+                </div>
+              ) : bot.status === 'inactive' ? (
+                <div className="p-4 bg-amber-950/20 border border-amber-800/40 rounded-xl flex items-start gap-3">
+                  <AlertCircle className="h-5 w-5 text-amber-400 shrink-0 mt-0.5" />
+                  <div className="text-sm">
+                    <p className="font-medium text-amber-300">Status: Inactive</p>
+                    <p className="text-slate-400 text-xs mt-0.5 leading-relaxed">
+                      This chatbot is disabled. You can re-activate it anytime in Settings.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div className="p-4 bg-slate-900/60 border border-slate-800 rounded-xl flex items-start gap-3">
+                  <Info className="h-5 w-5 text-slate-400 shrink-0 mt-0.5" />
+                  <div className="text-sm">
+                    <p className="font-medium text-slate-300">Status: Draft</p>
+                    <p className="text-slate-400 text-xs mt-0.5 leading-relaxed">
+                      Chatbot is in drafting mode. Configure prompts and instructions in Settings before activating.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* Stat cards */}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                 <div className="bg-slate-950 border border-slate-800 rounded-xl p-6">
                   <div className="flex items-center gap-3 text-slate-400 mb-2">
@@ -323,9 +487,396 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
                   <p className="text-xs text-slate-500 mt-1">Activity tracking not yet available</p>
                 </div>
               </div>
+
+              {/* Saved Configuration Inspector */}
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div className="bg-slate-950 border border-slate-800 rounded-xl p-6 space-y-4">
+                  <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                    <div className="flex items-center gap-2 text-slate-200 font-medium">
+                      <Sparkles className="h-4 w-4 text-blue-400" />
+                      <span>Prompts & Instructions</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('settings')}
+                      className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
+                    >
+                      Edit
+                    </button>
+                  </div>
+
+                  <div className="space-y-3 text-sm">
+                    <div>
+                      <span className="text-xs text-slate-500 font-medium uppercase tracking-wider block mb-1">
+                        Welcome Message
+                      </span>
+                      <div className="p-3 bg-slate-900 border border-slate-800 rounded-lg text-slate-300 text-xs italic">
+                        {bot.welcome_message ? `"${bot.welcome_message}"` : 'No welcome message configured'}
+                      </div>
+                    </div>
+
+                    <div>
+                      <span className="text-xs text-slate-500 font-medium uppercase tracking-wider block mb-1">
+                        System Instructions
+                      </span>
+                      <div className="p-3 bg-slate-900 border border-slate-800 rounded-lg text-slate-300 text-xs font-mono whitespace-pre-wrap max-h-48 overflow-y-auto">
+                        {bot.instructions || 'No instructions configured'}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-slate-950 border border-slate-800 rounded-xl p-6 space-y-4">
+                  <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                    <div className="flex items-center gap-2 text-slate-200 font-medium">
+                      <Sliders className="h-4 w-4 text-blue-400" />
+                      <span>Details & Appearance</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('settings')}
+                      className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
+                    >
+                      Edit
+                    </button>
+                  </div>
+
+                  <div className="space-y-3 text-sm">
+                    <div className="flex items-center justify-between py-1.5 border-b border-slate-900">
+                      <span className="text-xs text-slate-400">Website URL</span>
+                      <span className="text-xs text-slate-200 font-mono truncate max-w-[240px]">
+                        {bot.website_url || '—'}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between py-1.5 border-b border-slate-900">
+                      <span className="text-xs text-slate-400">Primary Color</span>
+                      <div className="flex items-center gap-2">
+                        <div
+                          className="h-4 w-4 rounded-full border border-slate-700"
+                          style={{ backgroundColor: bot.primary_color || '#3b82f6' }}
+                        />
+                        <span className="text-xs text-slate-200 font-mono">
+                          {bot.primary_color || '#3b82f6'}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-between py-1.5 border-b border-slate-900">
+                      <span className="text-xs text-slate-400">Created</span>
+                      <span className="text-xs text-slate-400">
+                        {new Date(bot.created_at).toLocaleDateString()}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between py-1.5">
+                      <span className="text-xs text-slate-400">Last Updated</span>
+                      <span className="text-xs text-slate-400">
+                        {new Date(bot.updated_at).toLocaleDateString()}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
             </div>
           )}
 
+          {/* SETTINGS TAB */}
+          {activeTab === 'settings' && (
+            <form onSubmit={handleSave} className="max-w-4xl space-y-6">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h2 className="text-lg font-medium text-slate-100 flex items-center gap-2">
+                    <span>Chatbot Settings</span>
+                    {isDirty && (
+                      <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                        Unsaved changes
+                      </span>
+                    )}
+                  </h2>
+                  <p className="text-sm text-slate-400 mt-0.5">
+                    Configure your chatbot identity, prompts, brand styling, and status.
+                  </p>
+                </div>
+              </div>
+
+              {saveSuccess && (
+                <div className="p-4 bg-emerald-950/30 border border-emerald-800/50 rounded-xl flex items-center gap-3 text-emerald-300 text-sm">
+                  <CheckCircle2 className="h-5 w-5 shrink-0 text-emerald-400" />
+                  <span>Chatbot settings saved successfully.</span>
+                </div>
+              )}
+
+              {saveError && (
+                <div className="p-4 bg-red-950/40 border border-red-800/60 rounded-xl flex items-center gap-3 text-red-300 text-sm">
+                  <AlertCircle className="h-5 w-5 shrink-0 text-red-400" />
+                  <span>{saveError}</span>
+                </div>
+              )}
+
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-6 sm:p-8 space-y-8">
+                {/* Status & Lifecycle */}
+                <div className="space-y-4 border-b border-slate-800 pb-8">
+                  <h3 className="text-sm font-medium text-slate-200 uppercase tracking-wider">
+                    Status & Visibility
+                  </h3>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <label
+                      className={cn(
+                        'flex flex-col gap-1 p-4 rounded-xl border cursor-pointer transition-all',
+                        formData.status === 'draft'
+                          ? 'bg-slate-900 border-blue-500/50 ring-1 ring-blue-500/20'
+                          : 'bg-slate-950 border-slate-800 hover:border-slate-700',
+                      )}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-semibold text-slate-200">Draft</span>
+                        <input
+                          type="radio"
+                          name="status"
+                          value="draft"
+                          checked={formData.status === 'draft'}
+                          onChange={() => {
+                            setFormData((prev) => ({ ...prev, status: 'draft' }));
+                            setSaveSuccess(false);
+                          }}
+                          className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-slate-700 bg-slate-900"
+                        />
+                      </div>
+                      <p className="text-xs text-slate-500 mt-1 leading-relaxed">
+                        Internal testing only. Chatbot is being drafted.
+                      </p>
+                    </label>
+
+                    <label
+                      className={cn(
+                        'flex flex-col gap-1 p-4 rounded-xl border cursor-pointer transition-all',
+                        formData.status === 'active'
+                          ? 'bg-slate-900 border-blue-500/50 ring-1 ring-blue-500/20'
+                          : 'bg-slate-950 border-slate-800 hover:border-slate-700',
+                      )}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-semibold text-emerald-400">Active</span>
+                        <input
+                          type="radio"
+                          name="status"
+                          value="active"
+                          checked={formData.status === 'active'}
+                          onChange={() => {
+                            setFormData((prev) => ({ ...prev, status: 'active' }));
+                            setSaveSuccess(false);
+                          }}
+                          className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-slate-700 bg-slate-900"
+                        />
+                      </div>
+                      <p className="text-xs text-slate-500 mt-1 leading-relaxed">
+                        Configuration is active. Public website embed in preview.
+                      </p>
+                    </label>
+
+                    <label
+                      className={cn(
+                        'flex flex-col gap-1 p-4 rounded-xl border cursor-pointer transition-all',
+                        formData.status === 'inactive'
+                          ? 'bg-slate-900 border-blue-500/50 ring-1 ring-blue-500/20'
+                          : 'bg-slate-950 border-slate-800 hover:border-slate-700',
+                      )}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-semibold text-amber-400">Inactive</span>
+                        <input
+                          type="radio"
+                          name="status"
+                          value="inactive"
+                          checked={formData.status === 'inactive'}
+                          onChange={() => {
+                            setFormData((prev) => ({ ...prev, status: 'inactive' }));
+                            setSaveSuccess(false);
+                          }}
+                          className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-slate-700 bg-slate-900"
+                        />
+                      </div>
+                      <p className="text-xs text-slate-500 mt-1 leading-relaxed">
+                        Disabled. Will not process any visitor interactions.
+                      </p>
+                    </label>
+                  </div>
+                </div>
+
+                {/* Basic Information */}
+                <div className="space-y-4 border-b border-slate-800 pb-8">
+                  <h3 className="text-sm font-medium text-slate-200 uppercase tracking-wider">
+                    Basic Information
+                  </h3>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+                    <div className="space-y-2">
+                      <label htmlFor="edit-name" className="text-sm font-medium text-slate-300">
+                        Chatbot Name *
+                      </label>
+                      <input
+                        id="edit-name"
+                        required
+                        maxLength={255}
+                        value={formData.name}
+                        onChange={(e) => {
+                          setFormData((prev) => ({ ...prev, name: e.target.value }));
+                          setSaveSuccess(false);
+                          if (saveError) setSaveError(null);
+                        }}
+                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all"
+                      />
+                    </div>
+
+                    <div className="space-y-2">
+                      <label htmlFor="edit-websiteUrl" className="text-sm font-medium text-slate-300">
+                        Website URL
+                      </label>
+                      <input
+                        id="edit-websiteUrl"
+                        type="url"
+                        maxLength={2048}
+                        value={formData.websiteUrl}
+                        onChange={(e) => {
+                          setFormData((prev) => ({ ...prev, websiteUrl: e.target.value }));
+                          setSaveSuccess(false);
+                          if (saveError) setSaveError(null);
+                        }}
+                        placeholder="https://example.com"
+                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label htmlFor="edit-description" className="text-sm font-medium text-slate-300">
+                      Description
+                    </label>
+                    <input
+                      id="edit-description"
+                      maxLength={2000}
+                      value={formData.description}
+                      onChange={(e) => {
+                        setFormData((prev) => ({ ...prev, description: e.target.value }));
+                        setSaveSuccess(false);
+                      }}
+                      placeholder="What does this chatbot do?"
+                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all"
+                    />
+                  </div>
+                </div>
+
+                {/* Prompts & Instructions */}
+                <div className="space-y-4 border-b border-slate-800 pb-8">
+                  <h3 className="text-sm font-medium text-slate-200 uppercase tracking-wider">
+                    Behavior & Prompts
+                  </h3>
+
+                  <div className="space-y-2">
+                    <label htmlFor="edit-welcomeMessage" className="text-sm font-medium text-slate-300">
+                      Welcome Message
+                    </label>
+                    <input
+                      id="edit-welcomeMessage"
+                      maxLength={1000}
+                      value={formData.welcomeMessage}
+                      onChange={(e) => {
+                        setFormData((prev) => ({ ...prev, welcomeMessage: e.target.value }));
+                        setSaveSuccess(false);
+                      }}
+                      placeholder="Hi there! How can I help you today?"
+                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label htmlFor="edit-instructions" className="text-sm font-medium text-slate-300">
+                      System Instructions
+                    </label>
+                    <textarea
+                      id="edit-instructions"
+                      rows={5}
+                      maxLength={5000}
+                      value={formData.instructions}
+                      onChange={(e) => {
+                        setFormData((prev) => ({ ...prev, instructions: e.target.value }));
+                        setSaveSuccess(false);
+                      }}
+                      placeholder="Define the bot persona, instructions, tone, and constraints..."
+                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all resize-y"
+                    />
+                  </div>
+                </div>
+
+                {/* Appearance */}
+                <div className="space-y-4">
+                  <h3 className="text-sm font-medium text-slate-200 uppercase tracking-wider">
+                    Appearance & Branding
+                  </h3>
+
+                  <div className="space-y-2">
+                    <label htmlFor="edit-primaryColor" className="text-sm font-medium text-slate-300">
+                      Primary Brand Color
+                    </label>
+                    <div className="flex items-center gap-3">
+                      <input
+                        id="edit-primaryColor"
+                        type="color"
+                        value={formData.primaryColor}
+                        onChange={(e) => {
+                          setFormData((prev) => ({ ...prev, primaryColor: e.target.value }));
+                          setSaveSuccess(false);
+                        }}
+                        className="h-10 w-10 rounded cursor-pointer border-0 p-0 bg-transparent"
+                      />
+                      <input
+                        type="text"
+                        maxLength={7}
+                        value={formData.primaryColor}
+                        onChange={(e) => {
+                          setFormData((prev) => ({ ...prev, primaryColor: e.target.value }));
+                          setSaveSuccess(false);
+                        }}
+                        className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-slate-200 font-mono w-28 focus:outline-none focus:border-blue-500"
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Form Action Buttons */}
+              <div className="flex items-center justify-end gap-3 pt-2">
+                <button
+                  type="button"
+                  disabled={!isDirty || isSaving}
+                  onClick={handleResetForm}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium text-slate-400 hover:text-slate-200 hover:bg-slate-900 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <RotateCcw className="h-4 w-4" />
+                  Discard Changes
+                </button>
+
+                <button
+                  type="submit"
+                  disabled={!isDirty || isSaving || !formData.name.trim()}
+                  className="inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-5 py-2 rounded-lg font-medium transition-colors text-sm disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+                >
+                  {isSaving ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Saving…
+                    </>
+                  ) : (
+                    <>
+                      <Save className="h-4 w-4" />
+                      Save Changes
+                    </>
+                  )}
+                </button>
+              </div>
+            </form>
+          )}
+
+          {/* INTEGRATE TAB */}
           {activeTab === 'integrate' && (
             <div className="max-w-3xl space-y-6">
               <div>
@@ -333,6 +884,17 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
                 <p className="text-sm text-slate-400 mt-1">
                   Copy and paste this code snippet into the <code>&lt;head&gt;</code> or just before the closing{' '}
                   <code>&lt;/body&gt;</code> tag of your website.
+                </p>
+              </div>
+
+              {/* Status semantics callout */}
+              <div className="p-4 bg-blue-950/30 border border-blue-800/40 rounded-xl space-y-1 text-sm">
+                <div className="flex items-center gap-2 font-medium text-blue-300">
+                  <Info className="h-4 w-4 shrink-0 text-blue-400" />
+                  <span>Widget Integration in Development</span>
+                </div>
+                <p className="text-xs text-slate-400 pl-6 leading-relaxed">
+                  Public website embed is currently in preview. The script below will be activated when the widget hosting service is completed in an upcoming milestone. Your bot configuration and status will be preserved.
                 </p>
               </div>
 
@@ -358,7 +920,7 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
           )}
 
           {/* Placeholder for other tabs */}
-          {['knowledge', 'conversations', 'leads', 'appearance'].includes(activeTab) && (
+          {['knowledge', 'conversations', 'leads'].includes(activeTab) && (
             <div className="flex flex-col items-center justify-center h-64 border border-dashed border-slate-800 rounded-xl bg-slate-950/30">
               <p className="text-slate-400 text-sm">
                 The {TABS.find((t) => t.id === activeTab)?.label} section will be implemented in a future milestone.

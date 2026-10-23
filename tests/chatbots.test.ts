@@ -7,9 +7,10 @@ import {
   listChatbots,
   createChatbot,
   getChatbot,
+  updateChatbot,
   ApiError,
 } from '../lib/api.ts';
-import type { Chatbot, ChatbotCreateInput } from '../lib/types.ts';
+import type { Chatbot, ChatbotCreateInput, ChatbotUpdateInput, ChatbotStatus } from '../lib/types.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -140,11 +141,26 @@ class ChatbotDetailController {
   activeOrgId: string | null = null;
   activeBotId: string | null = null;
 
+  formData = {
+    name: '',
+    status: 'draft' as ChatbotStatus,
+    description: '',
+    websiteUrl: '',
+    welcomeMessage: '',
+    instructions: '',
+    primaryColor: '#3b82f6',
+  };
+  isSaving = false;
+  saveError: string | null = null;
+  saveSuccess = false;
+
   async loadDetail(orgId: string | null, botId: string | null): Promise<void> {
     // Clear previous chatbot state immediately
     this.bot = null;
     this.error = null;
     this.isNotFound = false;
+    this.saveError = null;
+    this.saveSuccess = false;
     this.activeOrgId = orgId;
     this.activeBotId = botId;
 
@@ -161,6 +177,15 @@ class ChatbotDetailController {
       const data = await getChatbot(currentRequestOrg, currentRequestBot);
       if (this.activeOrgId === currentRequestOrg && this.activeBotId === currentRequestBot) {
         this.bot = data;
+        this.formData = {
+          name: data.name,
+          status: data.status,
+          description: data.description || '',
+          websiteUrl: data.website_url || '',
+          welcomeMessage: data.welcome_message || '',
+          instructions: data.instructions || '',
+          primaryColor: data.primary_color || '#3b82f6',
+        };
       }
     } catch (err: unknown) {
       if (this.activeOrgId === currentRequestOrg && this.activeBotId === currentRequestBot) {
@@ -179,6 +204,82 @@ class ChatbotDetailController {
       if (this.activeOrgId === currentRequestOrg && this.activeBotId === currentRequestBot) {
         this.isLoading = false;
       }
+    }
+  }
+
+  async save(
+    orgId: string | null,
+    botId: string | null,
+    input: {
+      name: string;
+      status?: ChatbotStatus;
+      description?: string;
+      websiteUrl?: string;
+      welcomeMessage?: string;
+      instructions?: string;
+      primaryColor?: string;
+    },
+  ): Promise<Chatbot | null> {
+    if (this.isSaving) return null;
+    if (!orgId || !botId) {
+      this.saveError = 'No active organization or chatbot';
+      this.saveSuccess = false;
+      return null;
+    }
+
+    const trimmedName = input.name.trim();
+    if (!trimmedName) {
+      this.saveError = 'Chatbot name is required.';
+      this.saveSuccess = false;
+      return null;
+    }
+
+    const trimmedUrl = input.websiteUrl?.trim();
+    if (trimmedUrl && !trimmedUrl.startsWith('http://') && !trimmedUrl.startsWith('https://')) {
+      this.saveError = 'Website URL must start with http:// or https://';
+      this.saveSuccess = false;
+      return null;
+    }
+
+    this.isSaving = true;
+    this.saveError = null;
+    this.saveSuccess = false;
+
+    const payload: ChatbotUpdateInput = {
+      name: trimmedName,
+      status: input.status,
+      description: input.description?.trim() || null,
+      website_url: trimmedUrl || null,
+      welcome_message: input.welcomeMessage?.trim() || null,
+      instructions: input.instructions?.trim() || null,
+      primary_color: input.primaryColor || '#3b82f6',
+    };
+
+    try {
+      const updated = await updateChatbot(orgId, botId, payload);
+      this.bot = updated;
+      this.formData = {
+        name: updated.name,
+        status: updated.status,
+        description: updated.description || '',
+        websiteUrl: updated.website_url || '',
+        welcomeMessage: updated.welcome_message || '',
+        instructions: updated.instructions || '',
+        primaryColor: updated.primary_color || '#3b82f6',
+      };
+      this.saveSuccess = true;
+      return updated;
+    } catch (err: unknown) {
+      this.saveError =
+        err instanceof ApiError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : 'Failed to update chatbot';
+      this.saveSuccess = false;
+      return null;
+    } finally {
+      this.isSaving = false;
     }
   }
 }
@@ -293,6 +394,63 @@ describe('Chatbot Management Frontend Integration', () => {
           assert(err instanceof ApiError);
           assert.equal(err.status, 404);
           assert.equal(err.message, 'Not found');
+          return true;
+        },
+      );
+    });
+
+    it('updateChatbot calls PATCH /api/v1/organizations/{org_id}/chatbots/{bot_id} with JSON body', async () => {
+      let capturedUrl = '';
+      let capturedMethod = '';
+      let capturedBody = '';
+
+      globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        capturedUrl = String(input);
+        capturedMethod = init?.method || '';
+        capturedBody = String(init?.body || '');
+        return new Response(
+          JSON.stringify({
+            ...mockApiChatbot,
+            name: 'Updated Agent',
+            status: 'active',
+          }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
+        );
+      };
+
+      const payload: ChatbotUpdateInput = {
+        name: 'Updated Agent',
+        status: 'active',
+      };
+
+      const result = await updateChatbot('org-123', 'bot-456', payload, 'test-token');
+      assert.equal(
+        capturedUrl,
+        'http://localhost:8000/api/v1/organizations/org-123/chatbots/bot-456',
+      );
+      assert.equal(capturedMethod, 'PATCH');
+      assert.deepEqual(JSON.parse(capturedBody), payload);
+      assert.equal(result.name, 'Updated Agent');
+      assert.equal(result.status, 'active');
+    });
+
+    it('updateChatbot throws ApiError on failure', async () => {
+      globalThis.fetch = async () => {
+        return new Response(JSON.stringify({ detail: 'Chatbot not found' }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      };
+
+      await assert.rejects(
+        () => updateChatbot('org-123', 'bot-456', { name: 'X' }),
+        (err: unknown) => {
+          assert.ok(err instanceof ApiError);
+          assert.equal(err.status, 404);
+          assert.equal(err.message, 'Chatbot not found');
           return true;
         },
       );
@@ -551,6 +709,217 @@ describe('Chatbot Management Frontend Integration', () => {
       await controller.loadDetail('org-bbb', mockApiChatbot.id);
       assert.equal(controller.bot, null);
       assert.equal(controller.isNotFound, true);
+    });
+
+    it('loads and exposes saved instructions and welcome message', async () => {
+      globalThis.fetch = async () => {
+        return new Response(
+          JSON.stringify({
+            ...mockApiChatbot,
+            welcome_message: 'Custom Hello',
+            instructions: 'Custom Prompt Instructions',
+          }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
+        );
+      };
+
+      const controller = new ChatbotDetailController();
+      await controller.loadDetail('org-aaa', mockApiChatbot.id);
+
+      assert.equal(controller.bot?.welcome_message, 'Custom Hello');
+      assert.equal(controller.bot?.instructions, 'Custom Prompt Instructions');
+      assert.equal(controller.formData.welcomeMessage, 'Custom Hello');
+      assert.equal(controller.formData.instructions, 'Custom Prompt Instructions');
+    });
+
+    it('updates chatbot configuration successfully and updates local state without showing false errors', async () => {
+      globalThis.fetch = async () => {
+        return new Response(JSON.stringify(mockApiChatbot), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      };
+
+      const controller = new ChatbotDetailController();
+      await controller.loadDetail('org-aaa', mockApiChatbot.id);
+
+      globalThis.fetch = async () => {
+        return new Response(
+          JSON.stringify({
+            ...mockApiChatbot,
+            name: 'Updated Bot Name',
+            description: 'Updated Description',
+            welcome_message: 'New Welcome',
+            instructions: 'New Instructions',
+            primary_color: '#10b981',
+          }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
+        );
+      };
+
+      const updated = await controller.save('org-aaa', mockApiChatbot.id, {
+        name: 'Updated Bot Name',
+        description: 'Updated Description',
+        welcomeMessage: 'New Welcome',
+        instructions: 'New Instructions',
+        primaryColor: '#10b981',
+      });
+
+      assert.notEqual(updated, null);
+      assert.equal(controller.bot?.name, 'Updated Bot Name');
+      assert.equal(controller.bot?.instructions, 'New Instructions');
+      assert.equal(controller.saveSuccess, true);
+      assert.equal(controller.saveError, null);
+      assert.equal(controller.isSaving, false);
+    });
+
+    it('handles status updates to active and inactive', async () => {
+      const controller = new ChatbotDetailController();
+
+      globalThis.fetch = async () => {
+        return new Response(
+          JSON.stringify({
+            ...mockApiChatbot,
+            status: 'active',
+          }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
+        );
+      };
+
+      const activeResult = await controller.save('org-aaa', mockApiChatbot.id, {
+        name: 'Bot',
+        status: 'active',
+      });
+      assert.equal(activeResult?.status, 'active');
+      assert.equal(controller.bot?.status, 'active');
+
+      globalThis.fetch = async () => {
+        return new Response(
+          JSON.stringify({
+            ...mockApiChatbot,
+            status: 'inactive',
+          }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
+        );
+      };
+
+      const inactiveResult = await controller.save('org-aaa', mockApiChatbot.id, {
+        name: 'Bot',
+        status: 'inactive',
+      });
+      assert.equal(inactiveResult?.status, 'inactive');
+      assert.equal(controller.bot?.status, 'inactive');
+    });
+
+    it('submits existing primary color when saving unrelated settings and preserves custom hex', async () => {
+      let capturedPayload: ChatbotUpdateInput | null = null;
+      globalThis.fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.body && typeof init.body === 'string') {
+          capturedPayload = JSON.parse(init.body) as ChatbotUpdateInput;
+        }
+        return new Response(
+          JSON.stringify({
+            ...mockApiChatbot,
+            ...(capturedPayload || {}),
+          }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
+        );
+      };
+
+      const controller = new ChatbotDetailController();
+      // Assume existing chatbot was created with shorthand hex '#123'
+      controller.formData.primaryColor = '#123';
+
+      // User edits only description, without modifying the primary color
+      const updated = await controller.save('org-aaa', mockApiChatbot.id, {
+        name: 'Bot Name',
+        description: 'New Description Only',
+        primaryColor: controller.formData.primaryColor,
+      });
+
+      assert.notEqual(updated, null);
+      const payload = capturedPayload as ChatbotUpdateInput | null;
+      assert.equal(payload?.primary_color, '#123');
+      assert.equal(payload?.description, 'New Description Only');
+      assert.equal(controller.saveSuccess, true);
+    });
+
+    it('validates required name field before saving', async () => {
+      const controller = new ChatbotDetailController();
+      const res = await controller.save('org-aaa', 'bot-1', { name: '   ' });
+
+      assert.equal(res, null);
+      assert.equal(controller.saveError, 'Chatbot name is required.');
+      assert.equal(controller.saveSuccess, false);
+    });
+
+    it('validates website URL format before saving', async () => {
+      const controller = new ChatbotDetailController();
+      const res = await controller.save('org-aaa', 'bot-1', {
+        name: 'Valid Name',
+        websiteUrl: 'ftp://invalid-url.com',
+      });
+
+      assert.equal(res, null);
+      assert.equal(controller.saveError, 'Website URL must start with http:// or https://');
+      assert.equal(controller.saveSuccess, false);
+    });
+
+    it('handles API update failure with error message and does not show false success', async () => {
+      globalThis.fetch = async () => {
+        return new Response(JSON.stringify({ detail: 'Failed to update chatbot' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      };
+
+      const controller = new ChatbotDetailController();
+      const res = await controller.save('org-aaa', 'bot-1', { name: 'New Name' });
+
+      assert.equal(res, null);
+      assert.equal(controller.saveError, 'Failed to update chatbot');
+      assert.equal(controller.saveSuccess, false);
+      assert.equal(controller.isSaving, false);
+    });
+
+    it('prevents concurrent duplicate update submissions', async () => {
+      let resolveFirstFetch: (res: Response) => void;
+      const firstFetchPromise = new Promise<Response>((resolve) => {
+        resolveFirstFetch = resolve;
+      });
+
+      globalThis.fetch = async () => firstFetchPromise;
+
+      const controller = new ChatbotDetailController();
+      const firstSavePromise = controller.save('org-aaa', 'bot-1', { name: 'First Save' });
+      const secondSave = await controller.save('org-aaa', 'bot-1', { name: 'Second Save' });
+
+      assert.equal(secondSave, null, 'Second save must be rejected while first is in-flight');
+
+      resolveFirstFetch!(
+        new Response(JSON.stringify({ ...mockApiChatbot, name: 'First Save' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      );
+
+      const firstSaveResult = await firstSavePromise;
+      assert.equal(firstSaveResult?.name, 'First Save');
     });
   });
 

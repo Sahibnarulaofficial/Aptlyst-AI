@@ -27,6 +27,16 @@ export type ChatbotCreateInput = {
   status?: ChatbotStatus;
 };
 
+export type ChatbotUpdateInput = {
+  name?: string;
+  description?: string | null;
+  website_url?: string | null;
+  welcome_message?: string | null;
+  instructions?: string | null;
+  primary_color?: string | null;
+  status?: ChatbotStatus;
+};
+
 export type MockChatbot = {
   id: string;
   name: string;

@@ -1,6 +1,7 @@
 import type {
   Chatbot,
   ChatbotCreateInput,
+  ChatbotUpdateInput,
   Organization,
   OrganizationWithRole,
 } from '@/lib/types';
@@ -170,6 +171,19 @@ export async function getChatbot(
 ): Promise<Chatbot> {
   return apiFetch<Chatbot>(`/api/v1/organizations/${orgId}/chatbots/${botId}`, {
     method: 'GET',
+    token,
+  });
+}
+
+export async function updateChatbot(
+  orgId: string,
+  botId: string,
+  payload: ChatbotUpdateInput,
+  token?: string,
+): Promise<Chatbot> {
+  return apiFetch<Chatbot>(`/api/v1/organizations/${orgId}/chatbots/${botId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
     token,
   });
 }

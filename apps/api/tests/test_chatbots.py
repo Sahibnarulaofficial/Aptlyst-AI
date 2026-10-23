@@ -294,3 +294,393 @@ async def test_chatbot_unauthenticated_requests_rejected(client: AsyncClient) ->
         headers={"Authorization": "Bearer invalid.token.payload"},
     )
     assert res_bad_token.status_code == 401
+
+    # Unauthenticated PATCH -> 403 Forbidden
+    res_no_auth_patch = await client.patch(
+        f"/api/v1/organizations/{random_org}/chatbots/{uuid.uuid4()}",
+        json={"name": "New Name"},
+    )
+    assert res_no_auth_patch.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_update_chatbot_supported_fields_and_partial_updates(client: AsyncClient) -> None:
+    """Verifies partial updates, updating each supported field, and explicit null vs omitted."""
+    user_id = uuid.uuid4()
+    token = make_token(user_id=str(user_id))
+    org_id = None
+
+    try:
+        with patch("app.auth.dependencies.settings") as mock_settings:
+            mock_settings.supabase_jwt_algorithm = "HS256"
+            mock_settings.supabase_jwt_secret = TEST_JWT_SECRET
+
+            # 1. Setup organization and initial bot
+            res_org = await client.post(
+                "/api/v1/organizations/setup",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"name": "Update Test Org"},
+            )
+            assert res_org.status_code == 201
+            org_id = uuid.UUID(res_org.json()["id"])
+
+            res_create = await client.post(
+                f"/api/v1/organizations/{org_id}/chatbots",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "name": "Original Name",
+                    "description": "Original Description",
+                    "website_url": "https://original.com",
+                    "welcome_message": "Original Welcome",
+                    "instructions": "Original Instructions",
+                    "primary_color": "#112233",
+                    "status": "draft",
+                },
+            )
+            assert res_create.status_code == 201
+            bot_id = res_create.json()["id"]
+
+            # 2. Partial update: only name
+            res_patch_name = await client.patch(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"name": "Renamed Bot"},
+            )
+            assert res_patch_name.status_code == 200
+            data = res_patch_name.json()
+            assert data["name"] == "Renamed Bot"
+            assert data["description"] == "Original Description"
+            assert data["website_url"] == "https://original.com"
+            assert data["status"] == "draft"
+
+            # 3. Partial update: status to active
+            res_patch_status = await client.patch(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"status": "active"},
+            )
+            assert res_patch_status.status_code == 200
+            assert res_patch_status.json()["status"] == "active"
+            assert res_patch_status.json()["name"] == "Renamed Bot"
+
+            # 4. Partial update: status to inactive
+            res_patch_inactive = await client.patch(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"status": "inactive"},
+            )
+            assert res_patch_inactive.status_code == 200
+            assert res_patch_inactive.json()["status"] == "inactive"
+
+            # 5. Update remaining fields: description, instructions, welcome_message, primary_color, website_url
+            res_patch_all = await client.patch(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "description": "Updated Description",
+                    "website_url": "https://updated.com",
+                    "welcome_message": "Updated Welcome",
+                    "instructions": "Updated Instructions",
+                    "primary_color": "#445566",
+                },
+            )
+            assert res_patch_all.status_code == 200
+            all_data = res_patch_all.json()
+            assert all_data["description"] == "Updated Description"
+            assert all_data["website_url"] == "https://updated.com"
+            assert all_data["welcome_message"] == "Updated Welcome"
+            assert all_data["instructions"] == "Updated Instructions"
+            assert all_data["primary_color"] == "#445566"
+            assert all_data["status"] == "inactive"  # omitted, preserved
+
+            # 6. Explicit null resets nullable fields in database
+            res_patch_nulls = await client.patch(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "description": None,
+                    "website_url": None,
+                    "welcome_message": None,
+                    "instructions": None,
+                },
+            )
+            assert res_patch_nulls.status_code == 200
+            null_data = res_patch_nulls.json()
+            assert null_data["description"] is None
+            assert null_data["website_url"] is None
+            assert null_data["welcome_message"] is None
+            assert null_data["instructions"] is None
+            assert null_data["name"] == "Renamed Bot"  # omitted, preserved
+
+            # 7. Empty update body rejected with 400
+            res_empty_patch = await client.patch(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={},
+            )
+            assert res_empty_patch.status_code == 400
+            assert res_empty_patch.json()["detail"] == "No fields provided for update"
+    finally:
+        if org_id:
+            async with AsyncSessionLocal() as session:
+                await session.execute(delete(Organization).where(Organization.id == org_id))
+                await session.commit()
+
+
+@pytest.mark.anyio
+async def test_update_chatbot_validation_rules(client: AsyncClient) -> None:
+    """Verifies that invalid updates (empty name, bad URL, bad hex, bad status, null name) are rejected with 422."""
+    user_id = uuid.uuid4()
+    token = make_token(user_id=str(user_id))
+    org_id = None
+
+    try:
+        with patch("app.auth.dependencies.settings") as mock_settings:
+            mock_settings.supabase_jwt_algorithm = "HS256"
+            mock_settings.supabase_jwt_secret = TEST_JWT_SECRET
+
+            res_org = await client.post(
+                "/api/v1/organizations/setup",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"name": "Validation Patch Org"},
+            )
+            assert res_org.status_code == 201
+            org_id = uuid.UUID(res_org.json()["id"])
+
+            res_bot = await client.post(
+                f"/api/v1/organizations/{org_id}/chatbots",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"name": "Valid Bot"},
+            )
+            assert res_bot.status_code == 201
+            bot_id = res_bot.json()["id"]
+
+            # Empty name
+            res_bad_name = await client.patch(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"name": "   "},
+            )
+            assert res_bad_name.status_code == 422
+
+            # Null name
+            res_null_name = await client.patch(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"name": None},
+            )
+            assert res_null_name.status_code == 422
+
+            # Bad URL
+            res_bad_url = await client.patch(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"website_url": "javascript:alert(1)"},
+            )
+            assert res_bad_url.status_code == 422
+
+            # Bad hex color
+            res_bad_color = await client.patch(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"primary_color": "blue"},
+            )
+            assert res_bad_color.status_code == 422
+
+            # Invalid status value
+            res_bad_status = await client.patch(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"status": "deleted"},
+            )
+            assert res_bad_status.status_code == 422
+
+            # Null status
+            res_null_status = await client.patch(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"status": None},
+            )
+            assert res_null_status.status_code == 422
+    finally:
+        if org_id:
+            async with AsyncSessionLocal() as session:
+                await session.execute(delete(Organization).where(Organization.id == org_id))
+                await session.commit()
+
+
+@pytest.mark.anyio
+async def test_update_chatbot_isolation_and_authorization(client: AsyncClient) -> None:
+    """Verifies that non-existent bot returns 404, cross-org access returns 404, and members/admins/owners can update."""
+    user_a = uuid.uuid4()
+    user_b = uuid.uuid4()
+    token_a = make_token(user_id=str(user_a))
+    token_b = make_token(user_id=str(user_b))
+    org_a_id = None
+    org_b_id = None
+
+    try:
+        with patch("app.auth.dependencies.settings") as mock_settings:
+            mock_settings.supabase_jwt_algorithm = "HS256"
+            mock_settings.supabase_jwt_secret = TEST_JWT_SECRET
+
+            # Org A & Bot A
+            res_org_a = await client.post(
+                "/api/v1/organizations/setup",
+                headers={"Authorization": f"Bearer {token_a}"},
+                json={"name": "Org A Update"},
+            )
+            assert res_org_a.status_code == 201
+            org_a_id = uuid.UUID(res_org_a.json()["id"])
+
+            res_bot_a = await client.post(
+                f"/api/v1/organizations/{org_a_id}/chatbots",
+                headers={"Authorization": f"Bearer {token_a}"},
+                json={"name": "Bot A"},
+            )
+            assert res_bot_a.status_code == 201
+            bot_a_id = res_bot_a.json()["id"]
+
+            # 1. Non-existent chatbot in Org A -> 404
+            random_bot = uuid.uuid4()
+            res_404 = await client.patch(
+                f"/api/v1/organizations/{org_a_id}/chatbots/{random_bot}",
+                headers={"Authorization": f"Bearer {token_a}"},
+                json={"name": "Nonexistent"},
+            )
+            assert res_404.status_code == 404
+            assert res_404.json()["detail"] == "Not found"
+
+            # 2. User B (not in Org A) attempts to update Bot A -> 404
+            res_b_tamper = await client.patch(
+                f"/api/v1/organizations/{org_a_id}/chatbots/{bot_a_id}",
+                headers={"Authorization": f"Bearer {token_b}"},
+                json={"name": "Attacker Name"},
+            )
+            assert res_b_tamper.status_code == 404
+            assert res_b_tamper.json()["detail"] == "Not found"
+
+            # 3. User B in Org B attempts cross-org tampering with Org B path and Bot A ID -> 404
+            res_org_b = await client.post(
+                "/api/v1/organizations/setup",
+                headers={"Authorization": f"Bearer {token_b}"},
+                json={"name": "Org B Update"},
+            )
+            assert res_org_b.status_code == 201
+            org_b_id = uuid.UUID(res_org_b.json()["id"])
+
+            res_cross_tamper = await client.patch(
+                f"/api/v1/organizations/{org_b_id}/chatbots/{bot_a_id}",
+                headers={"Authorization": f"Bearer {token_b}"},
+                json={"name": "Cross Tamper"},
+            )
+            assert res_cross_tamper.status_code == 404
+            assert res_cross_tamper.json()["detail"] == "Not found"
+
+            # 4. Member role can update: Add user_b to Org A as MemberRole.member
+            async with AsyncSessionLocal() as session:
+                session.add(
+                    OrganizationMember(
+                        organization_id=org_a_id,
+                        user_id=user_b,
+                        role=MemberRole.member,
+                    )
+                )
+                await session.commit()
+
+            res_member_update = await client.patch(
+                f"/api/v1/organizations/{org_a_id}/chatbots/{bot_a_id}",
+                headers={"Authorization": f"Bearer {token_b}"},
+                json={"name": "Updated By Member"},
+            )
+            assert res_member_update.status_code == 200
+            assert res_member_update.json()["name"] == "Updated By Member"
+    finally:
+        async with AsyncSessionLocal() as session:
+            if org_a_id:
+                await session.execute(delete(Organization).where(Organization.id == org_a_id))
+            if org_b_id:
+                await session.execute(delete(Organization).where(Organization.id == org_b_id))
+            await session.commit()
+
+
+@pytest.mark.anyio
+async def test_chatbot_color_validation_consistency_and_editing_regression(
+    client: AsyncClient,
+) -> None:
+    """Verifies color validation consistency between create and update, ensuring valid
+
+    chatbots can be edited when changing unrelated fields and submitting color.
+    """
+    user_id = uuid.uuid4()
+    token = make_token(user_id=str(user_id))
+    org_id = None
+
+    try:
+        with patch("app.auth.dependencies.settings") as mock_settings:
+            mock_settings.supabase_jwt_algorithm = "HS256"
+            mock_settings.supabase_jwt_secret = TEST_JWT_SECRET
+
+            res_org = await client.post(
+                "/api/v1/organizations/setup",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"name": "Color Regression Org"},
+            )
+            assert res_org.status_code == 201
+            org_id = uuid.UUID(res_org.json()["id"])
+
+            # 1. Create with 4-character hex shorthand (#123)
+            res_shorthand = await client.post(
+                f"/api/v1/organizations/{org_id}/chatbots",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"name": "Shorthand Hex Bot", "primary_color": "#123"},
+            )
+            assert res_shorthand.status_code == 201
+            bot_shorthand_id = res_shorthand.json()["id"]
+            assert res_shorthand.json()["primary_color"] == "#123"
+
+            # 2. Edit unrelated field (description) while form resubmits the existing primary_color="#123"
+            res_edit_unrelated = await client.patch(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_shorthand_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "name": "Shorthand Hex Bot",
+                    "description": "Updated Description Only",
+                    "primary_color": "#123",
+                },
+            )
+            assert res_edit_unrelated.status_code == 200
+            assert res_edit_unrelated.json()["description"] == "Updated Description Only"
+            assert res_edit_unrelated.json()["primary_color"] == "#123"
+
+            # 3. Edit omitting primary_color keeps existing primary_color
+            res_omit_color = await client.patch(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_shorthand_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"name": "Renamed Shorthand Bot"},
+            )
+            assert res_omit_color.status_code == 200
+            assert res_omit_color.json()["name"] == "Renamed Shorthand Bot"
+            assert res_omit_color.json()["primary_color"] == "#123"
+
+            # 4. Update with null or empty string resets to default "#3b82f6" (consistent with create)
+            res_null_color = await client.patch(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_shorthand_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"primary_color": None},
+            )
+            assert res_null_color.status_code == 200
+            assert res_null_color.json()["primary_color"] == "#3b82f6"
+
+            res_empty_color = await client.patch(
+                f"/api/v1/organizations/{org_id}/chatbots/{bot_shorthand_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"primary_color": "   "},
+            )
+            assert res_empty_color.status_code == 200
+            assert res_empty_color.json()["primary_color"] == "#3b82f6"
+    finally:
+        if org_id:
+            async with AsyncSessionLocal() as session:
+                await session.execute(delete(Organization).where(Organization.id == org_id))
+                await session.commit()
