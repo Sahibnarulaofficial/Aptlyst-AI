@@ -4,6 +4,7 @@ import type {
   ChatbotUpdateInput,
   Organization,
   OrganizationWithRole,
+  PublicChatbotConfig,
 } from '@/lib/types';
 
 /**
@@ -29,21 +30,23 @@ export class ApiError extends Error {
 export interface FetchOptions extends Omit<RequestInit, 'headers'> {
   token?: string;
   headers?: Record<string, string> | Headers;
+  skipAuth?: boolean;
 }
 
 /**
  * Perform an authenticated request to the FastAPI backend.
- * If token is omitted, it attempts to resolve the session token from Supabase.
+ * If token is omitted, it attempts to resolve the session token from Supabase
+ * (unless skipAuth is true).
  */
 export async function apiFetch<T>(
   endpoint: string,
   options: FetchOptions = {},
 ): Promise<T> {
-  const { token, headers: customHeaders, ...fetchInit } = options;
+  const { token, headers: customHeaders, skipAuth, ...fetchInit } = options;
 
   let accessToken = token;
 
-  if (!accessToken) {
+  if (!accessToken && !skipAuth) {
     if (typeof window !== 'undefined') {
       try {
         const { createClient } = await import('./supabase/client');
@@ -196,5 +199,16 @@ export async function deleteChatbot(
   return apiFetch<void>(`/api/v1/organizations/${orgId}/chatbots/${botId}`, {
     method: 'DELETE',
     token,
+  });
+}
+
+// ─── Public Chatbot API Methods ──────────────────────────────────────────────
+
+export async function getPublicChatbot(
+  botId: string,
+): Promise<PublicChatbotConfig> {
+  return apiFetch<PublicChatbotConfig>(`/api/v1/public/chatbots/${botId}`, {
+    method: 'GET',
+    skipAuth: true,
   });
 }

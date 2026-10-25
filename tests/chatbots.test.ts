@@ -9,9 +9,16 @@ import {
   getChatbot,
   updateChatbot,
   deleteChatbot,
+  getPublicChatbot,
   ApiError,
 } from '../lib/api.ts';
-import type { Chatbot, ChatbotCreateInput, ChatbotUpdateInput, ChatbotStatus } from '../lib/types.ts';
+import type {
+  Chatbot,
+  ChatbotCreateInput,
+  ChatbotUpdateInput,
+  ChatbotStatus,
+  PublicChatbotConfig,
+} from '../lib/types.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -330,6 +337,37 @@ class ChatbotDetailController {
   }
 }
 
+class PublicEmbedController {
+  bot: PublicChatbotConfig | null = null;
+  isLoading = true;
+  error: string | null = null;
+  isNotFound = false;
+
+  async load(botId: string): Promise<void> {
+    this.isLoading = true;
+    this.error = null;
+    this.isNotFound = false;
+
+    try {
+      const config = await getPublicChatbot(botId);
+      this.bot = config;
+    } catch (err: unknown) {
+      if (err instanceof ApiError && err.status === 404) {
+        this.isNotFound = true;
+      } else {
+        this.error =
+          err instanceof ApiError
+            ? err.message
+            : err instanceof Error
+              ? err.message
+              : 'Failed to load chatbot configuration';
+      }
+    } finally {
+      this.isLoading = false;
+    }
+  }
+}
+
 describe('Chatbot Management Frontend Integration', () => {
   const originalFetch = globalThis.fetch;
 
@@ -536,6 +574,63 @@ describe('Chatbot Management Frontend Integration', () => {
 
       await assert.rejects(
         () => deleteChatbot('org-123', 'bot-456'),
+        (err: unknown) => {
+          assert.ok(err instanceof ApiError);
+          assert.equal(err.status, 404);
+          assert.equal(err.message, 'Chatbot not found');
+          return true;
+        },
+      );
+    });
+
+    it('getPublicChatbot calls GET /api/v1/public/chatbots/{bot_id} without auth headers', async () => {
+      let capturedUrl = '';
+      let capturedMethod = '';
+      let capturedAuth = '';
+
+      const publicConfig: PublicChatbotConfig = {
+        id: '11111111-1111-1111-1111-111111111111',
+        name: 'Public Bot',
+        welcome_message: 'Hi there!',
+        primary_color: '#10b981',
+      };
+
+      globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        capturedUrl = String(input);
+        capturedMethod = init?.method || '';
+        const headers = init?.headers as Headers | undefined;
+        capturedAuth = headers?.get('Authorization') || '';
+        return new Response(JSON.stringify(publicConfig), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      };
+
+      const result = await getPublicChatbot('11111111-1111-1111-1111-111111111111');
+      assert.equal(
+        capturedUrl,
+        'http://localhost:8000/api/v1/public/chatbots/11111111-1111-1111-1111-111111111111',
+      );
+      assert.equal(capturedMethod, 'GET');
+      assert.equal(capturedAuth, '', 'Public request must not inject auth header');
+      assert.equal(result.id, '11111111-1111-1111-1111-111111111111');
+      assert.equal(result.name, 'Public Bot');
+      assert.equal(result.welcome_message, 'Hi there!');
+      assert.equal(result.primary_color, '#10b981');
+      assert.equal('instructions' in result, false);
+      assert.equal('organization_id' in result, false);
+    });
+
+    it('getPublicChatbot throws ApiError on 404 response', async () => {
+      globalThis.fetch = async () => {
+        return new Response(JSON.stringify({ detail: 'Chatbot not found' }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      };
+
+      await assert.rejects(
+        () => getPublicChatbot('unknown-bot'),
         (err: unknown) => {
           assert.ok(err instanceof ApiError);
           assert.equal(err.status, 404);
@@ -1116,6 +1211,183 @@ describe('Chatbot Management Frontend Integration', () => {
       assert.equal(controller.isDeleteDialogOpen, false);
       assert.equal(controller.deleteError, null);
       assert.equal(controller.navigatedTo, null);
+    });
+  });
+
+  describe('Public Embed Flow (/embed/[id])', () => {
+    it('loads and displays active public chatbot configuration', async () => {
+      const publicBot: PublicChatbotConfig = {
+        id: '22222222-2222-2222-2222-222222222222',
+        name: 'Website Greeter',
+        welcome_message: 'Welcome! How can I help you today?',
+        primary_color: '#2563eb',
+      };
+
+      globalThis.fetch = async () => {
+        return new Response(JSON.stringify(publicBot), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      };
+
+      const controller = new PublicEmbedController();
+      assert.equal(controller.isLoading, true);
+
+      await controller.load('22222222-2222-2222-2222-222222222222');
+
+      assert.equal(controller.isLoading, false);
+      assert.equal(controller.error, null);
+      assert.equal(controller.isNotFound, false);
+      assert.equal(controller.bot?.name, 'Website Greeter');
+      assert.equal(controller.bot?.welcome_message, 'Welcome! How can I help you today?');
+      assert.equal(controller.bot?.primary_color, '#2563eb');
+    });
+
+    it('sets isNotFound when chatbot is draft, inactive, or nonexistent (404)', async () => {
+      globalThis.fetch = async () => {
+        return new Response(JSON.stringify({ detail: 'Chatbot not found' }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      };
+
+      const controller = new PublicEmbedController();
+      await controller.load('draft-or-inactive-bot');
+
+      assert.equal(controller.isLoading, false);
+      assert.equal(controller.isNotFound, true);
+      assert.equal(controller.bot, null);
+      assert.equal(controller.error, null);
+    });
+
+    it('handles unexpected network error during public config fetch', async () => {
+      globalThis.fetch = async () => {
+        return new Response(JSON.stringify({ detail: 'Service temporarily unavailable' }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      };
+
+      const controller = new PublicEmbedController();
+      await controller.load('22222222-2222-2222-2222-222222222222');
+
+      assert.equal(controller.isLoading, false);
+      assert.equal(controller.isNotFound, false);
+      assert.equal(controller.bot, null);
+      assert.equal(controller.error, 'Service temporarily unavailable');
+    });
+  });
+
+  describe('Embeddable Loader Script (public/widget.js)', () => {
+    it('verifies widget.js script exists, uses DOM APIs safely, and avoids innerHTML', () => {
+      const widgetSource = readFileSync(
+        resolve(__dirname, '../public/widget.js'),
+        'utf-8',
+      );
+
+      // Verify no unsafe HTML string interpolation
+      assert.equal(
+        widgetSource.includes('innerHTML'),
+        false,
+        'public/widget.js must never use innerHTML',
+      );
+      assert.equal(
+        widgetSource.includes('dangerouslySetInnerHTML'),
+        false,
+        'public/widget.js must never use dangerouslySetInnerHTML',
+      );
+
+      // Verify DOM APIs used
+      assert.equal(
+        widgetSource.includes('document.createElement'),
+        true,
+        'public/widget.js must create elements via document.createElement',
+      );
+      assert.equal(
+        widgetSource.includes('document.createElementNS'),
+        true,
+        'public/widget.js must create SVG icons via document.createElementNS',
+      );
+
+      // Verify bot-id discovery
+      assert.equal(
+        widgetSource.includes('data-bot-id'),
+        true,
+        'public/widget.js must read data-bot-id attribute',
+      );
+
+      // Verify safe URL encoding of botId in iframe src
+      assert.equal(
+        widgetSource.includes('encodeURIComponent'),
+        true,
+        'public/widget.js must encodeURIComponent(botId) when building iframe src',
+      );
+
+      // Verify accessible button properties
+      assert.equal(
+        widgetSource.includes('aria-label'),
+        true,
+        'public/widget.js launcher must set aria-label',
+      );
+      assert.equal(
+        widgetSource.includes('aria-expanded'),
+        true,
+        'public/widget.js launcher must track aria-expanded',
+      );
+      assert.equal(
+        widgetSource.includes('aria-haspopup'),
+        true,
+        'public/widget.js launcher must set aria-haspopup',
+      );
+
+      // Verify configurable base URL support
+      assert.equal(
+        widgetSource.includes('data-base-url'),
+        true,
+        'public/widget.js must support data-base-url configuration',
+      );
+    });
+
+    it('verifies embed route and proxy middleware configuration', () => {
+      const proxySource = readFileSync(
+        resolve(__dirname, '../proxy.ts'),
+        'utf-8',
+      );
+      const embedSource = readFileSync(
+        resolve(__dirname, '../app/embed/[id]/page.tsx'),
+        'utf-8',
+      );
+
+      // Verify embed route is public and excluded from auth interception
+      assert.equal(
+        proxySource.includes("pathname === '/embed'"),
+        false,
+        'proxy.ts must NOT include /embed in isProtectedRoute',
+      );
+      assert.equal(
+        proxySource.includes("pathname.startsWith('/embed')"),
+        false,
+        'proxy.ts must NOT protect /embed routes',
+      );
+
+      // Verify embed route uses getPublicChatbot API
+      assert.equal(
+        embedSource.includes('getPublicChatbot'),
+        true,
+        'app/embed/[id]/page.tsx must use getPublicChatbot',
+      );
+
+      // Verify embed route does not request or display internal instructions or org ID
+      assert.equal(
+        embedSource.includes('instructions'),
+        false,
+        'app/embed/[id]/page.tsx must not reference instructions',
+      );
+      assert.equal(
+        embedSource.includes('organization_id'),
+        false,
+        'app/embed/[id]/page.tsx must not reference organization_id',
+      );
     });
   });
 

@@ -57,6 +57,8 @@ export async function proxy(request: NextRequest) {
     pathname === '/billing' ||
     pathname === '/settings';
 
+  // Public runtime routes (/embed/*, /widget.js) are intentionally excluded from
+  // isProtectedRoute so website visitors and iframes can access public chatbot previews without logging in.
   if (!user && isProtectedRoute) {
     const url = request.nextUrl.clone();
     url.pathname = '/login';

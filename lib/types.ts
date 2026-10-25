@@ -1,5 +1,12 @@
 export type ChatbotStatus = 'draft' | 'active' | 'inactive';
 
+export interface PublicChatbotConfig {
+  id: string;
+  name: string;
+  welcome_message: string | null;
+  primary_color: string | null;
+}
+
 export type Chatbot = {
   id: string;
   organization_id: string;

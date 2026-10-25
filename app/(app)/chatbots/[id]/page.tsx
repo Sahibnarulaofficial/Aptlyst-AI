@@ -365,8 +365,13 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
     );
   }
 
+  const appOrigin =
+    (typeof window !== 'undefined' && window.location.origin)
+      ? window.location.origin
+      : process.env.NEXT_PUBLIC_APP_URL || 'https://app.aptlyst.ai';
+
   const embedSnippet = `<script
-  src="https://app.aptlyst.ai/widget.js"
+  src="${appOrigin}/widget.js"
   data-bot-id="${bot.id}">
 </script>`;
 
@@ -954,29 +959,63 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
 
           {/* INTEGRATE TAB */}
           {activeTab === 'integrate' && (
-            <div className="max-w-3xl space-y-6">
-              <div>
-                <h2 className="text-lg font-medium text-slate-100">Add to your website</h2>
-                <p className="text-sm text-slate-400 mt-1">
-                  Copy and paste this code snippet into the <code>&lt;head&gt;</code> or just before the closing{' '}
-                  <code>&lt;/body&gt;</code> tag of your website.
-                </p>
+            <div className="max-w-4xl space-y-6">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-lg font-medium text-slate-100">Add to your website</h2>
+                  <p className="text-sm text-slate-400 mt-1">
+                    Copy and paste this code snippet into the <code>&lt;head&gt;</code> or before the closing{' '}
+                    <code>&lt;/body&gt;</code> tag of your website.
+                  </p>
+                </div>
+                <a
+                  href={`/embed/${bot.id}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-2 bg-slate-900 border border-slate-800 hover:bg-slate-800 text-slate-200 px-4 py-2 rounded-lg font-medium transition-colors text-sm shrink-0"
+                >
+                  <ExternalLink className="h-4 w-4" />
+                  <span>Open Standalone Preview</span>
+                </a>
               </div>
 
               {/* Status semantics callout */}
-              <div className="p-4 bg-blue-950/30 border border-blue-800/40 rounded-xl space-y-1 text-sm">
-                <div className="flex items-center gap-2 font-medium text-blue-300">
-                  <Info className="h-4 w-4 shrink-0 text-blue-400" />
-                  <span>Widget Integration in Development</span>
+              {bot.status === 'active' ? (
+                <div className="p-4 bg-emerald-950/30 border border-emerald-800/40 rounded-xl space-y-1 text-sm">
+                  <div className="flex items-center gap-2 font-medium text-emerald-300">
+                    <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-400" />
+                    <span>Widget Preview Operational (Active)</span>
+                  </div>
+                  <p className="text-xs text-slate-400 pl-6 leading-relaxed">
+                    Chatbot configuration is active. The widget script and embed iframe render your bot&apos;s identity,
+                    custom brand color, and welcome message. Live conversational AI responses will be enabled in an upcoming release.
+                  </p>
                 </div>
-                <p className="text-xs text-slate-400 pl-6 leading-relaxed">
-                  Public website embed is currently in preview. The script below will be activated when the widget hosting service is completed in an upcoming milestone. Your bot configuration and status will be preserved.
-                </p>
-              </div>
+              ) : bot.status === 'draft' ? (
+                <div className="p-4 bg-slate-900 border border-slate-800 rounded-xl space-y-1 text-sm">
+                  <div className="flex items-center gap-2 font-medium text-slate-300">
+                    <Info className="h-4 w-4 shrink-0 text-slate-400" />
+                    <span>Chatbot in Draft Mode</span>
+                  </div>
+                  <p className="text-xs text-slate-400 pl-6 leading-relaxed">
+                    This chatbot is currently in draft mode and will return 404 to public visitors. Change status to Active in Settings to enable the embed widget.
+                  </p>
+                </div>
+              ) : (
+                <div className="p-4 bg-amber-950/30 border border-amber-800/40 rounded-xl space-y-1 text-sm">
+                  <div className="flex items-center gap-2 font-medium text-amber-300">
+                    <AlertCircle className="h-4 w-4 shrink-0 text-amber-400" />
+                    <span>Chatbot Disabled (Inactive)</span>
+                  </div>
+                  <p className="text-xs text-slate-400 pl-6 leading-relaxed">
+                    This chatbot is currently inactive. Change status to Active in Settings to allow the widget to load.
+                  </p>
+                </div>
+              )}
 
               <div className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden">
                 <div className="flex items-center justify-between px-4 py-2 border-b border-slate-800 bg-slate-900/50">
-                  <span className="text-xs font-mono text-slate-400">HTML</span>
+                  <span className="text-xs font-mono text-slate-400">HTML Code Snippet</span>
                   <button
                     type="button"
                     onClick={handleCopy}
@@ -990,6 +1029,21 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
                   <pre className="text-sm font-mono text-slate-300">
                     <code>{embedSnippet}</code>
                   </pre>
+                </div>
+              </div>
+
+              {/* Live Preview Card */}
+              <div className="border border-slate-800 rounded-xl bg-slate-950 p-6 space-y-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm font-semibold text-slate-200">Interactive Widget Preview</h3>
+                  <span className="text-xs text-slate-500 font-mono">/embed/{bot.id}</span>
+                </div>
+                <div className="flex justify-center p-4 bg-slate-900/40 rounded-xl border border-slate-800/60">
+                  <iframe
+                    src={`/embed/${bot.id}`}
+                    title="Widget Live Preview"
+                    className="w-full max-w-sm h-[520px] rounded-xl border border-slate-800 shadow-2xl bg-slate-950"
+                  />
                 </div>
               </div>
             </div>

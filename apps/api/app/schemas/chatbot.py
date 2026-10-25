@@ -118,3 +118,17 @@ class ChatbotOut(BaseModel):
     last_active: datetime | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class PublicChatbotConfig(BaseModel):
+    """Minimal, privacy-safe chatbot configuration for public website widgets.
+
+    Exposes strictly the visual branding and identity needed to render the chat widget.
+    Never exposes internal instructions, organization IDs, or operational metrics.
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    welcome_message: str | None = None
+    primary_color: str | None = "#3b82f6"
