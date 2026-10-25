@@ -11,6 +11,7 @@ from sqlalchemy import (
     Index,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import UUID
@@ -19,6 +20,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
 if False:  # TYPE_CHECKING
+    from app.models.conversation import Conversation
     from app.models.organization import Organization
 
 
@@ -63,7 +65,11 @@ class Chatbot(Base):
     )
 
     organization: Mapped["Organization"] = relationship(back_populates="chatbots")
+    conversations: Mapped[list["Conversation"]] = relationship(
+        back_populates="chatbot", cascade="all, delete-orphan", overlaps="conversations"
+    )
 
     __table_args__ = (
         Index("ix_chatbots_org_created_at", "organization_id", "created_at"),
+        UniqueConstraint("id", "organization_id", name="uq_chatbots_id_org_id"),
     )

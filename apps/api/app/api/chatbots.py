@@ -4,15 +4,17 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.organizations import _require_org_role
 from app.auth.dependencies import AuthenticatedUser
 from app.db.session import get_db
 from app.models.chatbot import Chatbot
+from app.models.conversation import Conversation, Message
 from app.models.organization import MemberRole
 from app.schemas.chatbot import ChatbotCreate, ChatbotOut, ChatbotUpdate
+from app.schemas.conversation import DashboardConversationOut
 
 router = APIRouter(prefix="/organizations/{org_id}/chatbots", tags=["chatbots"])
 
@@ -227,3 +229,58 @@ async def delete_chatbot(
     await db.commit()
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/{bot_id}/conversations", response_model=list[DashboardConversationOut])
+async def list_chatbot_conversations(
+    org_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    current_user: AuthenticatedUser,
+    db: DbSession,
+) -> list[DashboardConversationOut]:
+    """List all conversations for a specific chatbot within the organization.
+
+    Requires membership in the organization. Returns 404 for non-members or if the chatbot
+    does not belong to the organization.
+    """
+    await _require_org_role(org_id, current_user.id, db, minimum_role=MemberRole.member)
+
+    # Verify chatbot belongs to this organization
+    bot_result = await db.execute(
+        select(Chatbot).where(
+            Chatbot.id == bot_id,
+            Chatbot.organization_id == org_id,
+        )
+    )
+    if not bot_result.scalar_one_or_none():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chatbot not found")
+
+    stmt = (
+        select(
+            Conversation,
+            func.count(Message.id).label("messages_count"),
+            func.max(Message.created_at).label("last_message_at"),
+        )
+        .outerjoin(Message, Message.conversation_id == Conversation.id)
+        .where(
+            Conversation.chatbot_id == bot_id,
+            Conversation.organization_id == org_id,
+        )
+        .group_by(Conversation.id)
+        .order_by(Conversation.created_at.desc())
+    )
+    rows = (await db.execute(stmt)).all()
+
+    return [
+        DashboardConversationOut(
+            id=conv.id,
+            chatbot_id=conv.chatbot_id,
+            visitor_id=conv.visitor_id,
+            status=conv.status,
+            messages_count=messages_count,
+            last_message_at=last_message_at,
+            created_at=conv.created_at,
+            updated_at=conv.updated_at,
+        )
+        for conv, messages_count, last_message_at in rows
+    ]

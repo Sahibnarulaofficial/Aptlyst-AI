@@ -19,6 +19,7 @@ from app.db.base import Base
 
 if False:  # TYPE_CHECKING
     from app.models.chatbot import Chatbot
+    from app.models.conversation import Conversation
 
 
 class MemberRole(str, enum.Enum):
@@ -49,6 +50,9 @@ class Organization(Base):
     )
     chatbots: Mapped[list["Chatbot"]] = relationship(
         back_populates="organization", cascade="all, delete-orphan"
+    )
+    conversations: Mapped[list["Conversation"]] = relationship(
+        back_populates="organization", cascade="all, delete-orphan", overlaps="chatbot,conversations"
     )
 
 
