@@ -1,12 +1,50 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.api.chatbots import router as chatbots_router
 from app.api.health import router as health_router
 from app.api.organizations import router as organizations_router
 from app.api.public_chatbots import router as public_chatbots_router
+from app.security.rate_limiter import (
+    RateLimitExceeded,
+    get_rate_limiter,
+    validate_rate_limiter_configuration,
+)
 
-app = FastAPI(title="Aptlyst AI API", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan managing startup validation and resource cleanup."""
+    validate_rate_limiter_configuration()
+    yield
+    limiter = get_rate_limiter()
+    if hasattr(limiter, "close"):
+        await limiter.close()
+
+
+app = FastAPI(title="Aptlyst AI API", version="0.1.0", lifespan=lifespan)
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    """Format HTTP 429 response with consistent JSON body and rate-limit headers."""
+    response = JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "detail": exc.detail,
+            "retry_after": exc.retry_after,
+            "limit": exc.limit,
+        },
+        headers=dict(exc.headers or {}),
+    )
+    if request.url.path.startswith("/api/v1/public/"):
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Expose-Headers"] = (
+            "Retry-After, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset"
+        )
+    return response
 
 # Internal dashboard CORS: restricted to authorized frontend origins with credentials.
 app.add_middleware(

@@ -13,6 +13,7 @@ from app.auth.visitor_session import (
     create_visitor_token,
     get_verified_visitor_session,
 )
+from app.config import settings
 from app.db.session import get_db
 from app.models.chatbot import Chatbot, ChatbotStatus
 from app.models.conversation import (
@@ -29,6 +30,7 @@ from app.schemas.conversation import (
     VisitorMessageCreate,
     VisitorMessageResponse,
 )
+from app.security.rate_limiter import check_rate_limit, get_client_ip
 
 router = APIRouter(prefix="/public/chatbots", tags=["public-chatbots"])
 
@@ -61,6 +63,7 @@ async def _check_visitor_payload_size(request: Request) -> None:
 @router.get("/{bot_id}", response_model=PublicChatbotConfig)
 async def get_public_chatbot(
     bot_id: uuid.UUID,
+    request: Request,
     db: DbSession,
 ) -> PublicChatbotConfig:
     """Retrieve public configuration for an active chatbot.
@@ -68,7 +71,17 @@ async def get_public_chatbot(
     Unauthenticated endpoint intended for the embeddable website widget.
     Returns 404 if the chatbot does not exist, is in draft mode, or is inactive.
     Never exposes internal instructions, organization IDs, or operational metrics.
+    Enforces IP-based rate limiting (60 req/min).
     """
+    client_ip = get_client_ip(request)
+    await check_rate_limit(
+        key=f"pub_cfg:{client_ip}",
+        limit=settings.rate_limit_public_config_per_minute,
+        window_seconds=60,
+        limit_name="public_config",
+        request=request,
+    )
+
     result = await db.execute(
         select(Chatbot).where(
             Chatbot.id == bot_id,
@@ -103,8 +116,28 @@ async def create_visitor_conversation(
     is in draft mode, or is inactive.
     Issues a cryptographically signed HMAC-SHA256 session token granting
     access only to this conversation and chatbot.
+    Enforces dual-window IP rate limiting (10/min, 50/hour) scoped by chatbot.
     """
     await _check_visitor_payload_size(request)
+
+    client_ip = get_client_ip(request)
+    # Minute limit: 10/min per IP per chatbot
+    await check_rate_limit(
+        key=f"conv_create_min:{bot_id}:{client_ip}",
+        limit=settings.rate_limit_conversation_create_per_minute,
+        window_seconds=60,
+        limit_name="conversation_create_minute",
+        request=request,
+    )
+    # Hourly limit: 50/hr per IP per chatbot
+    await check_rate_limit(
+        key=f"conv_create_hr:{bot_id}:{client_ip}",
+        limit=settings.rate_limit_conversation_create_per_hour,
+        window_seconds=3600,
+        limit_name="conversation_create_hour",
+        request=request,
+    )
+
     result = await db.execute(
         select(Chatbot).where(
             Chatbot.id == bot_id,
@@ -177,6 +210,25 @@ async def create_visitor_message(
     """
     # Enforce request payload size limit (<= 16 KB)
     await _check_visitor_payload_size(request)
+
+    # Rate Limiting:
+    # 1. Visitor session rate limit: 20 msg/min
+    await check_rate_limit(
+        key=f"msg_create_session:{conversation_id}",
+        limit=settings.rate_limit_message_create_per_visitor_minute,
+        window_seconds=60,
+        limit_name="message_create_session",
+        request=request,
+    )
+    # 2. Client IP rate limit: 40 msg/min
+    client_ip = get_client_ip(request)
+    await check_rate_limit(
+        key=f"msg_create_ip:{client_ip}",
+        limit=settings.rate_limit_message_create_per_ip_minute,
+        window_seconds=60,
+        limit_name="message_create_ip",
+        request=request,
+    )
 
     # Verify active chatbot
     bot_result = await db.execute(
@@ -272,13 +324,34 @@ async def create_visitor_message(
 async def list_conversation_messages(
     bot_id: uuid.UUID,
     conversation_id: uuid.UUID,
+    request: Request,
     db: DbSession,
     session: Annotated[VisitorSession, Depends(get_verified_visitor_session)],
 ) -> list[MessageOut]:
     """Retrieve the full chronological message transcript for a visitor conversation.
 
     Requires a valid signed visitor session token matching bot_id and conversation_id.
+    Enforces visitor session (30 req/min) and IP (60 req/min) rate limiting.
     """
+    # Rate Limiting:
+    # 1. Visitor session rate limit: 30 req/min
+    await check_rate_limit(
+        key=f"msg_list_session:{conversation_id}",
+        limit=settings.rate_limit_messages_list_per_visitor_minute,
+        window_seconds=60,
+        limit_name="messages_list_session",
+        request=request,
+    )
+    # 2. Client IP rate limit: 60 req/min
+    client_ip = get_client_ip(request)
+    await check_rate_limit(
+        key=f"msg_list_ip:{client_ip}",
+        limit=settings.rate_limit_messages_list_per_ip_minute,
+        window_seconds=60,
+        limit_name="messages_list_ip",
+        request=request,
+    )
+
     # Verify active chatbot
     bot_result = await db.execute(
         select(Chatbot).where(

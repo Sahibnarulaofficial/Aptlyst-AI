@@ -1,3 +1,4 @@
+import ipaddress
 from pathlib import Path
 from typing import Any
 from pydantic import field_validator
@@ -107,6 +108,39 @@ class Settings(BaseSettings):
         if secondary:
             secrets.append(secondary)
         return secrets
+
+    # Rate Limiting & Abuse Protection
+    rate_limiting_enabled: bool = True
+    rate_limit_storage: str = "memory"  # "memory" or "redis"
+    redis_url: str = ""
+    redis_fallback_policy: str = "memory"  # "memory", "fail_open", "fail_closed"
+    redis_connect_timeout_seconds: float = 1.0
+    redis_command_timeout_seconds: float = 1.0
+    trusted_proxies: str = "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+    rate_limit_max_keys: int = 10000
+    rate_limit_capacity_overflow_policy: str = "evict_oldest"  # "evict_oldest", "drop_new"
+
+    # Configurable Rate Limits
+    rate_limit_public_config_per_minute: int = 60
+    rate_limit_conversation_create_per_minute: int = 10
+    rate_limit_conversation_create_per_hour: int = 50
+    rate_limit_message_create_per_visitor_minute: int = 20
+    rate_limit_message_create_per_ip_minute: int = 40
+    rate_limit_messages_list_per_visitor_minute: int = 30
+    rate_limit_messages_list_per_ip_minute: int = 60
+
+    @property
+    def parsed_trusted_proxy_networks(self) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+        """Parse trusted_proxies string into IPv4/IPv6 networks."""
+        networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        for raw in self.trusted_proxies.split(","):
+            raw_str = raw.strip()
+            if raw_str:
+                try:
+                    networks.append(ipaddress.ip_network(raw_str, strict=False))
+                except ValueError:
+                    pass
+        return networks
 
     # Add future settings here as the product grows, e.g.:
     # openai_api_key: str = ""
