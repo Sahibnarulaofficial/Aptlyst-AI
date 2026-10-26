@@ -21,7 +21,9 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
 if False:  # TYPE_CHECKING
+    from app.models.billing import LLMUsageLog
     from app.models.chatbot import Chatbot
+    from app.models.generation import GenerationTask
     from app.models.organization import Organization
 
 
@@ -82,6 +84,12 @@ class Conversation(Base):
         cascade="all, delete-orphan",
         order_by="Message.created_at.asc()",
     )
+    generation_tasks: Mapped[list["GenerationTask"]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan"
+    )
+    usage_logs: Mapped[list["LLMUsageLog"]] = relationship(
+        back_populates="conversation"
+    )
 
     __table_args__ = (
         ForeignKeyConstraint(
@@ -120,6 +128,12 @@ class Message(Base):
     )
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
+    generation_task: Mapped["GenerationTask | None"] = relationship(
+        back_populates="visitor_message", uselist=False, cascade="all, delete-orphan"
+    )
+    usage_logs: Mapped[list["LLMUsageLog"]] = relationship(
+        back_populates="visitor_message"
+    )
 
     __table_args__ = (
         UniqueConstraint(

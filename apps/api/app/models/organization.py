@@ -18,8 +18,11 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
 if False:  # TYPE_CHECKING
+    from app.models.billing import LLMUsageLog, OrganizationBillingPeriod, UsageReservation
     from app.models.chatbot import Chatbot
     from app.models.conversation import Conversation
+    from app.models.generation import GenerationTask
+    from app.models.subscription import Subscription
 
 
 class MemberRole(str, enum.Enum):
@@ -53,6 +56,21 @@ class Organization(Base):
     )
     conversations: Mapped[list["Conversation"]] = relationship(
         back_populates="organization", cascade="all, delete-orphan", overlaps="chatbot,conversations"
+    )
+    billing_periods: Mapped[list["OrganizationBillingPeriod"]] = relationship(
+        back_populates="organization"
+    )
+    subscriptions: Mapped[list["Subscription"]] = relationship(
+        back_populates="organization"
+    )
+    generation_tasks: Mapped[list["GenerationTask"]] = relationship(
+        back_populates="organization"
+    )
+    usage_reservations: Mapped[list["UsageReservation"]] = relationship(
+        back_populates="organization"
+    )
+    usage_logs: Mapped[list["LLMUsageLog"]] = relationship(
+        back_populates="organization"
     )
 
 

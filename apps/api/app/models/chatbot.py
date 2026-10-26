@@ -20,6 +20,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
 if False:  # TYPE_CHECKING
+    from app.models.billing import LLMUsageLog
     from app.models.conversation import Conversation
     from app.models.organization import Organization
 
@@ -68,6 +69,7 @@ class Chatbot(Base):
     conversations: Mapped[list["Conversation"]] = relationship(
         back_populates="chatbot", cascade="all, delete-orphan", overlaps="conversations"
     )
+    usage_logs: Mapped[list["LLMUsageLog"]] = relationship(back_populates="chatbot")
 
     __table_args__ = (
         Index("ix_chatbots_org_created_at", "organization_id", "created_at"),

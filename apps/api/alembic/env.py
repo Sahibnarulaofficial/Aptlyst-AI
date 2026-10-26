@@ -15,6 +15,9 @@ from app.db.base import Base
 from app.models.organization import Organization, OrganizationMember  # noqa: F401
 from app.models.chatbot import Chatbot  # noqa: F401
 from app.models.conversation import Conversation, Message  # noqa: F401
+from app.models.billing import OrganizationBillingPeriod, UsageReservation, LLMUsageLog  # noqa: F401
+from app.models.generation import GenerationTask  # noqa: F401
+from app.models.subscription import Subscription, StripeWebhookEvent  # noqa: F401
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url)
