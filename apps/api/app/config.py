@@ -65,6 +65,11 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "VISITOR_SESSION_SECRET must be at least 32 characters long in production."
                 )
+            if self.llm_provider.strip().lower() == "mock" and not self.llm_allow_mock_in_production:
+                raise ValueError(
+                    "Mock LLM provider is strictly for development and automated testing. "
+                    "It is prohibited in production environments."
+                )
 
     @property
     def resolved_visitor_session_secret(self) -> str:
@@ -141,6 +146,29 @@ class Settings(BaseSettings):
                 except ValueError:
                     pass
         return networks
+
+    # AI Generation Foundation (Milestone 3 - Phase 1)
+    llm_provider: str = "disabled"  # "disabled" by default; set to "mock" for local dev/testing
+    llm_model: str = "mock-gpt-4o-mini"
+    llm_timeout_seconds: float = 10.0
+    llm_max_output_tokens: int = 1000
+    llm_temperature: float = 0.7
+    llm_max_context_messages: int = 10
+    llm_allow_mock_in_production: bool = False
+
+    @field_validator("llm_provider")
+    @classmethod
+    def validate_llm_provider(cls, v: str) -> str:
+        """Validate that llm_provider is one of the supported Phase 1 options."""
+        if isinstance(v, str):
+            normalized = v.strip().lower()
+            if normalized not in ("disabled", "mock"):
+                raise ValueError(
+                    f"Unsupported LLM provider '{v}'. "
+                    "Phase 1 accepts only 'disabled' or 'mock'."
+                )
+            return normalized
+        raise ValueError("llm_provider must be a string")
 
     # Add future settings here as the product grows, e.g.:
     # openai_api_key: str = ""

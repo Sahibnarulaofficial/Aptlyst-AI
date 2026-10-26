@@ -1,11 +1,20 @@
 """Pydantic schemas for conversations and messages."""
 
+import enum
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.conversation import ConversationStatus, MessageSenderType
+
+
+class GenerationStatus(str, enum.Enum):
+    """Status of AI assistant response generation for a submitted visitor message."""
+
+    completed = "completed"
+    failed = "failed"
+    skipped = "skipped"
 
 
 class ConversationCreate(BaseModel):
@@ -46,6 +55,21 @@ class VisitorMessageCreate(BaseModel):
         description="Client-generated unique ID for idempotent message submission.",
     )
 
+    @field_validator("client_message_id")
+    @classmethod
+    def validate_client_message_id(cls, v: str | None) -> str | None:
+        """Reserve 'reply:' prefix for system assistant correlation keys."""
+        if v is None:
+            return None
+        trimmed = v.strip()
+        if not trimmed:
+            return None
+        if trimmed.lower().startswith("reply:"):
+            raise ValueError(
+                "client_message_id cannot use the reserved 'reply:' prefix."
+            )
+        return trimmed
+
 
 class MessageOut(BaseModel):
     """Schema for a persisted conversation message."""
@@ -63,16 +87,30 @@ class MessageOut(BaseModel):
 class VisitorMessageResponse(BaseModel):
     """Response returned upon submitting a visitor message.
 
-    Explicit API Contract:
-    AI assistant replies are not generated in Milestone 1. The 'assistant_reply'
-    field is always null in this milestone, indicating successful message persistence
-    without synchronous LLM invocation.
+    API Contract (Milestone 3):
+    - message: The persisted visitor message (always saved even if AI generation fails).
+    - assistant_reply: Text content of the generated reply, or null if skipped/failed.
+    - assistant_message: Full persisted assistant message record, or null if skipped/failed.
+    - generation_status: Status of the assistant reply generation: 'completed', 'failed', or 'skipped'.
+    - generation_error: Non-fatal error explanation if generation failed (visitor message is preserved).
     """
 
     message: MessageOut
     assistant_reply: str | None = Field(
         default=None,
-        description="Explicit API contract: AI replies are not generated in Milestone 1.",
+        description="Text content of the generated assistant reply, or null if skipped/failed.",
+    )
+    assistant_message: MessageOut | None = Field(
+        default=None,
+        description="Full persisted assistant message record, or null if generation was skipped/failed.",
+    )
+    generation_status: GenerationStatus = Field(
+        default=GenerationStatus.completed,
+        description="Status of assistant reply generation: 'completed', 'failed', or 'skipped'.",
+    )
+    generation_error: str | None = Field(
+        default=None,
+        description="Non-fatal error detail when generation fails; visitor message is preserved.",
     )
 
 

@@ -26,11 +26,13 @@ from app.schemas.chatbot import PublicChatbotConfig
 from app.schemas.conversation import (
     ConversationCreate,
     ConversationPublicOut,
+    GenerationStatus,
     MessageOut,
     VisitorMessageCreate,
     VisitorMessageResponse,
 )
 from app.security.rate_limiter import check_rate_limit, get_client_ip
+from app.services.llm import generate_and_persist_assistant_reply
 
 router = APIRouter(prefix="/public/chatbots", tags=["public-chatbots"])
 
@@ -274,14 +276,48 @@ async def create_visitor_message(
         )
         existing_msg = existing_result.scalar_one_or_none()
         if existing_msg:
-            # Idempotent replay: return existing message with 200 OK
+            # Idempotent replay: check if assistant reply already exists
+            reply_result = await db.execute(
+                select(Message).where(
+                    Message.conversation_id == conversation_id,
+                    Message.client_message_id == f"reply:{existing_msg.id}",
+                )
+            )
+            existing_reply = reply_result.scalar_one_or_none()
             response.status_code = status.HTTP_200_OK
+
+            if existing_reply:
+                return VisitorMessageResponse(
+                    message=MessageOut.model_validate(existing_msg),
+                    assistant_reply=existing_reply.content,
+                    assistant_message=MessageOut.model_validate(existing_reply),
+                    generation_status=GenerationStatus.completed,
+                )
+
+            # Prior generation did not produce a reply; generate if provider is active
+            if settings.llm_provider.strip().lower() == "disabled":
+                return VisitorMessageResponse(
+                    message=MessageOut.model_validate(existing_msg),
+                    assistant_reply=None,
+                    assistant_message=None,
+                    generation_status=GenerationStatus.skipped,
+                )
+
+            gen_result = await generate_and_persist_assistant_reply(
+                db=db,
+                chatbot=bot,
+                conversation_id=conversation_id,
+                visitor_message=existing_msg,
+            )
             return VisitorMessageResponse(
                 message=MessageOut.model_validate(existing_msg),
-                assistant_reply=None,
+                assistant_reply=gen_result.reply_message.content if gen_result.reply_message else None,
+                assistant_message=MessageOut.model_validate(gen_result.reply_message) if gen_result.reply_message else None,
+                generation_status=gen_result.status,
+                generation_error=gen_result.error,
             )
 
-    # Insert message
+    # Insert visitor message
     msg = Message(
         conversation_id=conversation_id,
         sender_type=MessageSenderType.visitor,
@@ -305,15 +341,59 @@ async def create_visitor_message(
             existing_msg = existing_result.scalar_one_or_none()
             if existing_msg:
                 response.status_code = status.HTTP_200_OK
+                # Check if the concurrent winner already saved an assistant reply
+                reply_result = await db.execute(
+                    select(Message).where(
+                        Message.conversation_id == conversation_id,
+                        Message.client_message_id == f"reply:{existing_msg.id}",
+                    )
+                )
+                existing_reply = reply_result.scalar_one_or_none()
+                if existing_reply:
+                    return VisitorMessageResponse(
+                        message=MessageOut.model_validate(existing_msg),
+                        assistant_reply=existing_reply.content,
+                        assistant_message=MessageOut.model_validate(existing_reply),
+                        generation_status=GenerationStatus.completed,
+                    )
+
+                gen_result = await generate_and_persist_assistant_reply(
+                    db=db,
+                    chatbot=bot,
+                    conversation_id=conversation_id,
+                    visitor_message=existing_msg,
+                )
                 return VisitorMessageResponse(
                     message=MessageOut.model_validate(existing_msg),
-                    assistant_reply=None,
+                    assistant_reply=gen_result.reply_message.content if gen_result.reply_message else None,
+                    assistant_message=MessageOut.model_validate(gen_result.reply_message) if gen_result.reply_message else None,
+                    generation_status=gen_result.status,
+                    generation_error=gen_result.error,
                 )
         raise
 
+    # AI Generation Lifecycle
+    if settings.llm_provider.strip().lower() == "disabled":
+        return VisitorMessageResponse(
+            message=MessageOut.model_validate(msg),
+            assistant_reply=None,
+            assistant_message=None,
+            generation_status=GenerationStatus.skipped,
+        )
+
+    gen_result = await generate_and_persist_assistant_reply(
+        db=db,
+        chatbot=bot,
+        conversation_id=conversation_id,
+        visitor_message=msg,
+    )
+
     return VisitorMessageResponse(
         message=MessageOut.model_validate(msg),
-        assistant_reply=None,
+        assistant_reply=gen_result.reply_message.content if gen_result.reply_message else None,
+        assistant_message=MessageOut.model_validate(gen_result.reply_message) if gen_result.reply_message else None,
+        generation_status=gen_result.status,
+        generation_error=gen_result.error,
     )
 
 
