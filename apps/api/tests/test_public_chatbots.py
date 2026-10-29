@@ -1,16 +1,23 @@
 """Tests for public chatbot runtime endpoint and CORS behavior."""
 
+import os
 import uuid
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete
 
-from app.db.session import AsyncSessionLocal
+from app.db.session import AsyncSessionLocal, get_db
 from app.main import app
 from app.models.organization import Organization
 from tests.test_auth import TEST_JWT_SECRET, make_token
+
+RUN_INTEGRATION_TESTS = os.getenv("RUN_SUPABASE_INTEGRATION_TESTS", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 
 @pytest.fixture
@@ -27,6 +34,10 @@ async def client() -> AsyncClient:
 
 
 @pytest.mark.anyio
+@pytest.mark.skipif(
+    not RUN_INTEGRATION_TESTS,
+    reason="Public chatbot full lifecycle integration test requires real PostgreSQL with RUN_SUPABASE_INTEGRATION_TESTS=1",
+)
 async def test_get_public_chatbot_active_success_and_field_filtering(client: AsyncClient) -> None:
     """Verifies that an active chatbot returns only public visual fields, never instructions or org IDs."""
     user_id = uuid.uuid4()
@@ -120,13 +131,22 @@ async def test_get_public_chatbot_active_success_and_field_filtering(client: Asy
 @pytest.mark.anyio
 async def test_get_public_chatbot_nonexistent_and_invalid_uuid(client: AsyncClient) -> None:
     """Verifies that nonexistent bot IDs return 404 and malformed UUIDs return 422."""
-    random_bot_id = uuid.uuid4()
-    res_nonexistent = await client.get(f"/api/v1/public/chatbots/{random_bot_id}")
-    assert res_nonexistent.status_code == 404
-    assert res_nonexistent.json()["detail"] == "Chatbot not found"
+    mock_session = AsyncMock()
+    mock_res = MagicMock()
+    mock_res.scalar_one_or_none.return_value = None
+    mock_session.execute = AsyncMock(return_value=mock_res)
+    app.dependency_overrides[get_db] = lambda: mock_session
 
-    res_invalid_uuid = await client.get("/api/v1/public/chatbots/not-a-valid-uuid")
-    assert res_invalid_uuid.status_code == 422
+    try:
+        random_bot_id = uuid.uuid4()
+        res_nonexistent = await client.get(f"/api/v1/public/chatbots/{random_bot_id}")
+        assert res_nonexistent.status_code == 404
+        assert res_nonexistent.json()["detail"] == "Chatbot not found"
+
+        res_invalid_uuid = await client.get("/api/v1/public/chatbots/not-a-valid-uuid")
+        assert res_invalid_uuid.status_code == 422
+    finally:
+        app.dependency_overrides.pop(get_db, None)
 
 
 @pytest.mark.anyio

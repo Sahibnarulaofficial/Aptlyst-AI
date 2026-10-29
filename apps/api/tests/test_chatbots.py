@@ -1,5 +1,6 @@
 """Tests for chatbot management, validation, role authorization, and tenant isolation."""
 
+import os
 import uuid
 from unittest.mock import patch
 
@@ -12,6 +13,17 @@ from app.main import app
 from app.models.chatbot import Chatbot, ChatbotStatus
 from app.models.organization import MemberRole, Organization, OrganizationMember
 from tests.test_auth import TEST_JWT_SECRET, make_token
+
+RUN_INTEGRATION_TESTS = os.getenv("RUN_SUPABASE_INTEGRATION_TESTS", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+db_required = pytest.mark.skipif(
+    not RUN_INTEGRATION_TESTS,
+    reason="Chatbot database integration test requires real PostgreSQL with RUN_SUPABASE_INTEGRATION_TESTS=1",
+)
 
 
 @pytest.fixture
@@ -28,6 +40,7 @@ async def client() -> AsyncClient:
 
 
 @pytest.mark.anyio
+@db_required
 async def test_create_and_list_chatbots_scoped_to_organization(client: AsyncClient) -> None:
     """Verifies that an organization member can create and list chatbots scoped to their org."""
     user_id = uuid.uuid4()
@@ -105,6 +118,7 @@ async def test_create_and_list_chatbots_scoped_to_organization(client: AsyncClie
 
 
 @pytest.mark.anyio
+@db_required
 async def test_chatbot_validation_rules(client: AsyncClient) -> None:
     """Verifies that invalid payloads (empty name, bad URL, bad hex) are rejected with 422."""
     user_id = uuid.uuid4()
@@ -156,6 +170,7 @@ async def test_chatbot_validation_rules(client: AsyncClient) -> None:
 
 
 @pytest.mark.anyio
+@db_required
 async def test_chatbot_cross_tenant_isolation(client: AsyncClient) -> None:
     """Verifies tenant isolation: User B cannot list, create, or read chatbots in User A's org."""
     user_a = uuid.uuid4()
@@ -218,6 +233,7 @@ async def test_chatbot_cross_tenant_isolation(client: AsyncClient) -> None:
 
 
 @pytest.mark.anyio
+@db_required
 async def test_chatbot_cross_org_id_tampering(client: AsyncClient) -> None:
     """Verifies that requesting a Bot from Org A through Org B URL path returns 404 even if user belongs to Org B."""
     user = uuid.uuid4()
@@ -310,6 +326,7 @@ async def test_chatbot_unauthenticated_requests_rejected(client: AsyncClient) ->
 
 
 @pytest.mark.anyio
+@db_required
 async def test_update_chatbot_supported_fields_and_partial_updates(client: AsyncClient) -> None:
     """Verifies partial updates, updating each supported field, and explicit null vs omitted."""
     user_id = uuid.uuid4()
@@ -434,6 +451,7 @@ async def test_update_chatbot_supported_fields_and_partial_updates(client: Async
 
 
 @pytest.mark.anyio
+@db_required
 async def test_update_chatbot_validation_rules(client: AsyncClient) -> None:
     """Verifies that invalid updates (empty name, bad URL, bad hex, bad status, null name) are rejected with 422."""
     user_id = uuid.uuid4()
@@ -516,6 +534,7 @@ async def test_update_chatbot_validation_rules(client: AsyncClient) -> None:
 
 
 @pytest.mark.anyio
+@db_required
 async def test_update_chatbot_isolation_and_authorization(client: AsyncClient) -> None:
     """Verifies that non-existent bot returns 404, cross-org access returns 404, and members/admins/owners can update."""
     user_a = uuid.uuid4()
@@ -611,6 +630,7 @@ async def test_update_chatbot_isolation_and_authorization(client: AsyncClient) -
 
 
 @pytest.mark.anyio
+@db_required
 async def test_chatbot_color_validation_consistency_and_editing_regression(
     client: AsyncClient,
 ) -> None:
@@ -693,6 +713,7 @@ async def test_chatbot_color_validation_consistency_and_editing_regression(
 
 
 @pytest.mark.anyio
+@db_required
 async def test_delete_chatbot_successful_and_cross_tenant_isolation(
     client: AsyncClient,
 ) -> None:
@@ -815,6 +836,7 @@ async def test_delete_chatbot_successful_and_cross_tenant_isolation(
 
 
 @pytest.mark.anyio
+@db_required
 async def test_delete_chatbot_roles_and_transaction_safety(
     client: AsyncClient,
 ) -> None:

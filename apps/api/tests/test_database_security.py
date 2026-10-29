@@ -6,10 +6,29 @@ actual database-level constraints, role attributes, Row Level Security (RLS) sta
 and PostgreSQL privilege catalogs (`pg_roles`, `pg_tables`, and `information_schema.table_privileges`).
 """
 
+import os
 import pytest
 from sqlalchemy import text
 
 from app.db.session import AsyncSessionLocal
+
+
+RUN_INTEGRATION_TESTS = os.getenv("RUN_SUPABASE_INTEGRATION_TESTS", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+pytestmark = [
+    pytest.mark.skipif(
+        not RUN_INTEGRATION_TESTS,
+        reason=(
+            "PostgreSQL security catalog tests are disabled. "
+            "Set RUN_SUPABASE_INTEGRATION_TESTS=1 and configure test environment variables to enable."
+        ),
+    ),
+    pytest.mark.anyio,
+]
 
 
 @pytest.fixture

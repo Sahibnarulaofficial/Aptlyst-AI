@@ -1,6 +1,7 @@
 """Tests for organization management, role authorization, tenant isolation, and concurrency."""
 
 import asyncio
+import os
 import uuid
 from unittest.mock import patch
 
@@ -12,6 +13,23 @@ from app.db.session import AsyncSessionLocal
 from app.main import app
 from app.models.organization import MemberRole, Organization, OrganizationMember
 from tests.test_auth import TEST_JWT_SECRET, make_token
+
+RUN_INTEGRATION_TESTS = os.getenv("RUN_SUPABASE_INTEGRATION_TESTS", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+pytestmark = [
+    pytest.mark.skipif(
+        not RUN_INTEGRATION_TESTS,
+        reason=(
+            "Organization integration tests require real PostgreSQL database. "
+            "Set RUN_SUPABASE_INTEGRATION_TESTS=1 and configure test environment variables to enable."
+        ),
+    ),
+    pytest.mark.anyio,
+]
 
 
 @pytest.fixture

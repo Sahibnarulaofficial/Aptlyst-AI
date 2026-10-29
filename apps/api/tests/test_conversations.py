@@ -13,6 +13,7 @@ Covers:
 - Multi-tenant database invariant (composite foreign key rejects cross-org associations).
 """
 
+import os
 import time
 import uuid
 from unittest.mock import patch
@@ -36,6 +37,12 @@ from app.models.chatbot import Chatbot, ChatbotStatus
 from app.models.conversation import Conversation, ConversationStatus, Message, MessageSenderType
 from app.models.organization import Organization
 from tests.test_auth import TEST_JWT_SECRET, make_token
+
+RUN_INTEGRATION_TESTS = os.getenv("RUN_SUPABASE_INTEGRATION_TESTS", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 
 @pytest.fixture
@@ -241,6 +248,10 @@ def test_production_secret_enforcement() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.skipif(
+    not RUN_INTEGRATION_TESTS,
+    reason="Conversation lifecycle integration test requires real PostgreSQL with RUN_SUPABASE_INTEGRATION_TESTS=1",
+)
 async def test_conversation_lifecycle_and_security(client: AsyncClient) -> None:
     """Full lifecycle integration test:
 
@@ -478,6 +489,10 @@ async def test_conversation_lifecycle_and_security(client: AsyncClient) -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.skipif(
+    not RUN_INTEGRATION_TESTS,
+    reason="Composite foreign key test requires real PostgreSQL with RUN_SUPABASE_INTEGRATION_TESTS=1",
+)
 async def test_composite_foreign_key_cross_org_invariant() -> None:
     """Verifies that the database composite FK rejects conversations referencing a bot from another org."""
     user_id = uuid.uuid4()
