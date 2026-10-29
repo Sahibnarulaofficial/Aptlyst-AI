@@ -1,5 +1,6 @@
 """Public chatbots API router for unauthenticated widget and embed runtimes."""
 
+import logging
 import uuid
 from typing import Annotated
 
@@ -32,7 +33,13 @@ from app.schemas.conversation import (
     VisitorMessageResponse,
 )
 from app.security.rate_limiter import check_rate_limit, get_client_ip
-from app.services.llm import generate_and_persist_assistant_reply
+from app.services.llm import (
+    OrchestrationResult,
+    OrchestratorErrorCode,
+    orchestrate_assistant_reply,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/public/chatbots", tags=["public-chatbots"])
 
@@ -60,6 +67,106 @@ async def _check_visitor_payload_size(request: Request) -> None:
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail="Payload exceeds maximum allowed size of 16 KB",
         )
+
+
+def _map_orchestrator_error_to_public_message(result: OrchestrationResult) -> str:
+    """Translate internal orchestrator error codes into safe, deliberate public error strings.
+
+    Ensures that internal financial details, quota counts, spending limits,
+    database IDs, and sensitive infrastructure errors are NEVER exposed to public clients.
+    """
+    if result.error_code in (
+        OrchestratorErrorCode.QUOTA_EXHAUSTED,
+        OrchestratorErrorCode.SPENDING_CAP_EXHAUSTED,
+    ):
+        return "The AI assistant is currently unavailable due to usage limits. Your message was saved."
+
+    if result.error_code == OrchestratorErrorCode.NO_ACTIVE_BILLING_PERIOD:
+        return "The AI assistant is currently unavailable due to organization service limits. Your message was saved."
+
+    if result.error_code in (
+        OrchestratorErrorCode.PROVIDER_TIMEOUT,
+        OrchestratorErrorCode.TASK_QUARANTINED,
+    ):
+        return "The AI assistant timed out while generating a response. Your message was saved."
+
+    # General provider error, lease fencing, settlement failures, pre-dispatch failures, etc.
+    return "The AI assistant is temporarily unavailable. Your message was saved."
+
+
+async def _execute_orchestrated_generation(
+    db: AsyncSession,
+    chatbot: Chatbot,
+    conversation_id: uuid.UUID,
+    visitor_message: Message,
+) -> VisitorMessageResponse:
+    """Coordinate generation turn using the durable billing-aware orchestrator.
+
+    Preserves public response schema:
+    - If provider is disabled -> generation_status='skipped'
+    - If generation succeeds -> generation_status='completed', assistant_reply and assistant_message populated
+    - If generation fails (quota, timeout, provider error, settlement) -> generation_status='failed',
+      assistant_reply=None, assistant_message=None, generation_error mapped to safe public text.
+      The visitor message remains persisted and intact.
+    """
+    if settings.llm_provider.strip().lower() == "disabled":
+        return VisitorMessageResponse(
+            message=MessageOut.model_validate(visitor_message),
+            assistant_reply=None,
+            assistant_message=None,
+            generation_status=GenerationStatus.skipped,
+            generation_error=None,
+        )
+
+    try:
+        orch_result = await orchestrate_assistant_reply(
+            db=db,
+            chatbot=chatbot,
+            conversation_id=conversation_id,
+            visitor_message=visitor_message,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Unexpected error during orchestrated AI generation for conversation %s, visitor message %s: %s",
+            conversation_id,
+            visitor_message.id,
+            exc,
+        )
+        return VisitorMessageResponse(
+            message=MessageOut.model_validate(visitor_message),
+            assistant_reply=None,
+            assistant_message=None,
+            generation_status=GenerationStatus.failed,
+            generation_error="The AI assistant is temporarily unavailable. Your message was saved.",
+        )
+
+    if orch_result.status == GenerationStatus.completed and orch_result.reply_message:
+        return VisitorMessageResponse(
+            message=MessageOut.model_validate(visitor_message),
+            assistant_reply=orch_result.reply_message.content,
+            assistant_message=MessageOut.model_validate(orch_result.reply_message),
+            generation_status=GenerationStatus.completed,
+            generation_error=None,
+        )
+
+    if orch_result.status == GenerationStatus.skipped:
+        return VisitorMessageResponse(
+            message=MessageOut.model_validate(visitor_message),
+            assistant_reply=None,
+            assistant_message=None,
+            generation_status=GenerationStatus.skipped,
+            generation_error=None,
+        )
+
+    # Generation failed or quarantined
+    public_error = _map_orchestrator_error_to_public_message(orch_result)
+    return VisitorMessageResponse(
+        message=MessageOut.model_validate(visitor_message),
+        assistant_reply=None,
+        assistant_message=None,
+        generation_status=GenerationStatus.failed,
+        generation_error=public_error,
+    )
 
 
 @router.get("/{bot_id}", response_model=PublicChatbotConfig)
@@ -295,26 +402,11 @@ async def create_visitor_message(
                 )
 
             # Prior generation did not produce a reply; generate if provider is active
-            if settings.llm_provider.strip().lower() == "disabled":
-                return VisitorMessageResponse(
-                    message=MessageOut.model_validate(existing_msg),
-                    assistant_reply=None,
-                    assistant_message=None,
-                    generation_status=GenerationStatus.skipped,
-                )
-
-            gen_result = await generate_and_persist_assistant_reply(
+            return await _execute_orchestrated_generation(
                 db=db,
                 chatbot=bot,
                 conversation_id=conversation_id,
                 visitor_message=existing_msg,
-            )
-            return VisitorMessageResponse(
-                message=MessageOut.model_validate(existing_msg),
-                assistant_reply=gen_result.reply_message.content if gen_result.reply_message else None,
-                assistant_message=MessageOut.model_validate(gen_result.reply_message) if gen_result.reply_message else None,
-                generation_status=gen_result.status,
-                generation_error=gen_result.error,
             )
 
     # Insert visitor message
@@ -357,43 +449,20 @@ async def create_visitor_message(
                         generation_status=GenerationStatus.completed,
                     )
 
-                gen_result = await generate_and_persist_assistant_reply(
+                return await _execute_orchestrated_generation(
                     db=db,
                     chatbot=bot,
                     conversation_id=conversation_id,
                     visitor_message=existing_msg,
                 )
-                return VisitorMessageResponse(
-                    message=MessageOut.model_validate(existing_msg),
-                    assistant_reply=gen_result.reply_message.content if gen_result.reply_message else None,
-                    assistant_message=MessageOut.model_validate(gen_result.reply_message) if gen_result.reply_message else None,
-                    generation_status=gen_result.status,
-                    generation_error=gen_result.error,
-                )
         raise
 
-    # AI Generation Lifecycle
-    if settings.llm_provider.strip().lower() == "disabled":
-        return VisitorMessageResponse(
-            message=MessageOut.model_validate(msg),
-            assistant_reply=None,
-            assistant_message=None,
-            generation_status=GenerationStatus.skipped,
-        )
-
-    gen_result = await generate_and_persist_assistant_reply(
+    # AI Generation Lifecycle (durable, billing-aware orchestrator)
+    return await _execute_orchestrated_generation(
         db=db,
         chatbot=bot,
         conversation_id=conversation_id,
         visitor_message=msg,
-    )
-
-    return VisitorMessageResponse(
-        message=MessageOut.model_validate(msg),
-        assistant_reply=gen_result.reply_message.content if gen_result.reply_message else None,
-        assistant_message=MessageOut.model_validate(gen_result.reply_message) if gen_result.reply_message else None,
-        generation_status=gen_result.status,
-        generation_error=gen_result.error,
     )
 
 
