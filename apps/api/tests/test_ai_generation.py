@@ -22,7 +22,7 @@ Covers:
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -32,9 +32,12 @@ from httpx import ASGITransport, AsyncClient
 from app.auth.visitor_session import create_visitor_token
 from app.config import Settings, settings
 from app.db.session import get_db
+import app.models.subscription  # noqa: F401
 from app.main import app
+from app.models.billing import OrganizationBillingPeriod
 from app.models.chatbot import Chatbot, ChatbotStatus
 from app.models.conversation import Conversation, ConversationStatus, Message, MessageSenderType
+from app.models.generation import GenerationTaskStatus
 from app.schemas.conversation import GenerationStatus, VisitorMessageCreate
 from app.services.llm import (
     BaseLLMProvider,
@@ -49,6 +52,7 @@ from app.services.llm import (
     generate_and_persist_assistant_reply,
     set_llm_provider_for_testing,
 )
+from tests.test_public_chat_orchestration import MockPublicSession
 
 
 @pytest.fixture
@@ -577,44 +581,48 @@ async def test_http_api_message_submission_generates_mock_reply(client: AsyncCli
     """End-to-end integration: Visitor posts message -> assistant reply generated and returned."""
     bot_id = uuid.uuid4()
     conv_id = uuid.uuid4()
+    org_id = uuid.uuid4()
     session_token, visitor_id = create_visitor_token(bot_id=bot_id, conversation_id=conv_id)
 
     mock_bot = Chatbot(
         id=bot_id,
-        organization_id=uuid.uuid4(),
+        organization_id=org_id,
         name="Live Assistant",
         instructions="Assist courteously.",
         status=ChatbotStatus.active,
     )
     mock_conv = Conversation(
         id=conv_id,
-        organization_id=mock_bot.organization_id,
+        organization_id=org_id,
         chatbot_id=bot_id,
         visitor_id=visitor_id,
         status=ConversationStatus.active,
     )
 
+    now = datetime.now(timezone.utc)
+    mock_bp = OrganizationBillingPeriod(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        period_start=now - timedelta(days=1),
+        period_end=now + timedelta(days=29),
+        is_active=True,
+        is_blocked=False,
+        monthly_token_quota=100_000,
+        tokens_used=0,
+        tokens_reserved=0,
+        hard_spending_cap_micros=10_000_000,
+        cost_micros_used=0,
+        cost_micros_reserved=0,
+    )
+
     custom_mock = MockLLMProvider(canned_response="Hello! I am your AI assistant.")
     set_llm_provider_for_testing(custom_mock)
 
-    mock_session = AsyncMock()
-    mock_session.add = MagicMock()
-
-    bot_res = MagicMock(); bot_res.scalar_one_or_none.return_value = mock_bot
-    conv_res = MagicMock(); conv_res.scalar_one_or_none.return_value = mock_conv
-    idemp_res = MagicMock(); idemp_res.scalar_one_or_none.return_value = None
-    reply_res = MagicMock(); reply_res.scalar_one_or_none.return_value = None
-    ctx_res = MagicMock(); ctx_res.scalars.return_value.all.return_value = []
-
-    mock_session.execute = AsyncMock(side_effect=[bot_res, conv_res, idemp_res, reply_res, ctx_res])
-
-    async def mock_refresh(instance):
-        if not getattr(instance, "id", None):
-            instance.id = uuid.uuid4()
-        if not getattr(instance, "created_at", None):
-            instance.created_at = datetime.now(timezone.utc)
-
-    mock_session.refresh = mock_refresh
+    mock_session = MockPublicSession(
+        chatbots={bot_id: mock_bot},
+        conversations={conv_id: mock_conv},
+        billing_periods={mock_bp.id: mock_bp},
+    )
     app.dependency_overrides[get_db] = lambda: mock_session
 
     try:
@@ -636,6 +644,10 @@ async def test_http_api_message_submission_generates_mock_reply(client: AsyncCli
         assert data["generation_status"] == "completed"
         assert data["generation_error"] is None
         assert custom_mock.call_count == 1
+
+        # Verify orchestrator task and usage accounting occurred
+        assert len(mock_session.tasks) == 1
+        assert len(mock_session.usage_logs) == 1
     finally:
         app.dependency_overrides.pop(get_db, None)
 
@@ -645,42 +657,47 @@ async def test_http_api_timeout_preserves_visitor_message(client: AsyncClient) -
     """Verifies that provider timeout returns 201 with preserved visitor message and failure status."""
     bot_id = uuid.uuid4()
     conv_id = uuid.uuid4()
+    org_id = uuid.uuid4()
     session_token, visitor_id = create_visitor_token(bot_id=bot_id, conversation_id=conv_id)
 
     mock_bot = Chatbot(
         id=bot_id,
-        organization_id=uuid.uuid4(),
+        organization_id=org_id,
         name="Live Assistant",
         status=ChatbotStatus.active,
     )
     mock_conv = Conversation(
         id=conv_id,
-        organization_id=mock_bot.organization_id,
+        organization_id=org_id,
         chatbot_id=bot_id,
         visitor_id=visitor_id,
         status=ConversationStatus.active,
     )
 
+    now = datetime.now(timezone.utc)
+    mock_bp = OrganizationBillingPeriod(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        period_start=now - timedelta(days=1),
+        period_end=now + timedelta(days=29),
+        is_active=True,
+        is_blocked=False,
+        monthly_token_quota=100_000,
+        tokens_used=0,
+        tokens_reserved=0,
+        hard_spending_cap_micros=10_000_000,
+        cost_micros_used=0,
+        cost_micros_reserved=0,
+    )
+
     custom_mock = MockLLMProvider(force_timeout=True)
     set_llm_provider_for_testing(custom_mock)
 
-    mock_session = AsyncMock()
-    mock_session.add = MagicMock()
-    bot_res = MagicMock(); bot_res.scalar_one_or_none.return_value = mock_bot
-    conv_res = MagicMock(); conv_res.scalar_one_or_none.return_value = mock_conv
-    idemp_res = MagicMock(); idemp_res.scalar_one_or_none.return_value = None
-    reply_res = MagicMock(); reply_res.scalar_one_or_none.return_value = None
-    ctx_res = MagicMock(); ctx_res.scalars.return_value.all.return_value = []
-
-    mock_session.execute = AsyncMock(side_effect=[bot_res, conv_res, idemp_res, reply_res, ctx_res])
-
-    async def mock_refresh(instance):
-        if not getattr(instance, "id", None):
-            instance.id = uuid.uuid4()
-        if not getattr(instance, "created_at", None):
-            instance.created_at = datetime.now(timezone.utc)
-
-    mock_session.refresh = mock_refresh
+    mock_session = MockPublicSession(
+        chatbots={bot_id: mock_bot},
+        conversations={conv_id: mock_conv},
+        billing_periods={mock_bp.id: mock_bp},
+    )
     app.dependency_overrides[get_db] = lambda: mock_session
 
     try:
@@ -698,6 +715,12 @@ async def test_http_api_timeout_preserves_visitor_message(client: AsyncClient) -
         assert data["assistant_message"] is None
         assert data["generation_status"] == "failed"
         assert "timed out" in data["generation_error"].lower()
+
+        # Orchestrator invariant: timeout preserves liability and quarantines task
+        assert len(mock_session.tasks) == 1
+        task = next(iter(mock_session.tasks.values()))
+        assert task.status == GenerationTaskStatus.reconciliation_needed
+        assert mock_bp.tokens_reserved > 0
     finally:
         app.dependency_overrides.pop(get_db, None)
 
@@ -707,17 +730,18 @@ async def test_http_api_idempotent_replay_without_duplicate_generation(client: A
     """Verifies that re-posting identical client_message_id returns existing reply without provider call."""
     bot_id = uuid.uuid4()
     conv_id = uuid.uuid4()
+    org_id = uuid.uuid4()
     session_token, visitor_id = create_visitor_token(bot_id=bot_id, conversation_id=conv_id)
 
     mock_bot = Chatbot(
         id=bot_id,
-        organization_id=uuid.uuid4(),
+        organization_id=org_id,
         name="Live Assistant",
         status=ChatbotStatus.active,
     )
     mock_conv = Conversation(
         id=conv_id,
-        organization_id=mock_bot.organization_id,
+        organization_id=org_id,
         chatbot_id=bot_id,
         visitor_id=visitor_id,
         status=ConversationStatus.active,
@@ -746,13 +770,14 @@ async def test_http_api_idempotent_replay_without_duplicate_generation(client: A
     custom_mock = MockLLMProvider()
     set_llm_provider_for_testing(custom_mock)
 
-    mock_session = AsyncMock()
-    bot_res = MagicMock(); bot_res.scalar_one_or_none.return_value = mock_bot
-    conv_res = MagicMock(); conv_res.scalar_one_or_none.return_value = mock_conv
-    v_msg_res = MagicMock(); v_msg_res.scalar_one_or_none.return_value = existing_visitor_msg
-    a_msg_res = MagicMock(); a_msg_res.scalar_one_or_none.return_value = existing_assistant_msg
-
-    mock_session.execute = AsyncMock(side_effect=[bot_res, conv_res, v_msg_res, a_msg_res])
+    mock_session = MockPublicSession(
+        chatbots={bot_id: mock_bot},
+        conversations={conv_id: mock_conv},
+        messages={
+            existing_visitor_msg.id: existing_visitor_msg,
+            existing_assistant_msg.id: existing_assistant_msg,
+        },
+    )
     app.dependency_overrides[get_db] = lambda: mock_session
 
     try:
@@ -770,6 +795,7 @@ async def test_http_api_idempotent_replay_without_duplicate_generation(client: A
         assert data["generation_status"] == "completed"
         # Provider must NOT have been called!
         assert custom_mock.call_count == 0
+        assert len(mock_session.tasks) == 0
     finally:
         app.dependency_overrides.pop(get_db, None)
 

@@ -12,6 +12,11 @@ from app.services.llm.base import (
 )
 from app.services.llm.context import build_conversation_context
 from app.services.llm.mock import MockLLMProvider
+from app.services.llm.orchestrator import (
+    OrchestrationResult,
+    OrchestratorErrorCode,
+    orchestrate_assistant_reply,
+)
 from app.services.llm.service import (
     AIGenerationResult,
     generate_and_persist_assistant_reply,
@@ -34,4 +39,7 @@ __all__ = [
     "generate_and_persist_assistant_reply",
     "get_llm_provider",
     "set_llm_provider_for_testing",
+    "OrchestrationResult",
+    "OrchestratorErrorCode",
+    "orchestrate_assistant_reply",
 ]

@@ -16,8 +16,25 @@ class LLMTimeoutError(LLMError):
 
 
 class LLMProviderError(LLMError):
-    """Raised when an LLM provider returns an upstream error or network failure."""
-    pass
+    """Raised when an LLM provider returns an upstream error or network failure.
+
+    Attributes:
+        status_code: Optional upstream HTTP status code.
+        is_definite_rejection: When True, the provider contract guarantees that the request
+            was rejected before execution and no billable token usage or cost was incurred.
+            When False (default), in-flight execution or liability is uncertain.
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        status_code: int | None = None,
+        is_definite_rejection: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.is_definite_rejection = is_definite_rejection
 
 
 class LLMConfigurationError(LLMError):

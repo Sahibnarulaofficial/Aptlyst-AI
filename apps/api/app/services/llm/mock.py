@@ -35,6 +35,7 @@ class MockLLMProvider(BaseLLMProvider):
         canned_response: str | None = None,
         force_timeout: bool = False,
         force_error: str | None = None,
+        force_error_is_definite: bool = True,
         simulated_delay: float = 0.0,
         allow_in_production: bool = False,
     ):
@@ -49,6 +50,7 @@ class MockLLMProvider(BaseLLMProvider):
         self.canned_response = canned_response
         self.force_timeout = force_timeout
         self.force_error = force_error
+        self.force_error_is_definite = force_error_is_definite
         self.simulated_delay = simulated_delay
         self.call_count = 0
         self.last_prompt_messages: list[LLMMessage] = []
@@ -83,7 +85,10 @@ class MockLLMProvider(BaseLLMProvider):
 
         # 3. Simulated upstream provider error
         if self.force_error:
-            raise LLMProviderError(f"Mock upstream failure: {self.force_error}")
+            raise LLMProviderError(
+                f"Mock upstream failure: {self.force_error}",
+                is_definite_rejection=self.force_error_is_definite,
+            )
 
         # 4. Extract latest user query for context
         user_queries = [m.content for m in messages if m.role == "user"]
