@@ -19,10 +19,12 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+import app.models.generation_attempt  # noqa: F401
 
 if False:  # TYPE_CHECKING
     from app.models.billing import LLMUsageLog, OrganizationBillingPeriod, UsageReservation
     from app.models.conversation import Conversation, Message
+    from app.models.generation_attempt import GenerationTaskAttempt
     from app.models.organization import Organization
 
 
@@ -142,6 +144,9 @@ class GenerationTask(Base):
         cascade="all, delete-orphan",
     )
     usage_logs: Mapped[list["LLMUsageLog"]] = relationship(
+        back_populates="generation_task"
+    )
+    attempts_list: Mapped[list["GenerationTaskAttempt"]] = relationship(
         back_populates="generation_task"
     )
 

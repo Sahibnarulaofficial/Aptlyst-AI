@@ -17,6 +17,7 @@ from app.models.chatbot import Chatbot  # noqa: F401
 from app.models.conversation import Conversation, Message  # noqa: F401
 from app.models.billing import OrganizationBillingPeriod, UsageReservation, LLMUsageLog  # noqa: F401
 from app.models.generation import GenerationTask  # noqa: F401
+from app.models.generation_attempt import GenerationTaskAttempt  # noqa: F401
 from app.models.subscription import Subscription, StripeWebhookEvent  # noqa: F401
 
 config = context.config
@@ -39,12 +40,16 @@ def run_migrations_offline() -> None:
     )
     with context.begin_transaction():
         context.run_migrations()
+        context.execute("ALTER TABLE IF EXISTS alembic_version ENABLE ROW LEVEL SECURITY")
+        context.execute("REVOKE ALL ON alembic_version FROM anon, authenticated")
 
 
 def do_run_migrations(connection):  # type: ignore[no-untyped-def]
     context.configure(connection=connection, target_metadata=target_metadata)
     with context.begin_transaction():
         context.run_migrations()
+        context.execute("ALTER TABLE IF EXISTS alembic_version ENABLE ROW LEVEL SECURITY")
+        context.execute("REVOKE ALL ON alembic_version FROM anon, authenticated")
 
 
 async def run_migrations_online() -> None:
@@ -52,7 +57,6 @@ async def run_migrations_online() -> None:
     connect_args = {}
     if "asyncpg" in settings.database_url:
         connect_args["statement_cache_size"] = 0
-        connect_args["prepared_statement_cache_size"] = 0
 
     connectable = create_async_engine(
         settings.database_url,
