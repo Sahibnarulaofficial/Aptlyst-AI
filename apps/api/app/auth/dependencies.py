@@ -27,7 +27,7 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-_bearer = HTTPBearer(auto_error=True)
+_bearer = HTTPBearer(auto_error=False)
 
 
 @dataclass(frozen=True)
@@ -350,9 +350,15 @@ async def _verify_token(
 
 
 async def get_current_user(
-    credentials: Annotated[HTTPAuthorizationCredentials, Depends(_bearer)],
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
 ) -> CurrentUser:
     """FastAPI dependency: validates the Bearer token and returns the current user."""
+    if credentials is None or not credentials.credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return await _verify_token(credentials.credentials)
 
 

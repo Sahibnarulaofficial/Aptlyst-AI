@@ -1,5 +1,19 @@
 """Tests for chatbot management, validation, role authorization, and tenant isolation."""
 
+import sys
+
+if sys.platform == "win32":
+    import socket
+    from asyncio.proactor_events import BaseProactorEventLoop
+
+    def _safe_make_self_pipe(self):  # type: ignore[no-untyped-def]
+        self._ssock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._csock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._internal_fds += 1
+
+    BaseProactorEventLoop._make_self_pipe = _safe_make_self_pipe
+    BaseProactorEventLoop._loop_self_reading = lambda self, f=None: None
+
 import os
 import uuid
 from unittest.mock import patch
@@ -297,12 +311,12 @@ async def test_chatbot_cross_org_id_tampering(client: AsyncClient) -> None:
 
 @pytest.mark.anyio
 async def test_chatbot_unauthenticated_requests_rejected(client: AsyncClient) -> None:
-    """Verifies that missing or invalid authorization tokens are rejected with 401/403."""
+    """Verifies that missing or invalid authorization tokens are rejected with 401."""
     random_org = uuid.uuid4()
 
-    # Missing token -> 403 Forbidden (FastAPI HTTPBearer)
+    # Missing token -> 401 Unauthorized
     res_no_auth = await client.get(f"/api/v1/organizations/{random_org}/chatbots")
-    assert res_no_auth.status_code == 403
+    assert res_no_auth.status_code == 401
 
     # Invalid token -> 401 Unauthorized
     res_bad_token = await client.get(
@@ -311,18 +325,18 @@ async def test_chatbot_unauthenticated_requests_rejected(client: AsyncClient) ->
     )
     assert res_bad_token.status_code == 401
 
-    # Unauthenticated PATCH -> 403 Forbidden
+    # Unauthenticated PATCH -> 401 Unauthorized
     res_no_auth_patch = await client.patch(
         f"/api/v1/organizations/{random_org}/chatbots/{uuid.uuid4()}",
         json={"name": "New Name"},
     )
-    assert res_no_auth_patch.status_code == 403
+    assert res_no_auth_patch.status_code == 401
 
-    # Unauthenticated DELETE -> 403 Forbidden
+    # Unauthenticated DELETE -> 401 Unauthorized
     res_no_auth_del = await client.delete(
         f"/api/v1/organizations/{random_org}/chatbots/{uuid.uuid4()}",
     )
-    assert res_no_auth_del.status_code == 403
+    assert res_no_auth_del.status_code == 401
 
 
 @pytest.mark.anyio

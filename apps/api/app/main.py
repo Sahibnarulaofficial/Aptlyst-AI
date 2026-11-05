@@ -1,23 +1,42 @@
 from contextlib import asynccontextmanager
+import logging
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.api.billing import router as billing_router, webhook_router as billing_webhook_router
 from app.api.chatbots import router as chatbots_router
 from app.api.health import router as health_router
 from app.api.organizations import router as organizations_router
 from app.api.public_chatbots import router as public_chatbots_router
+from app.config import settings
 from app.security.rate_limiter import (
     RateLimitExceeded,
     get_rate_limiter,
     validate_rate_limiter_configuration,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan managing startup validation and resource cleanup."""
     validate_rate_limiter_configuration()
+    if settings.default_free_monthly_token_quota <= 0:
+        logger.warning(
+            "DEFAULT_FREE_MONTHLY_TOKEN_QUOTA is configured to %d. "
+            "New Free organizations will fail LLM token reservations with QUOTA_EXHAUSTED "
+            "until a positive quota is configured via environment variables.",
+            settings.default_free_monthly_token_quota,
+        )
+    if settings.stripe_enabled and settings.default_pro_monthly_token_quota <= 0:
+        logger.warning(
+            "DEFAULT_PRO_MONTHLY_TOKEN_QUOTA is configured to %d. "
+            "Paid Pro invoices will be quarantined with missing_pro_quota_configuration "
+            "until a positive quota is configured via environment variables.",
+            settings.default_pro_monthly_token_quota,
+        )
     yield
     limiter = get_rate_limiter()
     if hasattr(limiter, "close"):
@@ -92,3 +111,5 @@ app.include_router(health_router)
 app.include_router(organizations_router, prefix="/api/v1")
 app.include_router(chatbots_router, prefix="/api/v1")
 app.include_router(public_chatbots_router, prefix="/api/v1")
+app.include_router(billing_router, prefix="/api/v1")
+app.include_router(billing_webhook_router, prefix="/api/v1")

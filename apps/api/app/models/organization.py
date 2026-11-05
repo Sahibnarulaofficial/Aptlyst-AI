@@ -22,7 +22,12 @@ if False:  # TYPE_CHECKING
     from app.models.chatbot import Chatbot
     from app.models.conversation import Conversation
     from app.models.generation import GenerationTask
-    from app.models.subscription import Subscription
+    from app.models.subscription import (
+        BillingReconciliation,
+        StripeCheckoutAttempt,
+        StripeInvoice,
+        Subscription,
+    )
 
 
 class MemberRole(str, enum.Enum):
@@ -70,6 +75,15 @@ class Organization(Base):
         back_populates="organization"
     )
     usage_logs: Mapped[list["LLMUsageLog"]] = relationship(
+        back_populates="organization"
+    )
+    checkout_attempts: Mapped[list["StripeCheckoutAttempt"]] = relationship(
+        back_populates="organization"
+    )
+    billing_reconciliations: Mapped[list["BillingReconciliation"]] = relationship(
+        back_populates="organization"
+    )
+    stripe_invoices: Mapped[list["StripeInvoice"]] = relationship(
         back_populates="organization"
     )
 

@@ -1,9 +1,23 @@
 """Tests for JWT auth dependency, supporting both ES256 (JWKS) and HS256 verification."""
 
+import sys
+
+if sys.platform == "win32":
+    import socket
+    from asyncio.proactor_events import BaseProactorEventLoop
+
+    def _safe_make_self_pipe(self):  # type: ignore[no-untyped-def]
+        self._ssock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._csock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._internal_fds += 1
+
+    BaseProactorEventLoop._make_self_pipe = _safe_make_self_pipe
+    BaseProactorEventLoop._loop_self_reading = lambda self, f=None: None
+
 import base64
 import time
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import jwt
@@ -12,6 +26,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from httpx import ASGITransport, AsyncClient
 
 from app.auth.dependencies import JWKSCache, default_jwks_cache
+from app.db.session import get_db
 from app.main import app
 
 # ─── Test Keys & Fixtures ─────────────────────────────────────────────────────
@@ -136,18 +151,29 @@ async def client() -> AsyncClient:
 @pytest.fixture(autouse=True)
 def reset_jwks_cache():
     default_jwks_cache.clear()
+    async def _mock_db():
+        mock_session = AsyncMock()
+        mock_result = MagicMock()
+        mock_result.all.return_value = []
+        mock_session.execute.return_value = mock_result
+        yield mock_session
+
+    app.dependency_overrides[get_db] = _mock_db
     yield
     default_jwks_cache.clear()
+    app.dependency_overrides.pop(get_db, None)
 
 
 # ─── Generic / Common Auth Tests ──────────────────────────────────────────────
 
 
 @pytest.mark.anyio
-async def test_missing_bearer_token_returns_403(client: AsyncClient) -> None:
-    """Unauthenticated request to a protected route should return 403."""
+async def test_missing_bearer_token_returns_401(client: AsyncClient) -> None:
+    """Unauthenticated request to a protected route should return 401."""
     response = await client.get("/api/v1/organizations")
-    assert response.status_code == 403
+    assert response.status_code == 401
+    assert "not authenticated" in response.json()["detail"].lower()
+    assert response.headers.get("www-authenticate") == "Bearer"
 
 
 @pytest.mark.anyio

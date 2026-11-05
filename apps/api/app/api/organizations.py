@@ -1,5 +1,6 @@
 """Organizations API router."""
 
+from datetime import datetime, timedelta, timezone
 import uuid
 from typing import Annotated
 
@@ -9,7 +10,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import AuthenticatedUser
+from app.config import settings
 from app.db.session import get_db
+from app.models.billing import OrganizationBillingPeriod
 from app.models.organization import MemberRole, Organization, OrganizationMember
 from app.schemas.organization import (
     OrganizationCreate,
@@ -119,9 +122,10 @@ async def setup_initial_organization(
                 detail="Free plan is limited to 1 organization. Upgrade to create more organizations.",
             )
 
+        now = datetime.now(timezone.utc)
         org = Organization(name=body.name)
         db.add(org)
-        await db.flush()  # obtain org.id before creating membership
+        await db.flush()  # obtain org.id before creating membership and billing period
 
         membership = OrganizationMember(
             organization_id=org.id,
@@ -129,6 +133,22 @@ async def setup_initial_organization(
             role=MemberRole.owner,
         )
         db.add(membership)
+
+        initial_billing_period = OrganizationBillingPeriod(
+            organization_id=org.id,
+            period_start=now,
+            period_end=now + timedelta(days=30),
+            plan_tier="free",
+            monthly_token_quota=settings.default_free_monthly_token_quota,
+            tokens_used=0,
+            tokens_reserved=0,
+            cost_micros_used=0,
+            cost_micros_reserved=0,
+            is_active=True,
+            is_blocked=False,
+        )
+        db.add(initial_billing_period)
+
         await db.commit()
         await db.refresh(org)
 

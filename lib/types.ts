@@ -89,3 +89,43 @@ export type OrganizationWithRole = {
   created_at: string;
   updated_at: string;
 };
+
+// ─── Billing Types ────────────────────────────────────────────────────────────
+
+export interface BillingPeriodOut {
+  id: string;
+  period_start: string;
+  period_end: string;
+  plan_tier: string;
+  monthly_token_quota: number;
+  tokens_used: number;
+  tokens_reserved: number;
+  tokens_remaining: number;
+  is_blocked: boolean;
+  blocked_reason?: string | null;
+}
+
+export interface BillingSubscriptionOut {
+  organization_id: string;
+  plan_tier: string;
+  status: string;
+  current_period_start?: string | null;
+  current_period_end?: string | null;
+  cancel_at_period_end: boolean;
+  canceled_at?: string | null;
+  past_due_since?: string | null;
+  has_stripe_customer: boolean;
+  stripe_enabled: boolean;
+  billing_period?: BillingPeriodOut | null;
+}
+
+export interface StripeCheckoutSessionOut {
+  organization_id: string;
+  session_id: string;
+  checkout_url: string;
+}
+
+export interface StripeBillingPortalOut {
+  organization_id: string;
+  portal_url: string;
+}

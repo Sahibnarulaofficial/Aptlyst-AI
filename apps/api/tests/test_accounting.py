@@ -53,7 +53,7 @@ from app.models.billing import (
 )
 from app.models.generation import GenerationTask, GenerationTaskStatus
 from app.models.generation_attempt import GenerationAttemptStatus, GenerationTaskAttempt
-import app.models.subscription  # noqa: F401
+from app.models.subscription import Subscription, SubscriptionStatus
 from app.services.billing.accounting import (
     AccountingErrorCode,
     ReservationResult,
@@ -130,12 +130,14 @@ class MockAsyncSession:
         reservations: dict[uuid.UUID, UsageReservation] | None = None,
         usage_logs: dict[uuid.UUID, LLMUsageLog] | None = None,
         attempts: list[GenerationTaskAttempt] | None = None,
+        subscriptions: dict[uuid.UUID, Subscription] | None = None,
     ) -> None:
         self.billing_periods = billing_periods or {}
         self.tasks = tasks or {}
         self.reservations = reservations or {}
         self.usage_logs = usage_logs or {}
         self.attempts = attempts or []
+        self.subscriptions = subscriptions or {}
         self.added: list[Any] = []
         self.flushed = False
         self.rolled_back = False
@@ -147,6 +149,8 @@ class MockAsyncSession:
             self.reservations[obj.id] = obj
         elif isinstance(obj, LLMUsageLog):
             self.usage_logs[obj.id] = obj
+        elif isinstance(obj, Subscription):
+            self.subscriptions[obj.organization_id] = obj
 
     async def flush(self) -> None:
         self.flushed = True
@@ -180,6 +184,13 @@ class MockAsyncSession:
             for v in params.values():
                 if isinstance(v, uuid.UUID) and v in self.billing_periods:
                     return MockResult(self.billing_periods[v])
+            return MockResult(None)
+
+        # Query: select(Subscription).where(...)
+        if entity is Subscription:
+            for v in params.values():
+                if isinstance(v, uuid.UUID) and v in self.subscriptions:
+                    return MockResult(self.subscriptions[v])
             return MockResult(None)
 
         # Query: select(GenerationTask).where(...)
@@ -228,6 +239,7 @@ def make_test_billing_period(
     *,
     period_id: uuid.UUID | None = None,
     org_id: uuid.UUID | None = None,
+    plan_tier: str = "free",
     monthly_token_quota: int = 100_000,
     hard_spending_cap_micros: int | None = 1_000_000,  # $1.00 USD
     tokens_used: int = 0,
@@ -245,6 +257,7 @@ def make_test_billing_period(
         organization_id=org_id or uuid.uuid4(),
         period_start=ref_time - timedelta(days=5),
         period_end=ref_time + timedelta(days=25),
+        plan_tier=plan_tier,
         monthly_token_quota=monthly_token_quota,
         hard_spending_cap_micros=hard_spending_cap_micros,
         tokens_used=tokens_used,

@@ -1,11 +1,15 @@
 """Billing and usage pricing domain services."""
 
 from app.services.billing.accounting import (
+    FIXED_FREE_PERIOD_DURATION,
+    FIXED_FREE_PERIOD_SECONDS,
     AccountingErrorCode,
     ReservationResult,
     SettlementResult,
+    evaluate_free_period_rollover,
     release_reservation,
     reserve_usage,
+    rollover_free_billing_period_if_needed,
     settle_reservation,
 )
 from app.services.billing.pricing import (
@@ -26,6 +30,81 @@ from app.services.billing.pricing import (
     get_model_pricing,
     validate_rate,
     validate_token_count,
+)
+from app.services.billing.stripe_checkout import (
+    ActiveSubscriptionExistsError,
+    CheckoutInProgressError,
+    CheckoutRecoveryRequiredError,
+    StripeCheckoutError,
+    StripeCheckoutSessionResult,
+    build_checkout_return_url,
+    classify_stripe_error,
+    create_stripe_checkout_session,
+    get_active_checkout_attempt,
+    recover_checkout_attempt,
+)
+from app.services.billing.stripe_client import (
+    StripeBillingDisabledError,
+    StripeConfigurationError,
+    get_stripe_client,
+    is_stripe_enabled,
+    reset_stripe_client,
+    set_stripe_client_for_testing,
+)
+from app.services.billing.stripe_customer import (
+    StripeCustomerError,
+    get_or_create_stripe_customer,
+    get_stripe_customer_id,
+)
+from app.services.billing.stripe_checkout_handler import (
+    handle_checkout_session_completed,
+)
+from app.services.billing.stripe_subscription_handler import (
+    handle_subscription_created,
+)
+from app.services.billing.stripe_subscription_updated_handler import (
+    handle_subscription_updated,
+)
+from app.services.billing.stripe_subscription_deleted_handler import (
+    handle_subscription_deleted,
+)
+from app.services.billing.stripe_invoice_paid_handler import (
+    handle_invoice_paid,
+)
+from app.services.billing.stripe_invoice_payment_failed_handler import (
+    handle_invoice_payment_failed,
+)
+from app.services.billing.stripe_webhook import (
+    MAX_WEBHOOK_PAYLOAD_BYTES,
+    WebhookConfigurationError,
+    WebhookPayloadMalformedError,
+    WebhookPayloadTooLargeError,
+    WebhookPersistenceError,
+    WebhookSignatureVerificationError,
+    ingest_stripe_webhook_event,
+    read_bounded_request_body,
+    verify_stripe_webhook_signature,
+)
+from app.services.billing.stripe_webhook_engine import (
+    MAX_WEBHOOK_ATTEMPTS,
+    ClaimResult,
+    ClaimStatus,
+    ProcessResult,
+    ProcessingOutcome,
+    WebhookDispatcher,
+    WebhookEngineError,
+    WebhookEnginePersistenceError,
+    WebhookPermanentError,
+    WebhookReconciliationConflictError,
+    WebhookRetryableError,
+    WebhookUnknownEventError,
+    claim_next_webhook_event,
+    claim_webhook_event_by_id,
+    default_webhook_dispatcher,
+    execute_claimed_webhook_event,
+    process_webhook_event,
+    record_webhook_outcome,
+    sanitize_error_message,
 )
 
 __all__ = [
@@ -52,4 +131,57 @@ __all__ = [
     "get_model_pricing",
     "validate_rate",
     "validate_token_count",
+    "StripeBillingDisabledError",
+    "StripeConfigurationError",
+    "get_stripe_client",
+    "is_stripe_enabled",
+    "reset_stripe_client",
+    "set_stripe_client_for_testing",
+    "StripeCustomerError",
+    "get_or_create_stripe_customer",
+    "get_stripe_customer_id",
+    "ActiveSubscriptionExistsError",
+    "CheckoutInProgressError",
+    "CheckoutRecoveryRequiredError",
+    "StripeCheckoutError",
+    "StripeCheckoutSessionResult",
+    "build_checkout_return_url",
+    "classify_stripe_error",
+    "create_stripe_checkout_session",
+    "get_active_checkout_attempt",
+    "recover_checkout_attempt",
+    "MAX_WEBHOOK_PAYLOAD_BYTES",
+    "WebhookConfigurationError",
+    "WebhookPayloadMalformedError",
+    "WebhookPayloadTooLargeError",
+    "WebhookPersistenceError",
+    "WebhookSignatureVerificationError",
+    "ingest_stripe_webhook_event",
+    "read_bounded_request_body",
+    "verify_stripe_webhook_signature",
+    "MAX_WEBHOOK_ATTEMPTS",
+    "ClaimResult",
+    "ClaimStatus",
+    "ProcessResult",
+    "ProcessingOutcome",
+    "WebhookDispatcher",
+    "WebhookEngineError",
+    "WebhookEnginePersistenceError",
+    "WebhookPermanentError",
+    "WebhookReconciliationConflictError",
+    "WebhookRetryableError",
+    "WebhookUnknownEventError",
+    "claim_next_webhook_event",
+    "claim_webhook_event_by_id",
+    "default_webhook_dispatcher",
+    "execute_claimed_webhook_event",
+    "handle_checkout_session_completed",
+    "handle_subscription_created",
+    "handle_subscription_updated",
+    "handle_subscription_deleted",
+    "handle_invoice_paid",
+    "handle_invoice_payment_failed",
+    "process_webhook_event",
+    "record_webhook_outcome",
+    "sanitize_error_message",
 ]

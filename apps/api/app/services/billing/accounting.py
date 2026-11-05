@@ -2,7 +2,8 @@
 
 Guarantees:
 1. Strict integer arithmetic: micro-dollars ($1e-6 USD) exclusively, zero floating-point math.
-2. Deadlock avoidance: consistent global lock order (OrganizationBillingPeriod FIRST, UsageReservation SECOND).
+2. Deadlock avoidance: consistent global lock order (OrganizationBillingPeriod FIRST,
+   Subscription SECOND, UsageReservation THIRD).
 3. Concurrent reservation fencing: SELECT ... FOR UPDATE serializes quota and spending-cap checks per billing period.
 4. Single active reservation: partial unique index (uq_task_active_reservation) and explicit transaction checks
    prevent a generation task from acquiring multiple concurrent reservations.
@@ -10,16 +11,26 @@ Guarantees:
 6. Conflicting settlement rejection: divergent actual usage on an already settled reservation is explicitly rejected.
 7. Ambiguity quarantine: never silently releases or zero-settles an ambiguous or dispatched reservation.
 8. Defense-in-depth: strict ownership validation for organization, task, reservation, and billing period.
+9. Subscription entitlement enforcement: Pro billing periods require an active, entitled Subscription record.
+   - past_due within settings.billing_grace_period_days: access retained.
+   - past_due beyond grace window, or canceled/unpaid/paused: denied.
+   - Missing subscription for a Pro period: fail closed.
+   - Free billing periods proceed without requiring a Subscription row.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import enum
+import logging
 from typing import Any
 import uuid
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 from app.models.billing import (
     LLMUsageLog,
@@ -29,6 +40,7 @@ from app.models.billing import (
 )
 from app.models.generation import GenerationTask, GenerationTaskStatus
 from app.models.generation_attempt import GenerationAttemptStatus, GenerationTaskAttempt
+from app.models.subscription import Subscription, SubscriptionStatus
 from app.services.billing.pricing import (
     MAX_MICROS_LIMIT,
     MAX_TOKENS_LIMIT,
@@ -61,6 +73,10 @@ class AccountingErrorCode(str, enum.Enum):
     RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
     AMBIGUOUS_STATE_CANNOT_ZERO_SETTLE = "AMBIGUOUS_STATE_CANNOT_ZERO_SETTLE"
     INTEGER_OVERFLOW = "INTEGER_OVERFLOW"
+    # Subscription entitlement errors (Pro billing periods only)
+    SUBSCRIPTION_NOT_FOUND = "SUBSCRIPTION_NOT_FOUND"
+    SUBSCRIPTION_INACTIVE = "SUBSCRIPTION_INACTIVE"
+    GRACE_PERIOD_EXPIRED = "GRACE_PERIOD_EXPIRED"
 
 
 @dataclass(frozen=True)
@@ -115,6 +131,20 @@ async def reserve_usage(
 
     Executes within the caller's transaction context. Locks the OrganizationBillingPeriod
     row using SELECT ... FOR UPDATE to serialize concurrent quota evaluations.
+
+    For Pro billing periods, additionally locks the Subscription row (SECOND in global lock order
+    after OrganizationBillingPeriod) and enforces the subscription entitlement policy:
+    - active: allowed.
+    - past_due within settings.billing_grace_period_days: allowed.
+    - past_due beyond grace window: denied (GRACE_PERIOD_EXPIRED).
+    - canceled, unpaid, paused, incomplete, incomplete_expired, trialing: denied (SUBSCRIPTION_INACTIVE).
+    - Missing subscription for a Pro period: denied (SUBSCRIPTION_NOT_FOUND).
+    Free billing periods proceed without requiring a Subscription row.
+
+    Lock order (deadlock-safe):
+      1. OrganizationBillingPeriod  (SELECT FOR UPDATE)
+      2. Subscription               (SELECT FOR UPDATE, Pro periods only)
+      3. UsageReservation           (SELECT, no explicit lock on dup check)
 
     Args:
         session: Active SQLAlchemy async session.
@@ -217,6 +247,118 @@ async def reserve_usage(
                 "now": current_time.isoformat(),
             },
         )
+
+    # 4b. Subscription Entitlement Check (Pro billing periods only)
+    #
+    # Lock order: OrganizationBillingPeriod FIRST (already held), Subscription SECOND.
+    # Subscription webhook handlers lock Subscription only and never lock
+    # OrganizationBillingPeriod, so this ordering is globally deadlock-safe.
+    #
+    # Free billing periods bypass this check; they do not require a Subscription row.
+    is_paid_period = bool(period.plan_tier and period.plan_tier.strip().lower() != "free")
+    if is_paid_period:
+        # Select subscriptions for the organization that are eligible to authorize Pro usage.
+        # Eligible statuses: active, past_due (subject to grace period evaluation).
+        # We query only eligible statuses to safely ignore historical canceled/incomplete rows
+        # while leveraging the partial unique index uq_org_active_subscription.
+        eligible_statuses = (SubscriptionStatus.active, SubscriptionStatus.past_due)
+        stmt_sub = (
+            select(Subscription)
+            .where(
+                Subscription.organization_id == org_id,
+                Subscription.status.in_(eligible_statuses),
+            )
+            .with_for_update()
+        )
+        res_sub = await session.execute(stmt_sub)
+        eligible_subs = res_sub.scalars().all()
+
+        if len(eligible_subs) > 1:
+            logger.warning(
+                "Organization %s has multiple (%d) eligible subscriptions. Failing closed.",
+                org_id,
+                len(eligible_subs),
+            )
+            return ReservationResult(
+                success=False,
+                error_code=AccountingErrorCode.RECONCILIATION_REQUIRED,
+                message=f"Multiple eligible subscriptions ({len(eligible_subs)}) found for organization '{org_id}'; reconciliation required",
+                details={
+                    "eligible_subscription_count": len(eligible_subs),
+                    "subscription_ids": [str(s.id) for s in eligible_subs],
+                },
+            )
+
+        if len(eligible_subs) == 0:
+            # Check if a non-entitled subscription row exists for diagnostic reporting
+            stmt_any = (
+                select(Subscription)
+                .where(Subscription.organization_id == org_id)
+                .order_by(Subscription.created_at.desc())
+                .limit(1)
+            )
+            res_any = await session.execute(stmt_any)
+            latest_sub = res_any.scalar_one_or_none()
+
+            if latest_sub is not None:
+                return ReservationResult(
+                    success=False,
+                    error_code=AccountingErrorCode.SUBSCRIPTION_INACTIVE,
+                    message="Subscription is not in an entitled state for Pro access",
+                    details={"subscription_status": latest_sub.status.value},
+                )
+
+            return ReservationResult(
+                success=False,
+                error_code=AccountingErrorCode.SUBSCRIPTION_NOT_FOUND,
+                message="Pro billing period requires an active Stripe subscription record, but none was found",
+            )
+
+        subscription = eligible_subs[0]
+        sub_status = subscription.status
+
+        # States that are never entitled for Pro access
+        _non_entitled_statuses = frozenset({
+            SubscriptionStatus.canceled,
+            SubscriptionStatus.unpaid,
+            SubscriptionStatus.paused,
+            SubscriptionStatus.incomplete,
+            SubscriptionStatus.incomplete_expired,
+            SubscriptionStatus.trialing,
+        })
+
+        if sub_status in _non_entitled_statuses:
+            return ReservationResult(
+                success=False,
+                error_code=AccountingErrorCode.SUBSCRIPTION_INACTIVE,
+                message="Subscription is not in an entitled state for Pro access",
+                details={"subscription_status": sub_status.value},
+            )
+
+        if sub_status == SubscriptionStatus.past_due:
+            # Grace-period enforcement.
+            # past_due_since must be present; absence fails closed.
+            past_due_since = subscription.past_due_since
+            if past_due_since is None:
+                return ReservationResult(
+                    success=False,
+                    error_code=AccountingErrorCode.GRACE_PERIOD_EXPIRED,
+                    message="Subscription is past_due but past_due_since anchor is missing; failing closed",
+                )
+            # Ensure timezone-aware comparison
+            if past_due_since.tzinfo is None:
+                past_due_since = past_due_since.replace(tzinfo=timezone.utc)
+            grace_deadline = past_due_since + timedelta(days=settings.billing_grace_period_days)
+            if current_time >= grace_deadline:
+                return ReservationResult(
+                    success=False,
+                    error_code=AccountingErrorCode.GRACE_PERIOD_EXPIRED,
+                    message="Subscription past-due grace period has expired; Pro access denied",
+                )
+            # Within grace window: allow usage to continue within the existing paid period.
+
+        # cancel_at_period_end=True alone does NOT revoke entitlement while status is active.
+        # The status transition (to canceled) is the authoritative revocation trigger.
 
     # 5. Verify Generation Task Eligibility
     stmt_task = select(GenerationTask).where(GenerationTask.id == t_id)
@@ -924,3 +1066,156 @@ async def release_reservation(
         cost_micros_released=cost_micros_released,
         is_idempotent_replay=False,
     )
+
+
+# =============================================================================
+# Free Billing Period Rollover Service
+# =============================================================================
+
+FIXED_FREE_PERIOD_DURATION = timedelta(days=30)
+FIXED_FREE_PERIOD_SECONDS = int(FIXED_FREE_PERIOD_DURATION.total_seconds())  # 2,592,000s
+
+
+def evaluate_free_period_rollover(
+    current_period_start: datetime,
+    current_period_end: datetime,
+    now: datetime | None = None,
+) -> tuple[datetime, datetime] | None:
+    """Evaluate whether a Free billing period requires rollover.
+
+    Guarantees:
+    1. Active Period Guard: If now < current_period_end, returns None (no rollover required).
+    2. Exact Boundary Rollover: At or after expiry, calculates the currently applicable 30-day window
+       anchored to the original anchor boundary without date drift.
+    3. Intermediate Period Skipping: If dormant for multiple cycles, intermediate inactive periods
+       are not created.
+    4. Timezone Awareness: Operates strictly with timezone-aware UTC timestamps.
+
+    Args:
+        current_period_start: UTC timestamp of current active period start.
+        current_period_end: UTC timestamp of current active period end.
+        now: Optional current UTC timestamp (defaults to datetime.now(timezone.utc)).
+
+    Returns:
+        tuple[datetime, datetime]: (new_period_start, new_period_end) if rollover is required.
+        None: If current period is still active (no rollover required).
+    """
+    now = now or datetime.now(timezone.utc)
+
+    # 1. Active Period Guard: No rollover if current period has not ended
+    if now < current_period_end:
+        return None
+
+    # 2. At or after boundary: calculate elapsed seconds past current_period_end
+    elapsed_seconds = (now - current_period_end).total_seconds()
+
+    # 3. Calculate integer cycles skipped since current_period_end
+    #    k = 0 when now is within the immediate next cycle [current_period_end, current_period_end + 30d)
+    #    k > 0 when one or more full 30-day cycles were dormant
+    cycles_skipped = int(elapsed_seconds // FIXED_FREE_PERIOD_SECONDS)
+
+    # 4. Anchor next period start to the original anchor boundary
+    new_period_start = current_period_end + timedelta(seconds=cycles_skipped * FIXED_FREE_PERIOD_SECONDS)
+    new_period_end = new_period_start + FIXED_FREE_PERIOD_DURATION
+
+    return new_period_start, new_period_end
+
+
+async def rollover_free_billing_period_if_needed(
+    session: AsyncSession,
+    *,
+    organization_id: uuid.UUID,
+    now: datetime | None = None,
+) -> OrganizationBillingPeriod | None:
+    """Atomically roll over an expired Free billing period under database row lock.
+
+    Guarantees:
+    1. Free-Tier Scoped: Never modifies or rolls over paid Pro subscription periods.
+    2. Concurrency Safety: Serializes concurrent rollover attempts using SELECT ... FOR UPDATE.
+    3. Double-Rollover Prevention: Re-evaluates rollover eligibility under lock.
+    4. Historical Immutability: Marks previous period inactive without modifying its usage counters.
+    5. In-flight Reservation Safety: Existing reservations retain their immutable billing_period_id.
+
+    Args:
+        session: Active SQLAlchemy async session.
+        organization_id: Organization owning the billing period.
+        now: Optional override for current timestamp.
+
+    Returns:
+        OrganizationBillingPeriod: The currently active billing period (newly rolled over or existing),
+        or None if no active billing period exists.
+    """
+    now = now or datetime.now(timezone.utc)
+
+    # 1. Acquire row lock on active period with bounded retry for concurrent deactivations.
+    # Concurrency consideration (PostgreSQL READ COMMITTED row locking):
+    # If Worker A and Worker B concurrently attempt to lock an expired active period P1:
+    # - Worker A acquires the lock on P1, evaluates rollover, sets P1.is_active = False,
+    #   inserts new active period P2, flushes, and commits.
+    # - Worker B was blocked waiting for P1's lock. When Worker A commits, Worker B unblocks.
+    #   Under PostgreSQL READ COMMITTED row-level locking, Worker B re-evaluates the query's
+    #   WHERE clause against the updated P1. Since P1.is_active is now False, P1 no longer
+    #   matches the filter. PostgreSQL skips the row and does NOT automatically re-scan for
+    #   newly inserted rows like P2. Thus, Worker B's initial query returns 0 rows (None).
+    #
+    # To prevent dropping valid requests, we use a bounded 2-attempt loop:
+    # If the first attempt returns None, we re-execute the fresh SELECT query under lock.
+    # In READ COMMITTED mode, this second attempt takes a fresh command snapshot, locating
+    # the newly committed active period P2. Worker B locks P2, determines that P2 is fresh
+    # (evaluate_free_period_rollover returns None), and returns P2 safely.
+    #
+    # Lock Ordering: Maintains global lock order (OrganizationBillingPeriod FIRST).
+    # Avoids introducing an Organization row lock to prevent deadlock with other workflows.
+    current_period = None
+    for _ in range(2):
+        stmt = (
+            select(OrganizationBillingPeriod)
+            .where(
+                OrganizationBillingPeriod.organization_id == organization_id,
+                OrganizationBillingPeriod.is_active == True,
+            )
+            .with_for_update()
+        )
+        result = await session.execute(stmt)
+        current_period = result.scalar_one_or_none()
+        if current_period is not None:
+            break
+
+    if not current_period:
+        return None
+
+    # Paid Pro periods are renewed strictly via Stripe webhooks, not Free rolling logic
+    if current_period.plan_tier != "free":
+        return current_period
+
+    # 2. Evaluate rollover under lock (guards against concurrent worker races)
+    boundaries = evaluate_free_period_rollover(
+        current_period.period_start, current_period.period_end, now
+    )
+    if boundaries is None:
+        # Current period is still active or another concurrent worker already rolled it over
+        return current_period
+
+    new_start, new_end = boundaries
+
+    # 3. Deactivate expired period (historical record preserved)
+    current_period.is_active = False
+
+    # 4. Insert currently applicable active period
+    new_period = OrganizationBillingPeriod(
+        organization_id=organization_id,
+        period_start=new_start,
+        period_end=new_end,
+        plan_tier="free",
+        monthly_token_quota=settings.default_free_monthly_token_quota,
+        tokens_used=0,
+        tokens_reserved=0,
+        cost_micros_used=0,
+        cost_micros_reserved=0,
+        is_active=True,
+        is_blocked=False,
+    )
+    session.add(new_period)
+    await session.flush()
+
+    return new_period

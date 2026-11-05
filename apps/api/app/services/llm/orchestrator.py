@@ -89,6 +89,9 @@ class OrchestratorErrorCode(str, enum.Enum):
     SETTLEMENT_FAILED = "SETTLEMENT_FAILED"
     INTERNAL_ERROR = "INTERNAL_ERROR"
     INVALID_OWNERSHIP = "INVALID_OWNERSHIP"
+    SUBSCRIPTION_INACTIVE = "SUBSCRIPTION_INACTIVE"
+    GRACE_PERIOD_EXPIRED = "GRACE_PERIOD_EXPIRED"
+    SUBSCRIPTION_NOT_FOUND = "SUBSCRIPTION_NOT_FOUND"
 
 
 @dataclass(frozen=True)
@@ -372,6 +375,12 @@ async def orchestrate_assistant_reply(
             err_code = OrchestratorErrorCode.QUOTA_EXHAUSTED
             if reserve_result.error_code == AccountingErrorCode.SPENDING_CAP_EXHAUSTED:
                 err_code = OrchestratorErrorCode.SPENDING_CAP_EXHAUSTED
+            elif reserve_result.error_code == AccountingErrorCode.SUBSCRIPTION_INACTIVE:
+                err_code = OrchestratorErrorCode.SUBSCRIPTION_INACTIVE
+            elif reserve_result.error_code == AccountingErrorCode.GRACE_PERIOD_EXPIRED:
+                err_code = OrchestratorErrorCode.GRACE_PERIOD_EXPIRED
+            elif reserve_result.error_code == AccountingErrorCode.SUBSCRIPTION_NOT_FOUND:
+                err_code = OrchestratorErrorCode.SUBSCRIPTION_NOT_FOUND
             return OrchestrationResult(
                 status=GenerationStatus.failed,
                 task=task,

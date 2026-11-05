@@ -81,7 +81,12 @@ def _map_orchestrator_error_to_public_message(result: OrchestrationResult) -> st
     ):
         return "The AI assistant is currently unavailable due to usage limits. Your message was saved."
 
-    if result.error_code == OrchestratorErrorCode.NO_ACTIVE_BILLING_PERIOD:
+    if result.error_code in (
+        OrchestratorErrorCode.NO_ACTIVE_BILLING_PERIOD,
+        OrchestratorErrorCode.SUBSCRIPTION_INACTIVE,
+        OrchestratorErrorCode.GRACE_PERIOD_EXPIRED,
+        OrchestratorErrorCode.SUBSCRIPTION_NOT_FOUND,
+    ):
         return "The AI assistant is currently unavailable due to organization service limits. Your message was saved."
 
     if result.error_code in (

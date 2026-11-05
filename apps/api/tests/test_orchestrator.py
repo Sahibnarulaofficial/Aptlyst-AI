@@ -57,7 +57,7 @@ from sqlalchemy.exc import IntegrityError
 import app.models.chatbot  # noqa: F401
 import app.models.conversation  # noqa: F401
 import app.models.organization  # noqa: F401
-import app.models.subscription  # noqa: F401
+from app.models.subscription import Subscription, SubscriptionStatus
 from app.config import settings
 from app.models.billing import (
     LLMUsageLog,
@@ -145,6 +145,7 @@ class MockOrchestratorSession:
         usage_logs: dict[uuid.UUID, LLMUsageLog] | None = None,
         attempts: dict[uuid.UUID, GenerationTaskAttempt] | None = None,
         messages: dict[uuid.UUID, Message] | None = None,
+        subscriptions: dict[uuid.UUID, Subscription] | None = None,
     ) -> None:
         self.billing_periods = billing_periods or {}
         self.tasks = tasks or {}
@@ -152,6 +153,7 @@ class MockOrchestratorSession:
         self.usage_logs = usage_logs or {}
         self.attempts = attempts or {}
         self.messages = messages or {}
+        self.subscriptions = subscriptions or {}
         self.added: list[Any] = []
         self.uncommitted_added: list[Any] = []
         self.commit_count = 0
@@ -176,6 +178,8 @@ class MockOrchestratorSession:
             self.usage_logs[obj.id] = obj
         elif isinstance(obj, OrganizationBillingPeriod):
             self.billing_periods[obj.id] = obj
+        elif isinstance(obj, Subscription):
+            self.subscriptions[obj.organization_id] = obj
 
     async def flush(self) -> None:
         self.flush_count += 1
@@ -264,6 +268,13 @@ class MockOrchestratorSession:
                     for bp in self.billing_periods.values():
                         if bp.organization_id == v:
                             return MockResult(bp)
+            return MockResult(None)
+
+        # 4b. Query: select(Subscription)
+        if entity is Subscription:
+            for v in params.values():
+                if isinstance(v, uuid.UUID) and v in self.subscriptions:
+                    return MockResult(self.subscriptions[v])
             return MockResult(None)
 
         # 5. Query: select(GenerationTask)

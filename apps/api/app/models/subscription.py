@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     Enum,
@@ -24,6 +25,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
 if False:  # TYPE_CHECKING
+    from app.models.billing import OrganizationBillingPeriod
     from app.models.organization import Organization
 
 
@@ -46,6 +48,7 @@ class WebhookProcessingStatus(str, enum.Enum):
     pending = "pending"
     processed = "processed"
     failed = "failed"
+    quarantined = "quarantined"
 
 
 class Subscription(Base):
@@ -109,6 +112,10 @@ class Subscription(Base):
         server_default="false",
     )
     canceled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    past_due_since: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
     )
@@ -196,4 +203,322 @@ class StripeWebhookEvent(Base):
 
     __table_args__ = (
         Index("ix_stripe_webhook_events_status", "status", "created_at"),
+    )
+
+
+class CheckoutAttemptStatus(str, enum.Enum):
+    """Normalized status of an organization checkout session attempt."""
+
+    creating = "creating"
+    recovery_required = "recovery_required"
+    open = "open"
+    payment_pending = "payment_pending"
+    complete = "complete"
+    expired = "expired"
+    failed = "failed"
+
+
+class ReconciliationStatus(str, enum.Enum):
+    """Review and resolution status for a financial billing reconciliation record."""
+
+    pending_review = "pending_review"
+    resolved_refunded = "resolved_refunded"
+    resolved_ignored = "resolved_ignored"
+
+
+class StripeCheckoutAttempt(Base):
+    """Durable organization-scoped Stripe Checkout Session attempt.
+
+    Guarantees:
+    1. Mutual Exclusion: At most one in-flight, pending, or open attempt per organization
+       via partial unique index `uq_org_active_checkout_attempt`.
+    2. Replay Fidelity: Persists exact `request_payload` for deterministic idempotency replay.
+    3. Crash Safety: Leased `creating` state with `recovery_required` transition protects
+       against releasing the tenant reservation while upstream Stripe state is ambiguous.
+    """
+
+    __tablename__ = "stripe_checkout_attempts"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    stripe_customer_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+    stripe_session_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        unique=True,
+    )
+    stripe_subscription_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    checkout_url: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    request_payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+    )
+    status: Mapped[CheckoutAttemptStatus] = mapped_column(
+        Enum(CheckoutAttemptStatus, name="checkout_attempt_status"),
+        nullable=False,
+        default=CheckoutAttemptStatus.creating,
+        server_default="creating",
+    )
+    attempt_lease_expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    session_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    error_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    # Relationships
+    organization: Mapped["Organization"] = relationship(
+        back_populates="checkout_attempts"
+    )
+
+    __table_args__ = (
+        Index("ix_stripe_checkout_attempts_org_created", "organization_id", "created_at"),
+        Index("ix_stripe_checkout_attempts_subscription_id", "stripe_subscription_id"),
+        Index(
+            "uq_org_active_checkout_attempt",
+            "organization_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('creating', 'recovery_required', 'open', 'payment_pending')"
+            ),
+        ),
+        Index(
+            "ix_stripe_checkout_attempts_lease",
+            "status",
+            "attempt_lease_expires_at",
+            postgresql_where=text("status = 'creating'"),
+        ),
+    )
+
+
+class BillingReconciliation(Base):
+    """Durable audit record for duplicate subscriptions and billing reconciliation cases.
+
+    Guarantees:
+    1. Non-Cascading Audit: Referenced webhook events and organizations use ON DELETE RESTRICT
+       to guarantee financial audit trails cannot be deleted.
+    2. Duplicate Prevention: UniqueConstraint on (event_id, incoming_subscription_id)
+       ensures idempotent recording.
+    3. Human Verification: Captures administrator resolution lifecycle without automatic
+       cancellation or refunds.
+    """
+
+    __tablename__ = "billing_reconciliations"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    event_id: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("stripe_webhook_events.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    existing_subscription_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+    incoming_subscription_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+    reason: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="duplicate_active_subscription",
+        server_default="duplicate_active_subscription",
+    )
+    status: Mapped[ReconciliationStatus] = mapped_column(
+        Enum(ReconciliationStatus, name="reconciliation_status"),
+        nullable=False,
+        default=ReconciliationStatus.pending_review,
+        server_default="pending_review",
+    )
+    diagnostic_payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+    )
+    resolved_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    resolution_notes: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    # Relationships
+    organization: Mapped["Organization"] = relationship(
+        back_populates="billing_reconciliations"
+    )
+    webhook_event: Mapped["StripeWebhookEvent"] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "event_id",
+            "incoming_subscription_id",
+            name="uq_reconciliation_event_sub",
+        ),
+        Index("ix_billing_reconciliations_org_status", "organization_id", "status"),
+    )
+
+
+class InvoiceProcessingStatus(str, enum.Enum):
+    """Processing lifecycle state of an ingested Stripe invoice."""
+
+    pending = "pending"
+    processed = "processed"
+    ignored = "ignored"
+    failed = "failed"
+
+
+class StripeInvoice(Base):
+    """Authoritative ledger of Stripe invoices for renewal idempotency and financial audit.
+
+    Guarantees:
+    1. Single Explicit Uniqueness: stripe_invoice_id is guarded by uq_stripe_invoices_invoice_id;
+       no redundant secondary index is created.
+    2. Event Provenance: raw_event_id is a foreign key to stripe_webhook_events.id with ON DELETE RESTRICT.
+    3. Multi-Event Convergence: invoice.paid and invoice.payment_succeeded serialize on
+       the same invoice row; only the canonical paid cycle event provisions a billing period.
+    4. Flexible Period Association:
+       - One invoice can reference at most one billing period (billing_period_id).
+       - Multiple invoices may reference the same billing period (non-unique index).
+    5. Minor-Unit Precision: amount_paid_minor_units stores integer values matching currency minor units.
+    6. Non-Cascading Audit Trail: ON DELETE RESTRICT prevents silent cascading deletion.
+    """
+
+    __tablename__ = "stripe_invoices"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    stripe_invoice_id: Mapped[str] = mapped_column(
+        String(255), nullable=False
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    stripe_customer_id: Mapped[str] = mapped_column(
+        String(255), nullable=False
+    )
+    stripe_subscription_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
+    billing_reason: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    invoice_status: Mapped[str] = mapped_column(
+        String(32), nullable=False
+    )
+    currency: Mapped[str | None] = mapped_column(
+        String(3), nullable=True
+    )
+    amount_paid_minor_units: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    period_start: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    period_end: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    processing_status: Mapped[InvoiceProcessingStatus] = mapped_column(
+        Enum(InvoiceProcessingStatus, name="invoice_processing_status"),
+        nullable=False,
+        default=InvoiceProcessingStatus.pending,
+        server_default="pending",
+    )
+    billing_period_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organization_billing_periods.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    raw_event_id: Mapped[str | None] = mapped_column(
+        String(255),
+        ForeignKey("stripe_webhook_events.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    error_message: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    diagnostic_payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    # Relationships
+    organization: Mapped["Organization"] = relationship(
+        back_populates="stripe_invoices"
+    )
+    billing_period: Mapped["OrganizationBillingPeriod"] = relationship()
+    originating_event: Mapped["StripeWebhookEvent | None"] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("stripe_invoice_id", name="uq_stripe_invoices_invoice_id"),
+        Index("ix_stripe_invoices_organization_id", "organization_id"),
+        Index("ix_stripe_invoices_customer_id", "stripe_customer_id"),
+        Index("ix_stripe_invoices_subscription_id", "stripe_subscription_id"),
+        Index("ix_stripe_invoices_billing_period_id", "billing_period_id"),
+        Index("ix_stripe_invoices_raw_event_id", "raw_event_id"),
+        Index("ix_stripe_invoices_org_created", "organization_id", "created_at"),
+        Index("ix_stripe_invoices_status", "processing_status", "created_at"),
     )

@@ -18,7 +18,13 @@ from app.models.conversation import Conversation, Message  # noqa: F401
 from app.models.billing import OrganizationBillingPeriod, UsageReservation, LLMUsageLog  # noqa: F401
 from app.models.generation import GenerationTask  # noqa: F401
 from app.models.generation_attempt import GenerationTaskAttempt  # noqa: F401
-from app.models.subscription import Subscription, StripeWebhookEvent  # noqa: F401
+from app.models.subscription import (  # noqa: F401
+    BillingReconciliation,
+    StripeCheckoutAttempt,
+    StripeInvoice,
+    StripeWebhookEvent,
+    Subscription,
+)
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url)

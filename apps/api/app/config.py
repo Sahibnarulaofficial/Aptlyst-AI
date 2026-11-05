@@ -1,7 +1,8 @@
 import ipaddress
 from pathlib import Path
 from typing import Any
-from pydantic import field_validator
+import urllib.parse
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -70,6 +71,139 @@ class Settings(BaseSettings):
                     "Mock LLM provider is strictly for development and automated testing. "
                     "It is prohibited in production environments."
                 )
+
+        # Stripe Billing Configuration Validation
+        if self.stripe_enabled:
+            secret = self.stripe_secret_key.get_secret_value().strip()
+            if not secret:
+                raise ValueError(
+                    "STRIPE_SECRET_KEY must be configured when Stripe billing is enabled."
+                )
+
+            webhook_secret = self.stripe_webhook_secret.get_secret_value().strip()
+            if not webhook_secret:
+                raise ValueError(
+                    "STRIPE_WEBHOOK_SECRET must be configured when Stripe billing is enabled."
+                )
+            if (
+                not webhook_secret.startswith("whsec_")
+                or len(webhook_secret) < 15
+                or not all(c.isalnum() or c == "_" for c in webhook_secret[6:])
+            ):
+                raise ValueError(
+                    "STRIPE_WEBHOOK_SECRET format is invalid. It must start with 'whsec_' "
+                    "followed by alphanumeric characters. (Note: format validation does not verify existence in Stripe.)"
+                )
+
+            pub_key = self.stripe_publishable_key.strip()
+            if not pub_key:
+                raise ValueError(
+                    "STRIPE_PUBLISHABLE_KEY must be configured when Stripe billing is enabled."
+                )
+
+            price_id = self.stripe_pro_price_id.strip()
+            if not price_id:
+                raise ValueError(
+                    "STRIPE_PRO_PRICE_ID must be configured when Stripe billing is enabled."
+                )
+            if (
+                not price_id.startswith("price_")
+                or len(price_id) < 14
+                or not all(c.isalnum() or c == "_" for c in price_id[6:])
+            ):
+                raise ValueError(
+                    "STRIPE_PRO_PRICE_ID format is invalid. It must start with 'price_' "
+                    "followed by alphanumeric characters. (Note: format validation does not verify existence in Stripe.)"
+                )
+
+            return_url = self.stripe_billing_return_url.strip()
+            if not return_url:
+                raise ValueError(
+                    "STRIPE_BILLING_RETURN_URL must be configured when Stripe billing is enabled."
+                )
+
+            parsed_url = urllib.parse.urlsplit(return_url)
+            if parsed_url.scheme not in ("http", "https"):
+                raise ValueError(
+                    "STRIPE_BILLING_RETURN_URL must use an allowed scheme ('http' or 'https')."
+                )
+            if not parsed_url.netloc or not parsed_url.hostname or any(c.isspace() for c in parsed_url.netloc):
+                raise ValueError(
+                    "STRIPE_BILLING_RETURN_URL must contain a valid, non-empty host without whitespace."
+                )
+
+            # Test / Live environment separation and deployment HTTPS requirements
+            is_staging = self.environment.strip().lower() in ("staging",)
+            if is_prod:
+                if secret.startswith(("sk_test_", "rk_test_")):
+                    raise ValueError(
+                        "Test Stripe secret key is prohibited in production environments."
+                    )
+                if not (secret.startswith("sk_live_") or secret.startswith("rk_live_")):
+                    raise ValueError(
+                        "Production Stripe secret key must start with 'sk_live_' or 'rk_live_'."
+                    )
+                if pub_key.startswith("pk_test_"):
+                    raise ValueError(
+                        "Test Stripe publishable key is prohibited in production environments."
+                    )
+                if not pub_key.startswith("pk_live_"):
+                    raise ValueError(
+                        "Production Stripe publishable key must start with 'pk_live_'."
+                    )
+                if parsed_url.scheme != "https":
+                    raise ValueError(
+                        "STRIPE_BILLING_RETURN_URL must use https:// in production environments."
+                    )
+            elif is_staging:
+                if secret.startswith(("sk_live_", "rk_live_")):
+                    raise ValueError(
+                        "Live Stripe secret key is prohibited in non-production environments."
+                    )
+                if not (secret.startswith("sk_test_") or secret.startswith("rk_test_")):
+                    raise ValueError(
+                        "Development/test Stripe secret key must start with 'sk_test_' or 'rk_test_'."
+                    )
+                if pub_key.startswith("pk_live_"):
+                    raise ValueError(
+                        "Live Stripe publishable key is prohibited in non-production environments."
+                    )
+                if not pub_key.startswith("pk_test_"):
+                    raise ValueError(
+                        "Development/test Stripe publishable key must start with 'pk_test_'."
+                    )
+                if parsed_url.scheme != "https":
+                    raise ValueError(
+                        "STRIPE_BILLING_RETURN_URL must use https:// in staging environments."
+                    )
+            else:
+                # Local development & automated testing
+                if secret.startswith(("sk_live_", "rk_live_")):
+                    raise ValueError(
+                        "Live Stripe secret key is prohibited in non-production environments."
+                    )
+                if not (secret.startswith("sk_test_") or secret.startswith("rk_test_")):
+                    raise ValueError(
+                        "Development/test Stripe secret key must start with 'sk_test_' or 'rk_test_'."
+                    )
+                if pub_key.startswith("pk_live_"):
+                    raise ValueError(
+                        "Live Stripe publishable key is prohibited in non-production environments."
+                    )
+                if not pub_key.startswith("pk_test_"):
+                    raise ValueError(
+                        "Development/test Stripe publishable key must start with 'pk_test_'."
+                    )
+                if parsed_url.scheme == "http" and parsed_url.hostname.lower() not in (
+                    "localhost",
+                    "127.0.0.1",
+                    "::1",
+                    "0.0.0.0",
+                ):
+                    raise ValueError(
+                        "STRIPE_BILLING_RETURN_URL scheme http:// is only permitted for localhost in development. "
+                        "Remote return URLs must use https://."
+                    )
 
     @property
     def resolved_visitor_session_secret(self) -> str:
@@ -170,10 +304,35 @@ class Settings(BaseSettings):
             return normalized
         raise ValueError("llm_provider must be a string")
 
-    # Add future settings here as the product grows, e.g.:
-    # openai_api_key: str = ""
-    # redis_url: str = ""
-    # stripe_secret_key: str = ""
+    # Stripe Billing Configuration (Milestone 4)
+    stripe_enabled: bool = False
+    stripe_secret_key: SecretStr = Field(default=SecretStr(""))
+    stripe_webhook_secret: SecretStr = Field(default=SecretStr(""))
+    stripe_publishable_key: str = ""
+    stripe_pro_price_id: str = ""
+    stripe_billing_return_url: str = "http://localhost:3000/billing"
+    billing_grace_period_days: int = 7
+    default_free_monthly_token_quota: int = Field(
+        default=0,
+        description="Initial monthly token quota for Free organizations. Defaults to 0 (fail-closed) until approved.",
+    )
+    default_pro_monthly_token_quota: int = Field(
+        default=0,
+        ge=0,
+        description="Initial monthly token quota for Pro organizations. Defaults to 0 (fail-closed) until configured.",
+    )
+
+    def get_public_stripe_config(self) -> dict[str, Any]:
+        """Return safe, non-sensitive Stripe configuration for client-side consumption.
+
+        Guarantees that secret keys (stripe_secret_key, stripe_webhook_secret) are never exposed.
+        """
+        return {
+            "enabled": self.stripe_enabled,
+            "publishable_key": self.stripe_publishable_key if self.stripe_enabled else "",
+            "pro_price_id": self.stripe_pro_price_id if self.stripe_enabled else "",
+            "billing_return_url": self.stripe_billing_return_url if self.stripe_enabled else "",
+        }
 
 
 settings = Settings()

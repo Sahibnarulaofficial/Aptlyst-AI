@@ -1,10 +1,13 @@
 import type {
+  BillingSubscriptionOut,
   Chatbot,
   ChatbotCreateInput,
   ChatbotUpdateInput,
   Organization,
   OrganizationWithRole,
   PublicChatbotConfig,
+  StripeBillingPortalOut,
+  StripeCheckoutSessionOut,
 } from '@/lib/types';
 
 /**
@@ -211,4 +214,45 @@ export async function getPublicChatbot(
     method: 'GET',
     skipAuth: true,
   });
+}
+
+// ─── Billing API Methods ─────────────────────────────────────────────────────
+
+export async function getBillingSubscription(
+  orgId: string,
+  token?: string,
+): Promise<BillingSubscriptionOut> {
+  return apiFetch<BillingSubscriptionOut>(
+    `/api/v1/organizations/${orgId}/billing/subscription`,
+    {
+      method: 'GET',
+      token,
+    },
+  );
+}
+
+export async function createCheckoutSession(
+  orgId: string,
+  token?: string,
+): Promise<StripeCheckoutSessionOut> {
+  return apiFetch<StripeCheckoutSessionOut>(
+    `/api/v1/organizations/${orgId}/billing/checkout-session`,
+    {
+      method: 'POST',
+      token,
+    },
+  );
+}
+
+export async function createBillingPortalSession(
+  orgId: string,
+  token?: string,
+): Promise<StripeBillingPortalOut> {
+  return apiFetch<StripeBillingPortalOut>(
+    `/api/v1/organizations/${orgId}/billing/portal`,
+    {
+      method: 'POST',
+      token,
+    },
+  );
 }
