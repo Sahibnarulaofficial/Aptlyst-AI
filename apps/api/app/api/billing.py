@@ -7,6 +7,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import case, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.organizations import _require_org_role
@@ -19,9 +20,41 @@ from app.models.subscription import Subscription, SubscriptionStatus
 from app.schemas.billing import (
     BillingPeriodOut,
     BillingSubscriptionOut,
+    RazorpayCheckoutVerificationIn,
+    RazorpayCheckoutVerificationOut,
+    RazorpaySubscriptionCheckoutOut,
     StripeBillingPortalOut,
     StripeCheckoutSessionOut,
     StripeCustomerOut,
+)
+from app.services.billing.razorpay.checkout import (
+    ActiveSubscriptionExistsError as RazorpayActiveSubscriptionExistsError,
+    CheckoutInProgressError as RazorpayCheckoutInProgressError,
+    CheckoutRecoveryRequiredError as RazorpayCheckoutRecoveryRequiredError,
+    RazorpayCheckoutAmbiguousError,
+    RazorpayCheckoutConflictError,
+    RazorpayCheckoutError,
+    RazorpayCheckoutNotFoundError,
+    RazorpayCheckoutPaymentError,
+    RazorpayCheckoutSignatureError,
+    create_razorpay_subscription_checkout,
+    verify_razorpay_checkout_callback,
+)
+from app.services.billing.razorpay.client import (
+    RazorpayBillingDisabledError,
+    RazorpayConfigurationError,
+)
+from app.services.billing.razorpay.webhook_ingress import (
+    RazorpayWebhookMerchantMismatchError,
+    RazorpayWebhookPayloadMalformedError,
+    RazorpayWebhookPayloadTooLargeError,
+    RazorpayWebhookPersistenceError,
+    RazorpayWebhookSignatureVerificationError,
+    extract_razorpay_event_id,
+    get_webhook_scope,
+    ingest_razorpay_webhook_event,
+    parse_and_validate_razorpay_envelope,
+    verify_razorpay_webhook_signature,
 )
 from app.services.billing.stripe_checkout import (
     ActiveSubscriptionExistsError,
@@ -324,6 +357,193 @@ async def create_checkout_session(
     )
 
 
+@router.post(
+    "/razorpay/checkout-subscription",
+    response_model=RazorpaySubscriptionCheckoutOut,
+    status_code=status.HTTP_200_OK,
+)
+async def create_razorpay_checkout_subscription_endpoint(
+    org_id: uuid.UUID,
+    current_user: AuthenticatedUser,
+    db: DbSession,
+) -> RazorpaySubscriptionCheckoutOut:
+    """Initiate or reuse a Razorpay Pro subscription checkout session for the organization.
+
+    Security & Domain Guarantees:
+    - Authentication required (401 for unauthenticated).
+    - Tenant isolation: verified membership and role (minimum role: admin).
+      Non-members receive 404 Not Found to prevent tenant enumeration.
+      Members with role 'member' receive 403 Forbidden.
+    - Resolves customer identity through the decoupled customer provisioning service.
+    - Zero client-controlled billing parameters: plan ID, currency, and scope are server-controlled.
+    - Server-controlled checkout attempt tracking: enforces single active checkout attempt.
+    - Never grants Pro entitlement or provisions billing quota.
+    """
+    await _require_org_role(org_id, current_user.id, db, minimum_role=MemberRole.admin)
+
+    org = await db.get(Organization, org_id)
+    if org is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Organization not found",
+        )
+
+    try:
+        result = await create_razorpay_subscription_checkout(
+            db=db,
+            organization=org,
+            user_email=current_user.email,
+        )
+    except (RazorpayBillingDisabledError, RazorpayConfigurationError) as exc:
+        logger.warning("Razorpay billing disabled/misconfigured for org %s: %s", org_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Razorpay billing is currently disabled or unavailable",
+        )
+    except RazorpayActiveSubscriptionExistsError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Organization already has an active subscription",
+        )
+    except RazorpayCheckoutInProgressError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A checkout session or payment is already in progress for this organization",
+        )
+    except RazorpayCheckoutRecoveryRequiredError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A previous checkout attempt requires reconciliation before a new session can be initiated",
+        )
+    except RazorpayCheckoutAmbiguousError as exc:
+        logger.error("Ambiguous Razorpay checkout outcome for org %s: %s", org_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Payment provider outcome is ambiguous; recovery required",
+        )
+    except RazorpayCheckoutError as exc:
+        logger.error("Razorpay checkout error for org %s: %s", org_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Payment provider error while creating checkout session",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Unexpected error during Razorpay checkout session creation for org %s: %s", org_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        )
+
+    return RazorpaySubscriptionCheckoutOut(
+        organization_id=result.organization_id,
+        attempt_id=result.attempt_id,
+        provider=result.provider,
+        subscription_id=result.subscription_id,
+        key_id=result.key_id,
+        plan_id=result.plan_id,
+        checkout_url=result.checkout_url,
+        status=result.status.value,
+    )
+
+
+@router.post(
+    "/razorpay/verify-checkout",
+    response_model=RazorpayCheckoutVerificationOut,
+    status_code=status.HTTP_200_OK,
+)
+async def verify_razorpay_checkout_endpoint(
+    org_id: uuid.UUID,
+    payload: RazorpayCheckoutVerificationIn,
+    current_user: AuthenticatedUser,
+    db: DbSession,
+) -> RazorpayCheckoutVerificationOut:
+    """Verify a Razorpay standard checkout callback, validate payment, and record verification.
+
+    Security & Domain Guarantees:
+    - Authentication required (401 for unauthenticated).
+    - Tenant isolation: verified membership and role (minimum role: admin).
+    - Never trusts browser-supplied subscription ID; verifies against server-owned checkout attempt.
+    - Cryptographic HMAC-SHA256 constant-time verification.
+    - Validates gateway payment status outside database transactions.
+    - Distinguishes captured payments from pending authorizations.
+    - Idempotent: repeated callbacks with matching payment ID return verified state.
+    - Entitlement Protection: never provisions Pro tier or grants token quota.
+    """
+    await _require_org_role(org_id, current_user.id, db, minimum_role=MemberRole.admin)
+
+    org = await db.get(Organization, org_id)
+    if org is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Organization not found",
+        )
+
+    try:
+        result = await verify_razorpay_checkout_callback(
+            db=db,
+            organization_id=org_id,
+            attempt_id=payload.attempt_id,
+            razorpay_payment_id=payload.razorpay_payment_id,
+            razorpay_subscription_id=payload.razorpay_subscription_id,
+            razorpay_signature=payload.razorpay_signature,
+        )
+    except RazorpayCheckoutNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Checkout attempt not found",
+        )
+    except RazorpayCheckoutSignatureError as exc:
+        logger.warning("Razorpay checkout signature verification failed for org %s: %s", org_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+    except RazorpayCheckoutPaymentError as exc:
+        logger.warning("Razorpay payment verification failed for org %s: %s", org_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+    except RazorpayCheckoutConflictError as exc:
+        logger.warning("Razorpay checkout conflict for org %s: %s", org_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        )
+    except (RazorpayBillingDisabledError, RazorpayConfigurationError) as exc:
+        logger.warning("Razorpay billing disabled/misconfigured for org %s: %s", org_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Razorpay billing is currently disabled or unavailable",
+        )
+    except RazorpayCheckoutError as exc:
+        logger.error("Razorpay checkout verification error for org %s: %s", org_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Payment provider error while verifying checkout",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Unexpected error verifying Razorpay checkout for org %s: %s", org_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        )
+
+    return RazorpayCheckoutVerificationOut(
+        organization_id=result.organization_id,
+        attempt_id=result.attempt_id,
+        provider=result.provider,
+        subscription_id=result.subscription_id,
+        payment_id=result.payment_id,
+        status=result.status.value,
+        payment_status=result.payment_status,
+    )
+
+
 @router.get(
     "/subscription",
     response_model=BillingSubscriptionOut,
@@ -617,5 +837,115 @@ async def handle_stripe_webhook(
         "event_id": event_id,
         "status": "pending" if is_new else "duplicate",
     }
+
+
+@webhook_router.post("/razorpay/webhook", status_code=status.HTTP_200_OK)
+async def handle_razorpay_webhook(
+    request: Request,
+    db: DbSession,
+) -> dict[str, Any]:
+    """Receive, verify, and durably ingest incoming Razorpay webhook events.
+
+    Security & Reliability Guarantees:
+    - Public Unauthenticated: Called directly by Razorpay without user authentication.
+    - Strict Request Body Limit: Maximum 64 KB streaming payload limit enforced dynamically.
+    - Cryptographic Verification: HMAC-SHA256 signature verified against exact raw bytes.
+    - Constant-time comparison: Rejects invalid or malformed signatures before JSON parsing.
+    - Zero Secret Leakage: Webhook secret, signature, and raw payload are never logged.
+    - Durable Receipt: Transaction committed to database before HTTP 200 response is sent.
+    - Safe Idempotency: Duplicate deliveries return HTTP 200 without altering state or creating records.
+    - Fail-Safe Configuration: Returns 503 if Razorpay is disabled or secret is missing.
+    - Tenant Isolation: Validates that payload account_id matches configured merchant account.
+    """
+    try:
+        raw_body = await read_bounded_request_body(request)
+    except (WebhookPayloadTooLargeError, RazorpayWebhookPayloadTooLargeError):
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Webhook payload exceeds maximum allowed size (64 KB)",
+        )
+
+    sig_header = request.headers.get("x-razorpay-signature")
+    event_id_header = request.headers.get("x-razorpay-event-id")
+
+    try:
+        verify_razorpay_webhook_signature(
+            raw_payload=raw_body,
+            sig_header=sig_header,
+        )
+    except RazorpayBillingDisabledError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Razorpay billing is currently disabled",
+        )
+    except RazorpayConfigurationError as exc:
+        logger.error("Razorpay webhook configuration error: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Razorpay webhook configuration unavailable",
+        )
+    except RazorpayWebhookSignatureVerificationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+
+    try:
+        event_payload = parse_and_validate_razorpay_envelope(raw_body)
+    except (RazorpayWebhookPayloadMalformedError, RazorpayWebhookMerchantMismatchError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+
+    event_id = extract_razorpay_event_id(
+        raw_payload=raw_body,
+        event_payload=event_payload,
+        event_id_header=event_id_header,
+    )
+    event_type = event_payload["event"]
+
+    try:
+        expected_merchant, env = get_webhook_scope()
+        payload_account_id = str(event_payload.get("account_id", "")).strip()
+        merchant_account_id = (
+            payload_account_id if expected_merchant == "default" else expected_merchant
+        )
+    except Exception as exc:
+        logger.error("Error resolving Razorpay webhook scope: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Razorpay webhook configuration unavailable",
+        )
+
+    try:
+        event_record, is_new = await ingest_razorpay_webhook_event(
+            db=db,
+            event_id=event_id,
+            event_type=event_type,
+            payload=event_payload,
+            merchant_account_id=merchant_account_id,
+            environment=env,
+        )
+    except (RazorpayWebhookPersistenceError, IntegrityError):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to durably persist webhook event",
+        )
+    except Exception as exc:
+        logger.error(
+            "Unexpected error persisting Razorpay webhook event %s: %s", event_id, exc
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        )
+
+    return {
+        "received": True,
+        "event_id": event_id,
+        "status": "pending" if is_new else "duplicate",
+    }
+
 
 

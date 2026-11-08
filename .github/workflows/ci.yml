@@ -1,0 +1,94 @@
+name: Backend CI & Isolated PostgreSQL Integration
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-integration:
+    name: PostgreSQL 16 Integration & Provenance Verification
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: aptlyst_ci_user
+          POSTGRES_PASSWORD: aptlyst_ci_password_secure
+          POSTGRES_DB: aptlyst_ci_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "apps/api/requirements*.txt"
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r apps/api/requirements.txt
+          pip install -r apps/api/requirements-dev.txt
+
+      - name: Verify PostgreSQL service container readiness
+        run: |
+          python -c "
+          import socket, time, sys
+          s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          for i in range(30):
+              try:
+                  s.connect(('127.0.0.1', 5432))
+                  print('PostgreSQL container port 5432 is open and accepting connections.')
+                  s.close()
+                  sys.exit(0)
+              except Exception:
+                  time.sleep(1)
+          print('Timed out waiting for PostgreSQL container port 5432.')
+          sys.exit(1)
+          "
+
+      - name: Apply Alembic migrations on disposable database
+        working-directory: apps/api
+        env:
+          DATABASE_URL: postgresql+asyncpg://aptlyst_ci_user:aptlyst_ci_password_secure@localhost:5432/aptlyst_ci_test
+        run: |
+          python -m alembic upgrade head
+
+      - name: Run PostgreSQL Integration Tests (14 scenarios)
+        working-directory: apps/api
+        env:
+          DATABASE_URL: postgresql+asyncpg://aptlyst_ci_user:aptlyst_ci_password_secure@localhost:5432/aptlyst_ci_test
+          POSTGRES_TEST_URL: postgresql+psycopg2://aptlyst_ci_user:aptlyst_ci_password_secure@localhost:5432/aptlyst_ci_test
+        run: |
+          python -m pytest -v tests/test_postgres_provenance_integration.py --junitxml=test-results-postgres.xml
+
+      - name: Run Focused Migration and Model Regression Tests
+        working-directory: apps/api
+        run: |
+          python -m pytest -v tests/test_payment_association_migration.py tests/test_provider_neutral_billing_models.py tests/test_provider_neutral_migration.py --junitxml=test-results-models.xml
+
+      - name: Preserve Test Results Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-ci
+          path: |
+            apps/api/test-results-postgres.xml
+            apps/api/test-results-models.xml

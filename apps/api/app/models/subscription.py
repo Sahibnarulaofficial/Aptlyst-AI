@@ -27,6 +27,7 @@ from app.db.base import Base
 if False:  # TYPE_CHECKING
     from app.models.billing import OrganizationBillingPeriod
     from app.models.organization import Organization
+    from app.models.payment import BillingInvoice, BillingPayment, PaymentReconciliation
 
 
 class SubscriptionStatus(str, enum.Enum):
@@ -71,10 +72,38 @@ class Subscription(Base):
         nullable=False,
         index=True,
     )
-    stripe_customer_id: Mapped[str] = mapped_column(
+    stripe_customer_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        unique=True,
+    )
+    provider: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+    )
+    provider_customer_id: Mapped[str] = mapped_column(
         String(255),
         nullable=False,
-        unique=True,
+    )
+    provider_subscription_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    provider_plan_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    merchant_account_id: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+    environment: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+    )
+    last_webhook_event_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )
     stripe_subscription_id: Mapped[str | None] = mapped_column(
         String(255),
@@ -135,9 +164,38 @@ class Subscription(Base):
         nullable=False,
     )
 
+    def __init__(self, **kwargs: Any) -> None:
+        # Backward compatibility for Stripe legacy callers:
+        # If stripe_customer_id is provided and provider-neutral fields are omitted,
+        # automatically populate them so existing tests and Stripe services continue to work.
+        if "stripe_customer_id" in kwargs and kwargs["stripe_customer_id"]:
+            kwargs.setdefault("provider", "stripe")
+            kwargs.setdefault("provider_customer_id", kwargs["stripe_customer_id"])
+            kwargs.setdefault("merchant_account_id", "default")
+            kwargs.setdefault("environment", "legacy")
+            if "stripe_subscription_id" in kwargs:
+                kwargs.setdefault("provider_subscription_id", kwargs["stripe_subscription_id"])
+            if "stripe_price_id" in kwargs:
+                kwargs.setdefault("provider_plan_id", kwargs["stripe_price_id"])
+            if "last_stripe_event_created_at" in kwargs:
+                kwargs.setdefault("last_webhook_event_at", kwargs["last_stripe_event_created_at"])
+        super().__init__(**kwargs)
+
     # Relationships
     organization: Mapped["Organization"] = relationship(
         back_populates="subscriptions"
+    )
+    billing_invoices: Mapped[list["BillingInvoice"]] = relationship(
+        back_populates="subscription"
+    )
+    billing_payments: Mapped[list["BillingPayment"]] = relationship(
+        back_populates="subscription"
+    )
+    payment_reconciliations: Mapped[list["PaymentReconciliation"]] = relationship(
+        back_populates="subscription"
+    )
+    billing_periods: Mapped[list["OrganizationBillingPeriod"]] = relationship(
+        back_populates="subscription"
     )
 
     __table_args__ = (
@@ -147,6 +205,23 @@ class Subscription(Base):
             "organization_id",
             unique=True,
             postgresql_where=text("status IN ('active', 'trialing')"),
+        ),
+        Index(
+            "uq_subscriptions_provider_customer",
+            "provider",
+            "merchant_account_id",
+            "environment",
+            "provider_customer_id",
+            unique=True,
+        ),
+        Index(
+            "uq_subscriptions_provider_subscription",
+            "provider",
+            "merchant_account_id",
+            "environment",
+            "provider_subscription_id",
+            unique=True,
+            postgresql_where=text("provider_subscription_id IS NOT NULL"),
         ),
     )
 
@@ -522,3 +597,7 @@ class StripeInvoice(Base):
         Index("ix_stripe_invoices_org_created", "organization_id", "created_at"),
         Index("ix_stripe_invoices_status", "processing_status", "created_at"),
     )
+
+
+# Register generalized provider-neutral models in SQLAlchemy class registry
+import app.models.payment  # noqa: F401, E402

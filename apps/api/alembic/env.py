@@ -25,6 +25,15 @@ from app.models.subscription import (  # noqa: F401
     StripeWebhookEvent,
     Subscription,
 )
+from app.models.payment import (  # noqa: F401
+    BillingCheckoutAttempt,
+    BillingCustomerProvision,
+    BillingInvoice,
+    BillingPayment,
+    BillingWebhookEvent,
+    CustomerProvisionStatus,
+    PaymentReconciliation,
+)
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url)

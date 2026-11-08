@@ -29,6 +29,7 @@ if False:  # TYPE_CHECKING
     from app.models.conversation import Conversation, Message
     from app.models.generation import GenerationTask
     from app.models.organization import Organization
+    from app.models.subscription import Subscription
 
 
 class ReservationStatus(str, enum.Enum):
@@ -59,6 +60,11 @@ class OrganizationBillingPeriod(Base):
         ForeignKey("organizations.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
+    )
+    subscription_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("subscriptions.id", ondelete="RESTRICT"),
+        nullable=True,
     )
     period_start: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -138,6 +144,9 @@ class OrganizationBillingPeriod(Base):
     organization: Mapped["Organization"] = relationship(
         back_populates="billing_periods"
     )
+    subscription: Mapped["Subscription | None"] = relationship(
+        back_populates="billing_periods"
+    )
     generation_tasks: Mapped[list["GenerationTask"]] = relationship(
         back_populates="billing_period"
     )
@@ -174,6 +183,10 @@ class OrganizationBillingPeriod(Base):
             "organization_id",
             "period_start",
             "period_end",
+        ),
+        Index(
+            "ix_billing_periods_subscription_id",
+            "subscription_id",
         ),
         # Partial unique index: at most one active period per organization
         Index(

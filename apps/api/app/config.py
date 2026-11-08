@@ -205,6 +205,80 @@ class Settings(BaseSettings):
                         "Remote return URLs must use https://."
                     )
 
+        # Razorpay Billing Configuration Validation (Step 5.2B)
+        if self.razorpay_enabled:
+            rzp_env = self.razorpay_environment.strip().lower()
+            if rzp_env not in ("test", "live"):
+                raise ValueError("RAZORPAY_ENVIRONMENT must be either 'test' or 'live'.")
+
+            key_id = self.razorpay_key_id.strip()
+            if not key_id:
+                raise ValueError(
+                    "RAZORPAY_KEY_ID must be configured when Razorpay billing is enabled."
+                )
+
+            key_secret = self.razorpay_key_secret.get_secret_value().strip()
+            if not key_secret:
+                raise ValueError(
+                    "RAZORPAY_KEY_SECRET must be configured when Razorpay billing is enabled."
+                )
+
+            webhook_secret = self.razorpay_webhook_secret.get_secret_value().strip()
+            if not webhook_secret:
+                raise ValueError(
+                    "RAZORPAY_WEBHOOK_SECRET must be configured when Razorpay billing is enabled."
+                )
+
+            plan_id = self.razorpay_pro_plan_id.strip()
+            if not plan_id:
+                raise ValueError(
+                    "RAZORPAY_PRO_PLAN_ID must be configured when Razorpay billing is enabled."
+                )
+            if not plan_id.startswith("plan_") or len(plan_id) < 8:
+                raise ValueError(
+                    "RAZORPAY_PRO_PLAN_ID format is invalid. It must start with 'plan_'."
+                )
+
+            plan_currency = self.razorpay_plan_currency.strip().upper()
+            if len(plan_currency) != 3 or not plan_currency.isalpha():
+                raise ValueError(
+                    "RAZORPAY_PLAN_CURRENCY must be a valid 3-letter ISO currency code (e.g., 'USD', 'INR')."
+                )
+
+            merchant_id = self.razorpay_merchant_account_id.strip()
+
+            if is_prod:
+                if rzp_env != "live":
+                    raise ValueError(
+                        "RAZORPAY_ENVIRONMENT must be 'live' in production environments."
+                    )
+                if key_id.startswith("rzp_test_"):
+                    raise ValueError(
+                        "Test Razorpay key is prohibited in production environments."
+                    )
+                if not key_id.startswith("rzp_live_"):
+                    raise ValueError(
+                        "Production Razorpay key must start with 'rzp_live_'."
+                    )
+                if not merchant_id or merchant_id.lower() in ("default", "placeholder", "none", "null"):
+                    raise ValueError(
+                        "Production RAZORPAY_MERCHANT_ACCOUNT_ID must be explicitly configured with a non-default account identifier."
+                    )
+            else:
+                # Staging & Local development / testing
+                if rzp_env != "test":
+                    raise ValueError(
+                        "RAZORPAY_ENVIRONMENT must be 'test' in non-production environments."
+                    )
+                if key_id.startswith("rzp_live_"):
+                    raise ValueError(
+                        "Live Razorpay key is prohibited in non-production environments."
+                    )
+                if not key_id.startswith("rzp_test_"):
+                    raise ValueError(
+                        "Development/test Razorpay key must start with 'rzp_test_'."
+                    )
+
     @property
     def resolved_visitor_session_secret(self) -> str:
         """Return the primary secret for HMAC-SHA256 visitor session tokens.
@@ -332,6 +406,30 @@ class Settings(BaseSettings):
             "publishable_key": self.stripe_publishable_key if self.stripe_enabled else "",
             "pro_price_id": self.stripe_pro_price_id if self.stripe_enabled else "",
             "billing_return_url": self.stripe_billing_return_url if self.stripe_enabled else "",
+        }
+
+    # Razorpay Billing Configuration (Step 5.2B)
+    razorpay_enabled: bool = False
+    razorpay_environment: str = "test"
+    razorpay_merchant_account_id: str = "default"
+    razorpay_key_id: str = ""
+    razorpay_key_secret: SecretStr = Field(default=SecretStr(""))
+    razorpay_webhook_secret: SecretStr = Field(default=SecretStr(""))
+    razorpay_pro_plan_id: str = ""
+    razorpay_plan_currency: str = "USD"
+
+    def get_public_razorpay_config(self) -> dict[str, Any]:
+        """Return safe, non-sensitive Razorpay configuration for client-side consumption.
+
+        Guarantees that secret keys (razorpay_key_secret, razorpay_webhook_secret) are never exposed.
+        """
+        return {
+            "enabled": self.razorpay_enabled,
+            "environment": self.razorpay_environment if self.razorpay_enabled else "test",
+            "key_id": self.razorpay_key_id if self.razorpay_enabled else "",
+            "merchant_account_id": self.razorpay_merchant_account_id if self.razorpay_enabled else "",
+            "pro_plan_id": self.razorpay_pro_plan_id if self.razorpay_enabled else "",
+            "plan_currency": self.razorpay_plan_currency if self.razorpay_enabled else "USD",
         }
 
 

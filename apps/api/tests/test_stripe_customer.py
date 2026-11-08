@@ -30,6 +30,7 @@ if sys.platform == "win32":
     BaseProactorEventLoop._loop_self_reading = lambda self, f=None: None
 
 import asyncio
+from datetime import datetime, timezone
 import uuid
 from typing import Any
 from unittest.mock import MagicMock
@@ -111,6 +112,7 @@ class InMemoryDbSession:
         self.subscriptions: dict[uuid.UUID, Subscription] = {
             s.organization_id: s for s in (subscriptions or [])
         }
+        self.subscription_list: list[Subscription] = list(subscriptions or [])
         self.fail_commit_with_integrity_error = fail_commit_with_integrity_error
         self.added: list[Any] = []
         self.uncommitted: list[Any] = []
@@ -128,7 +130,7 @@ class InMemoryDbSession:
         w_params = {
             w.left.key: w.right.value
             for w in getattr(stmt, "_where_criteria", ())
-            if hasattr(w, "left") and hasattr(w, "right") and hasattr(w.left, "key")
+            if hasattr(w, "left") and hasattr(w, "right") and hasattr(w.left, "key") and hasattr(w.right, "value")
         }
 
         cols = getattr(stmt, "selected_columns", [])
@@ -144,9 +146,18 @@ class InMemoryDbSession:
         # 2. Subscription.stripe_customer_id lookup by organization_id
         if "stripe_customer_id" in col_names or any("subscription" in str(c) for c in col_names):
             org_id = w_params.get("organization_id")
-            sub = self.subscriptions.get(org_id)
-            if sub:
-                return MockScalarResult(sub.stripe_customer_id)
+            provider = w_params.get("provider")
+            all_subs = list(self.subscription_list)
+            for s in self.subscriptions.values():
+                if s not in all_subs:
+                    all_subs.append(s)
+            for sub in reversed(all_subs):
+                if org_id and sub.organization_id != org_id:
+                    continue
+                if provider and sub.provider != provider:
+                    continue
+                if sub.stripe_customer_id is not None:
+                    return MockScalarResult(sub.stripe_customer_id)
             return MockScalarResult(None)
 
         return MockScalarResult(None)
@@ -161,6 +172,7 @@ class InMemoryDbSession:
         for obj in self.uncommitted:
             if isinstance(obj, Subscription):
                 self.subscriptions[obj.organization_id] = obj
+                self.subscription_list.append(obj)
         self.uncommitted.clear()
         self.committed_count += 1
 
@@ -796,3 +808,53 @@ async def test_get_customer_not_found(client: AsyncClient, monkeypatch):
         assert res.json()["detail"] == "No billing customer found for this organization"
     finally:
         clear_api_overrides()
+
+
+# ============================================================================
+# 14. Cross-Provider Isolation Regression Test
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_stripe_customer_id_not_shadowed_by_razorpay_record():
+    """Verify that get_stripe_customer_id returns the Stripe customer ID when both a historical
+    Stripe subscription and a newer Razorpay row or customer provision coexist for the same organization."""
+    org_id = uuid.uuid4()
+    org = Organization(id=org_id, name="Coexisting Providers Org")
+
+    # Historical Stripe subscription with stripe_customer_id
+    stripe_sub = Subscription(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        provider="stripe",
+        stripe_customer_id="cus_stripe_historical_999",
+        provider_customer_id="cus_stripe_historical_999",
+        merchant_account_id="default",
+        environment="legacy",
+        status=SubscriptionStatus.active,
+        plan_tier="pro",
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    # Newer Razorpay row without stripe_customer_id
+    razorpay_sub = Subscription(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        provider="razorpay",
+        stripe_customer_id=None,
+        provider_customer_id="cust_rzp_newer_111",
+        merchant_account_id="acc_test_123",
+        environment="test",
+        status=SubscriptionStatus.incomplete,
+        plan_tier="free",
+        created_at=datetime(2026, 11, 1, tzinfo=timezone.utc),
+    )
+
+    db = InMemoryDbSession(
+        organizations=[org],
+        subscriptions=[stripe_sub, razorpay_sub],
+    )
+
+    customer_id = await get_stripe_customer_id(db, org_id)
+    assert customer_id == "cus_stripe_historical_999"
+

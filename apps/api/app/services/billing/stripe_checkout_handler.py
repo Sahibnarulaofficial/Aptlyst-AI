@@ -258,7 +258,10 @@ async def handle_checkout_session_completed(
     # Check if this exact subscription is already reconciled and active
     stmt_existing_sub = (
         select(Subscription)
-        .where(Subscription.stripe_subscription_id == subscription_id)
+        .where(
+            Subscription.stripe_subscription_id == subscription_id,
+            Subscription.provider == "stripe",
+        )
         .with_for_update()
     )
     result_existing_sub = await db.execute(stmt_existing_sub)
@@ -387,17 +390,25 @@ async def handle_checkout_session_completed(
         # Search by customer ID
         stmt_sub_by_cust = (
             select(Subscription)
-            .where(Subscription.stripe_customer_id == customer_id)
+            .where(
+                Subscription.stripe_customer_id == customer_id,
+                Subscription.provider == "stripe",
+            )
             .with_for_update()
         )
         result_sub_by_cust = await db.execute(stmt_sub_by_cust)
         target_sub = result_sub_by_cust.scalar_one_or_none()
 
     if target_sub is None:
-        # Search by organization ID
+        # Search by organization ID (strictly Stripe provider, latest row)
         stmt_sub_by_org = (
             select(Subscription)
-            .where(Subscription.organization_id == org_id)
+            .where(
+                Subscription.organization_id == org_id,
+                Subscription.provider == "stripe",
+            )
+            .order_by(Subscription.created_at.desc())
+            .limit(1)
             .with_for_update()
         )
         result_sub_by_org = await db.execute(stmt_sub_by_org)

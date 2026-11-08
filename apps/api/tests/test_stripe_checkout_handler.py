@@ -272,22 +272,23 @@ class HandlerMockDbSession:
 
             # Query by stripe_subscription_id
             sub_id = params.get("stripe_subscription_id")
+            provider = params.get("provider")
             if sub_id:
-                match = next((s for s in self.subscriptions.values() if s.stripe_subscription_id == sub_id), None)
+                match = next((s for s in self.subscriptions.values() if s.stripe_subscription_id == sub_id and (provider is None or s.provider == provider)), None)
                 if match:
                     return HandlerMockScalarResult(match)
 
             # Query by stripe_customer_id
             cust_id = params.get("stripe_customer_id")
             if cust_id:
-                match = next((s for s in self.subscriptions.values() if s.stripe_customer_id == cust_id), None)
+                match = next((s for s in self.subscriptions.values() if s.stripe_customer_id == cust_id and (provider is None or s.provider == provider)), None)
                 if match:
                     return HandlerMockScalarResult(match)
 
             # Query by organization_id
             org_id = params.get("organization_id")
             if org_id:
-                match = next((s for s in self.subscriptions.values() if s.organization_id == org_id), None)
+                match = next((s for s in self.subscriptions.values() if s.organization_id == org_id and (provider is None or s.provider == provider)), None)
                 if match:
                     return HandlerMockScalarResult(match)
 
@@ -1509,3 +1510,267 @@ async def test_failed_reconciliation_rolls_back_all_domain_changes() -> None:
     assert existing_sub.plan_tier == "free"
     assert existing_sub.stripe_subscription_id is None
     assert attempt.status == CheckoutAttemptStatus.open
+
+
+# ============================================================================
+# Task 5: Cross-Provider Isolation Regression Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_cross_provider_coexistence_stripe_and_razorpay_records():
+    """Verify that Stripe checkout webhook handler resolves the correct Stripe record
+    without selecting or throwing MultipleResultsFound when Stripe and Razorpay records coexist."""
+    org = Organization(id=uuid.uuid4(), name="Dual Provider Org")
+    customer_id = "cus_dual_stripe_111"
+    sub_id = "sub_dual_stripe_222"
+    session_id = "cs_dual_stripe_333"
+
+    # Pre-existing Stripe subscription
+    stripe_sub = Subscription(
+        id=uuid.uuid4(),
+        organization_id=org.id,
+        provider="stripe",
+        stripe_customer_id=customer_id,
+        provider_customer_id=customer_id,
+        merchant_account_id="default",
+        environment="legacy",
+        status=SubscriptionStatus.incomplete,
+        plan_tier="free",
+    )
+
+    # Coexisting Razorpay subscription for same organization
+    razorpay_sub = Subscription(
+        id=uuid.uuid4(),
+        organization_id=org.id,
+        provider="razorpay",
+        stripe_customer_id=None,
+        provider_customer_id="cust_rzp_coexist_444",
+        merchant_account_id="acc_test_123",
+        environment="test",
+        status=SubscriptionStatus.incomplete,
+        plan_tier="free",
+    )
+
+    attempt = StripeCheckoutAttempt(
+        id=uuid.uuid4(),
+        organization_id=org.id,
+        stripe_customer_id=customer_id,
+        stripe_session_id=session_id,
+        status=CheckoutAttemptStatus.open,
+        attempt_lease_expires_at=datetime.now(timezone.utc),
+        request_payload={"line_items": [{"price": TEST_PRO_PRICE_ID}]},
+    )
+
+    event_record = StripeWebhookEvent(
+        id="evt_coexist_test",
+        event_type="checkout.session.completed",
+        status=WebhookProcessingStatus.pending,
+        attempts=1,
+        payload=build_checkout_completed_event(
+            event_id="evt_coexist_test",
+            session_id=session_id,
+            customer_id=customer_id,
+            subscription_id=sub_id,
+            org_id=org.id,
+            attempt_id=attempt.id,
+        ),
+        created_at=datetime.now(timezone.utc),
+    )
+
+    db = HandlerMockDbSession(
+        organizations=[org],
+        attempts=[attempt],
+        subscriptions=[stripe_sub, razorpay_sub],
+        events=[event_record],
+    )
+
+    with patch("app.services.billing.stripe_checkout_handler.settings", get_test_settings()):
+        result = await process_webhook_event(
+            db=db,
+            event_id="evt_coexist_test",
+            dispatcher=default_webhook_dispatcher,
+        )
+
+    assert result.success is True
+    assert event_record.status == WebhookProcessingStatus.processed
+
+    # Stripe subscription was updated to active Pro
+    assert stripe_sub.status == SubscriptionStatus.active
+    assert stripe_sub.plan_tier == "pro"
+    assert stripe_sub.stripe_subscription_id == sub_id
+
+    # Razorpay subscription remains completely untouched
+    assert razorpay_sub.provider == "razorpay"
+    assert razorpay_sub.status == SubscriptionStatus.incomplete
+    assert razorpay_sub.plan_tier == "free"
+    assert razorpay_sub.stripe_customer_id is None
+
+
+@pytest.mark.asyncio
+async def test_razorpay_only_record_existing_when_stripe_event_processed():
+    """Verify that when only a Razorpay subscription exists, a Stripe checkout event
+    creates a new Stripe record and NEVER mutates the Razorpay record."""
+    org = Organization(id=uuid.uuid4(), name="Razorpay Only Org")
+    customer_id = "cus_stripe_new_for_org"
+    sub_id = "sub_stripe_new_for_org"
+    session_id = "cs_stripe_new_for_org"
+
+    # Only a Razorpay subscription exists
+    razorpay_sub = Subscription(
+        id=uuid.uuid4(),
+        organization_id=org.id,
+        provider="razorpay",
+        stripe_customer_id=None,
+        provider_customer_id="cust_rzp_only_555",
+        merchant_account_id="acc_test_123",
+        environment="test",
+        status=SubscriptionStatus.incomplete,
+        plan_tier="free",
+    )
+
+    attempt = StripeCheckoutAttempt(
+        id=uuid.uuid4(),
+        organization_id=org.id,
+        stripe_customer_id=customer_id,
+        stripe_session_id=session_id,
+        status=CheckoutAttemptStatus.open,
+        attempt_lease_expires_at=datetime.now(timezone.utc),
+        request_payload={"line_items": [{"price": TEST_PRO_PRICE_ID}]},
+    )
+
+    event_record = StripeWebhookEvent(
+        id="evt_rzp_only_test",
+        event_type="checkout.session.completed",
+        status=WebhookProcessingStatus.pending,
+        attempts=1,
+        payload=build_checkout_completed_event(
+            event_id="evt_rzp_only_test",
+            session_id=session_id,
+            customer_id=customer_id,
+            subscription_id=sub_id,
+            org_id=org.id,
+            attempt_id=attempt.id,
+        ),
+        created_at=datetime.now(timezone.utc),
+    )
+
+    db = HandlerMockDbSession(
+        organizations=[org],
+        attempts=[attempt],
+        subscriptions=[razorpay_sub],
+        events=[event_record],
+    )
+
+    with patch("app.services.billing.stripe_checkout_handler.settings", get_test_settings()):
+        result = await process_webhook_event(
+            db=db,
+            event_id="evt_rzp_only_test",
+            dispatcher=default_webhook_dispatcher,
+        )
+
+    assert result.success is True
+    assert event_record.status == WebhookProcessingStatus.processed
+
+    # Razorpay record is completely untouched
+    assert razorpay_sub.provider == "razorpay"
+    assert razorpay_sub.status == SubscriptionStatus.incomplete
+    assert razorpay_sub.plan_tier == "free"
+    assert razorpay_sub.stripe_customer_id is None
+
+    # A brand new Stripe subscription was added
+    new_subs = [s for s in db.subscriptions.values() if s.provider == "stripe"]
+    assert len(new_subs) == 1
+    new_stripe_sub = new_subs[0]
+    assert new_stripe_sub.stripe_customer_id == customer_id
+    assert new_stripe_sub.stripe_subscription_id == sub_id
+    assert new_stripe_sub.status == SubscriptionStatus.active
+    assert new_stripe_sub.plan_tier == "pro"
+
+
+@pytest.mark.asyncio
+async def test_stripe_event_resolves_stripe_record_without_modifying_razorpay_record():
+    """Verify that Stripe event updates the specific Stripe record and does not cross-contaminate Razorpay."""
+    org = Organization(id=uuid.uuid4(), name="Multi Record Org")
+    customer_id = "cus_stripe_exact_match"
+    sub_id = "sub_stripe_exact_match"
+    session_id = "cs_stripe_exact_match"
+
+    # Pre-existing Stripe subscription
+    stripe_sub = Subscription(
+        id=uuid.uuid4(),
+        organization_id=org.id,
+        provider="stripe",
+        stripe_customer_id=customer_id,
+        provider_customer_id=customer_id,
+        merchant_account_id="default",
+        environment="legacy",
+        status=SubscriptionStatus.incomplete,
+        plan_tier="free",
+    )
+
+    # Active Razorpay subscription (e.g. from future or parallel checkout)
+    razorpay_sub = Subscription(
+        id=uuid.uuid4(),
+        organization_id=org.id,
+        provider="razorpay",
+        provider_customer_id="cust_rzp_active_777",
+        provider_subscription_id="sub_rzp_active_777",
+        merchant_account_id="acc_test_123",
+        environment="test",
+        status=SubscriptionStatus.canceled,
+        plan_tier="free",
+    )
+
+    attempt = StripeCheckoutAttempt(
+        id=uuid.uuid4(),
+        organization_id=org.id,
+        stripe_customer_id=customer_id,
+        stripe_session_id=session_id,
+        status=CheckoutAttemptStatus.open,
+        attempt_lease_expires_at=datetime.now(timezone.utc),
+        request_payload={"line_items": [{"price": TEST_PRO_PRICE_ID}]},
+    )
+
+    event_record = StripeWebhookEvent(
+        id="evt_no_cross_contaminate",
+        event_type="checkout.session.completed",
+        status=WebhookProcessingStatus.pending,
+        attempts=1,
+        payload=build_checkout_completed_event(
+            event_id="evt_no_cross_contaminate",
+            session_id=session_id,
+            customer_id=customer_id,
+            subscription_id=sub_id,
+            org_id=org.id,
+            attempt_id=attempt.id,
+        ),
+        created_at=datetime.now(timezone.utc),
+    )
+
+    db = HandlerMockDbSession(
+        organizations=[org],
+        attempts=[attempt],
+        subscriptions=[stripe_sub, razorpay_sub],
+        events=[event_record],
+    )
+
+    with patch("app.services.billing.stripe_checkout_handler.settings", get_test_settings()):
+        result = await process_webhook_event(
+            db=db,
+            event_id="evt_no_cross_contaminate",
+            dispatcher=default_webhook_dispatcher,
+        )
+
+    assert result.success is True
+
+    # Stripe sub updated
+    assert stripe_sub.status == SubscriptionStatus.active
+    assert stripe_sub.plan_tier == "pro"
+    assert stripe_sub.stripe_subscription_id == sub_id
+
+    # Razorpay sub completely unmodified
+    assert razorpay_sub.provider == "razorpay"
+    assert razorpay_sub.status == SubscriptionStatus.canceled
+    assert razorpay_sub.provider_subscription_id == "sub_rzp_active_777"
+

@@ -78,3 +78,43 @@ class StripeBillingPortalOut(BaseModel):
     organization_id: uuid.UUID
     portal_url: str
 
+
+class RazorpaySubscriptionCheckoutOut(BaseModel):
+    """Safe representation of an organization's Razorpay Subscription Checkout."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    organization_id: uuid.UUID
+    attempt_id: uuid.UUID
+    provider: str
+    subscription_id: str
+    key_id: str
+    plan_id: str
+    checkout_url: str | None = None
+    status: str
+
+
+class RazorpayCheckoutVerificationIn(BaseModel):
+    """Callback parameters received from Razorpay standard checkout."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    attempt_id: uuid.UUID
+    razorpay_payment_id: str
+    razorpay_subscription_id: str
+    razorpay_signature: str
+
+
+class RazorpayCheckoutVerificationOut(BaseModel):
+    """Safe outcome of a verified Razorpay subscription checkout callback."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    organization_id: uuid.UUID
+    attempt_id: uuid.UUID
+    provider: str
+    subscription_id: str
+    payment_id: str
+    status: str
+    payment_status: str
+

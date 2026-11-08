@@ -66,6 +66,7 @@ import app.models.generation  # noqa: F401
 import app.models.generation_attempt  # noqa: F401
 import app.models.organization  # noqa: F401
 import app.models.subscription  # noqa: F401
+import app.models.payment  # noqa: F401
 from app.api.billing import validate_stripe_portal_url
 from app.auth.dependencies import CurrentUser, get_current_user
 from app.config import Settings, settings
@@ -73,6 +74,7 @@ from app.db.session import get_db
 from app.main import app
 from app.models.billing import OrganizationBillingPeriod
 from app.models.organization import MemberRole, Organization, OrganizationMember
+from app.models.payment import BillingCustomerProvision, CustomerProvisionStatus
 from app.models.subscription import Subscription, SubscriptionStatus
 
 AUTH_HEADERS = {"Authorization": "Bearer test_valid_token"}
@@ -105,6 +107,7 @@ class BillingApiMockDbSession:
         members: list[OrganizationMember] | None = None,
         subscriptions: list[Subscription] | None = None,
         billing_periods: list[OrganizationBillingPeriod] | None = None,
+        provisions: list[BillingCustomerProvision] | None = None,
     ) -> None:
         self.organizations: dict[uuid.UUID, Organization] = {
             org.id: org for org in (organizations or [])
@@ -114,6 +117,7 @@ class BillingApiMockDbSession:
         }
         self.subscriptions: list[Subscription] = list(subscriptions or [])
         self.billing_periods: list[OrganizationBillingPeriod] = list(billing_periods or [])
+        self.provisions: list[BillingCustomerProvision] = list(provisions or [])
         self.committed_count = 0
         self.rolled_back_count = 0
         self.added: list[Any] = []
@@ -563,6 +567,47 @@ async def test_subscription_canceled_state_represented_correctly(client: AsyncCl
     data = resp.json()
     assert data["status"] == "canceled"
     assert data["canceled_at"].startswith("2026-10-25T08:30:00")
+
+
+@pytest.mark.asyncio
+async def test_subscription_free_tier_with_razorpay_customer_provision(client: AsyncClient):
+    """Verify that an organization without a paid subscription but with a Razorpay customer
+    provisioning record returns plan_tier='free' and status='active', ensuring customer provisioning
+    state is never interpreted as a subscription lifecycle state."""
+    user_id = uuid.uuid4()
+    org_id = uuid.uuid4()
+    org = Organization(id=org_id, name="Free Tier With Razorpay Provision")
+    member = OrganizationMember(organization_id=org_id, user_id=user_id, role=MemberRole.member)
+
+    # Customer provision in resolved state (customer created, but NO subscription created yet)
+    provision = BillingCustomerProvision(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        provider="razorpay",
+        merchant_account_id="acc_test_123",
+        environment="test",
+        provider_customer_id="cust_rzp_precheckout_999",
+        status=CustomerProvisionStatus.resolved,
+    )
+
+    db = BillingApiMockDbSession(
+        organizations=[org],
+        members=[member],
+        subscriptions=[],  # Zero subscription rows!
+        provisions=[provision],
+    )
+    setup_api_overrides(db, user_id)
+
+    resp = await client.get(
+        f"/api/v1/organizations/{org_id}/billing/subscription",
+        headers=AUTH_HEADERS,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["plan_tier"] == "free"
+    assert data["status"] == "active"
+    assert data["has_stripe_customer"] is False
+
 
 
 @pytest.mark.asyncio

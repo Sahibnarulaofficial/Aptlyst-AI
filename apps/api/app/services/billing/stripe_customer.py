@@ -63,7 +63,11 @@ async def get_stripe_customer_id(
     """
     stmt = (
         select(Subscription.stripe_customer_id)
-        .where(Subscription.organization_id == organization_id)
+        .where(
+            Subscription.organization_id == organization_id,
+            Subscription.provider == "stripe",
+            Subscription.stripe_customer_id.isnot(None),
+        )
         .order_by(Subscription.created_at.desc())
         .limit(1)
     )

@@ -22,6 +22,13 @@ if False:  # TYPE_CHECKING
     from app.models.chatbot import Chatbot
     from app.models.conversation import Conversation
     from app.models.generation import GenerationTask
+    from app.models.payment import (
+        BillingCheckoutAttempt,
+        BillingCustomerProvision,
+        BillingInvoice,
+        BillingPayment,
+        PaymentReconciliation,
+    )
     from app.models.subscription import (
         BillingReconciliation,
         StripeCheckoutAttempt,
@@ -84,6 +91,21 @@ class Organization(Base):
         back_populates="organization"
     )
     stripe_invoices: Mapped[list["StripeInvoice"]] = relationship(
+        back_populates="organization"
+    )
+    billing_checkout_attempts: Mapped[list["BillingCheckoutAttempt"]] = relationship(
+        back_populates="organization"
+    )
+    billing_invoices: Mapped[list["BillingInvoice"]] = relationship(
+        back_populates="organization"
+    )
+    billing_payments: Mapped[list["BillingPayment"]] = relationship(
+        back_populates="organization"
+    )
+    payment_reconciliations: Mapped[list["PaymentReconciliation"]] = relationship(
+        back_populates="organization"
+    )
+    billing_customer_provisions: Mapped[list["BillingCustomerProvision"]] = relationship(
         back_populates="organization"
     )
 

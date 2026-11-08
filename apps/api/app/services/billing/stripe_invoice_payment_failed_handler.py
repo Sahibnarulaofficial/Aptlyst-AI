@@ -220,10 +220,13 @@ async def handle_invoice_payment_failed(
 
     stmt_cust = (
         select(Subscription.organization_id, Subscription.stripe_subscription_id)
-        .where(Subscription.stripe_customer_id == customer_id)
+        .where(
+            Subscription.stripe_customer_id == customer_id,
+            Subscription.provider == "stripe",
+        )
     )
     res_cust = await db.execute(stmt_cust)
-    cust_row = res_cust.scalar_one_or_none()
+    cust_row = res_cust.first()
 
     if cust_row is None:
         raise WebhookPermanentError(
@@ -356,6 +359,7 @@ async def handle_invoice_payment_failed(
         .where(
             Subscription.organization_id == org_id,
             Subscription.stripe_subscription_id == subscription_id,
+            Subscription.provider == "stripe",
         )
     )
     res_sub = await db.execute(stmt_sub)

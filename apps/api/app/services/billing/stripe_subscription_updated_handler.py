@@ -242,7 +242,10 @@ async def handle_subscription_updated(
 
     stmt_sub = (
         select(Subscription)
-        .where(Subscription.stripe_customer_id == customer_id)
+        .where(
+            Subscription.stripe_customer_id == customer_id,
+            Subscription.provider == "stripe",
+        )
         .with_for_update()
     )
     result_sub = await db.execute(stmt_sub)
