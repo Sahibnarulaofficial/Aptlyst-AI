@@ -71,7 +71,7 @@ def test_1_valid_stripe_provenance_backfill(pg_engine) -> None:
             period_id = uuid.uuid4()
             stripe_sub_id = f"sub_stripe_{uuid.uuid4().hex[:12]}"
 
-            conn.execute(text("INSERT INTO organizations (id, name, slug) VALUES (:id, 'Test Org', :slug)"), {"id": org_id, "slug": f"org-{uuid.uuid4().hex[:8]}"})
+            conn.execute(text("INSERT INTO organizations (id, name) VALUES (:id, 'Test Org')"), {"id": org_id})
             conn.execute(
                 text("INSERT INTO subscriptions (id, organization_id, status, plan_tier, provider, provider_customer_id, merchant_account_id, environment, stripe_subscription_id) "
                      "VALUES (:id, :org_id, 'active', 'pro', 'stripe', 'cus_1', 'default', 'legacy', :stripe_sub_id)"),
@@ -131,7 +131,7 @@ def test_2_valid_provider_neutral_provenance_backfill(pg_engine) -> None:
             sub_id = uuid.uuid4()
             period_id = uuid.uuid4()
 
-            conn.execute(text("INSERT INTO organizations (id, name, slug) VALUES (:id, 'Test Org', :slug)"), {"id": org_id, "slug": f"org-{uuid.uuid4().hex[:8]}"})
+            conn.execute(text("INSERT INTO organizations (id, name) VALUES (:id, 'Test Org')"), {"id": org_id})
             conn.execute(
                 text("INSERT INTO subscriptions (id, organization_id, status, plan_tier, provider, provider_customer_id, merchant_account_id, environment) "
                      "VALUES (:id, :org_id, 'active', 'pro', 'razorpay', 'cust_1', 'acc_1', 'live')"),
@@ -192,7 +192,7 @@ def test_3_multiple_invoices_pointing_to_same_subscription(pg_engine) -> None:
             period_id = uuid.uuid4()
             stripe_sub_id = f"sub_stripe_{uuid.uuid4().hex[:12]}"
 
-            conn.execute(text("INSERT INTO organizations (id, name, slug) VALUES (:id, 'Test Org', :slug)"), {"id": org_id, "slug": f"org-{uuid.uuid4().hex[:8]}"})
+            conn.execute(text("INSERT INTO organizations (id, name) VALUES (:id, 'Test Org')"), {"id": org_id})
             conn.execute(
                 text("INSERT INTO subscriptions (id, organization_id, status, plan_tier, provider, provider_customer_id, merchant_account_id, environment, stripe_subscription_id) "
                      "VALUES (:id, :org_id, 'active', 'pro', 'stripe', 'cus_1', 'default', 'legacy', :stripe_sub_id)"),
@@ -283,7 +283,7 @@ def test_4_stripe_and_neutral_evidence_disagreeing(pg_engine) -> None:
             period_id = uuid.uuid4()
             stripe_sub_id = f"sub_stripe_{uuid.uuid4().hex[:12]}"
 
-            conn.execute(text("INSERT INTO organizations (id, name, slug) VALUES (:id, 'Test Org', :slug)"), {"id": org_id, "slug": f"org-{uuid.uuid4().hex[:8]}"})
+            conn.execute(text("INSERT INTO organizations (id, name) VALUES (:id, 'Test Org')"), {"id": org_id})
             conn.execute(
                 text("INSERT INTO subscriptions (id, organization_id, status, plan_tier, provider, provider_customer_id, merchant_account_id, environment, stripe_subscription_id) "
                      "VALUES (:id, :org_id, 'active', 'pro', 'stripe', 'cus_1', 'default', 'legacy', :stripe_sub_id)"),
@@ -353,7 +353,7 @@ def test_5_existing_provenance_disagreeing_with_invoice_evidence(pg_engine) -> N
             period_id = uuid.uuid4()
             stripe_sub_id = f"sub_stripe_{uuid.uuid4().hex[:12]}"
 
-            conn.execute(text("INSERT INTO organizations (id, name, slug) VALUES (:id, 'Test Org', :slug)"), {"id": org_id, "slug": f"org-{uuid.uuid4().hex[:8]}"})
+            conn.execute(text("INSERT INTO organizations (id, name) VALUES (:id, 'Test Org')"), {"id": org_id})
             conn.execute(
                 text("INSERT INTO subscriptions (id, organization_id, status, plan_tier, provider, provider_customer_id, merchant_account_id, environment, stripe_subscription_id) "
                      "VALUES (:id, :org_id, 'active', 'pro', 'stripe', 'cus_1', 'default', 'legacy', :stripe_sub_id)"),
@@ -415,7 +415,7 @@ def test_6_active_pro_period_without_provenance_aborts(pg_engine) -> None:
             org_id = uuid.uuid4()
             period_id = uuid.uuid4()
 
-            conn.execute(text("INSERT INTO organizations (id, name, slug) VALUES (:id, 'Test Org', :slug)"), {"id": org_id, "slug": f"org-{uuid.uuid4().hex[:8]}"})
+            conn.execute(text("INSERT INTO organizations (id, name) VALUES (:id, 'Test Org')"), {"id": org_id})
             conn.execute(
                 text("INSERT INTO organization_billing_periods (id, organization_id, period_start, period_end, plan_tier, monthly_token_quota, subscription_id, is_active) "
                      "VALUES (:id, :org_id, now(), now() + interval '30 days', 'pro', 2000000, NULL, true)"),
@@ -449,7 +449,7 @@ def test_7_free_period_with_null_provenance_succeeds(pg_engine) -> None:
             org_id = uuid.uuid4()
             period_id = uuid.uuid4()
 
-            conn.execute(text("INSERT INTO organizations (id, name, slug) VALUES (:id, 'Test Org', :slug)"), {"id": org_id, "slug": f"org-{uuid.uuid4().hex[:8]}"})
+            conn.execute(text("INSERT INTO organizations (id, name) VALUES (:id, 'Test Org')"), {"id": org_id})
             conn.execute(
                 text("INSERT INTO organization_billing_periods (id, organization_id, period_start, period_end, plan_tier, monthly_token_quota, subscription_id, is_active) "
                      "VALUES (:id, :org_id, now(), now() + interval '30 days', 'free', 100000, NULL, true)"),
@@ -483,7 +483,7 @@ def test_8_composite_foreign_key_mismatch_rejection(pg_engine) -> None:
             org_id = uuid.uuid4()
             attempt_id = uuid.uuid4()
 
-            conn.execute(text("INSERT INTO organizations (id, name, slug) VALUES (:id, 'Test Org', :slug)"), {"id": org_id, "slug": f"org-{uuid.uuid4().hex[:8]}"})
+            conn.execute(text("INSERT INTO organizations (id, name) VALUES (:id, 'Test Org')"), {"id": org_id})
             conn.execute(
                 text("INSERT INTO billing_checkout_attempts (id, organization_id, provider, merchant_account_id, environment, provider_subscription_id, provider_payment_id, idempotency_key, status, amount_minor_units, currency, attempt_lease_expires_at) "
                      "VALUES (:id, :org_id, 'razorpay', 'acc_live', 'live', 'sub_123', 'pay_123', 'idem_1', 'complete', 4900, 'USD', now() + interval '1 hour')"),
@@ -508,7 +508,7 @@ def test_9_composite_foreign_key_null_bypass_rejection(pg_engine) -> None:
             org_id = uuid.uuid4()
             attempt_id = uuid.uuid4()
 
-            conn.execute(text("INSERT INTO organizations (id, name, slug) VALUES (:id, 'Test Org', :slug)"), {"id": org_id, "slug": f"org-{uuid.uuid4().hex[:8]}"})
+            conn.execute(text("INSERT INTO organizations (id, name) VALUES (:id, 'Test Org')"), {"id": org_id})
             conn.execute(
                 text("INSERT INTO billing_checkout_attempts (id, organization_id, provider, merchant_account_id, environment, provider_subscription_id, provider_payment_id, idempotency_key, status, amount_minor_units, currency, attempt_lease_expires_at) "
                      "VALUES (:id, :org_id, 'razorpay', 'acc_live', 'live', 'sub_123', 'pay_123', 'idem_1', 'complete', 4900, 'USD', now() + interval '1 hour')"),
@@ -535,7 +535,7 @@ def test_10_successful_initial_payment_association(pg_engine) -> None:
             attempt_id = uuid.uuid4()
             payment_id = uuid.uuid4()
 
-            conn.execute(text("INSERT INTO organizations (id, name, slug) VALUES (:id, 'Test Org', :slug)"), {"id": org_id, "slug": f"org-{uuid.uuid4().hex[:8]}"})
+            conn.execute(text("INSERT INTO organizations (id, name) VALUES (:id, 'Test Org')"), {"id": org_id})
             # Attempt created with NULL provider_payment_id initially
             conn.execute(
                 text("INSERT INTO billing_checkout_attempts (id, organization_id, provider, merchant_account_id, environment, provider_subscription_id, provider_payment_id, idempotency_key, status, amount_minor_units, currency, attempt_lease_expires_at) "
@@ -577,7 +577,7 @@ def test_11_reassignment_of_established_payment_association_rejected(pg_engine) 
             attempt_id = uuid.uuid4()
             payment_id = uuid.uuid4()
 
-            conn.execute(text("INSERT INTO organizations (id, name, slug) VALUES (:id, 'Test Org', :slug)"), {"id": org_id, "slug": f"org-{uuid.uuid4().hex[:8]}"})
+            conn.execute(text("INSERT INTO organizations (id, name) VALUES (:id, 'Test Org')"), {"id": org_id})
             conn.execute(
                 text("INSERT INTO billing_checkout_attempts (id, organization_id, provider, merchant_account_id, environment, provider_subscription_id, provider_payment_id, idempotency_key, status, amount_minor_units, currency, attempt_lease_expires_at) "
                      "VALUES (:id, :org_id, 'razorpay', 'acc_live', 'live', 'sub_123', 'pay_123', 'idem_1', 'complete', 4900, 'USD', now() + interval '1 hour')"),
@@ -609,7 +609,7 @@ def test_12_reassignment_of_established_period_provenance_rejected(pg_engine) ->
             sub_id2 = uuid.uuid4()
             period_id = uuid.uuid4()
 
-            conn.execute(text("INSERT INTO organizations (id, name, slug) VALUES (:id, 'Test Org', :slug)"), {"id": org_id, "slug": f"org-{uuid.uuid4().hex[:8]}"})
+            conn.execute(text("INSERT INTO organizations (id, name) VALUES (:id, 'Test Org')"), {"id": org_id})
             conn.execute(
                 text("INSERT INTO subscriptions (id, organization_id, status, plan_tier, provider, provider_customer_id, merchant_account_id, environment) "
                      "VALUES (:id, :org_id, 'active', 'pro', 'razorpay', 'cust_1', 'acc_1', 'live')"),
@@ -647,7 +647,7 @@ def test_13_concurrent_attempts_to_associate_conflicting_records(pg_engine) -> N
     # Connection 1 creates organization, attempt, and associates Payment 1
     with pg_engine.connect() as conn1:
         with conn1.begin():
-            conn1.execute(text("INSERT INTO organizations (id, name, slug) VALUES (:id, 'Test Org', :slug)"), {"id": org_id, "slug": f"org-{uuid.uuid4().hex[:8]}"})
+            conn1.execute(text("INSERT INTO organizations (id, name) VALUES (:id, 'Test Org')"), {"id": org_id})
             conn1.execute(
                 text("INSERT INTO billing_checkout_attempts (id, organization_id, provider, merchant_account_id, environment, provider_subscription_id, provider_payment_id, idempotency_key, status, amount_minor_units, currency, attempt_lease_expires_at) "
                      "VALUES (:id, :org_id, 'razorpay', 'acc_live', 'live', 'sub_123', 'pay_123', 'idem_1', 'complete', 4900, 'USD', now() + interval '1 hour')"),
@@ -689,7 +689,7 @@ def test_14_downgrade_refusal_when_financial_associations_exist(pg_engine) -> No
             sub_id = uuid.uuid4()
             period_id = uuid.uuid4()
 
-            conn.execute(text("INSERT INTO organizations (id, name, slug) VALUES (:id, 'Test Org', :slug)"), {"id": org_id, "slug": f"org-{uuid.uuid4().hex[:8]}"})
+            conn.execute(text("INSERT INTO organizations (id, name) VALUES (:id, 'Test Org')"), {"id": org_id})
             conn.execute(
                 text("INSERT INTO subscriptions (id, organization_id, status, plan_tier, provider, provider_customer_id, merchant_account_id, environment) "
                      "VALUES (:id, :org_id, 'active', 'pro', 'razorpay', 'cust_1', 'acc_1', 'live')"),
