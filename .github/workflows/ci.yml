@@ -64,6 +64,27 @@ jobs:
           sys.exit(1)
           "
 
+      - name: Provision dummy Supabase roles in disposable CI database
+        run: |
+          python -c "
+          import psycopg2
+          conn = psycopg2.connect('postgresql://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test')
+          conn.autocommit = True
+          with conn.cursor() as cur:
+              for role in ('anon', 'authenticated'):
+                  cur.execute('SELECT 1 FROM pg_roles WHERE rolname = %s;', (role,))
+                  if not cur.fetchone():
+                      cur.execute('CREATE ROLE ' + role + ' NOLOGIN;')
+                      print('Provisioned role: ' + role + ' (NOLOGIN)')
+                  else:
+                      print('Role already exists: ' + role)
+              cur.execute('SELECT rolname, rolcanlogin FROM pg_roles WHERE rolname IN %s;', (('anon', 'authenticated'),))
+              for row in cur.fetchall():
+                  print('Verified role in pg_roles: ' + str(row[0]) + ', canlogin=' + str(row[1]))
+          conn.close()
+          print('Successfully provisioned and verified dummy Supabase roles.')
+          "
+
       - name: Apply Alembic migrations on disposable database
         working-directory: apps/api
         env:
