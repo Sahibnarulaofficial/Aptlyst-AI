@@ -291,7 +291,7 @@ def test_4_stripe_and_neutral_evidence_disagreeing(pg_engine) -> None:
             )
             conn.execute(
                 text("INSERT INTO subscriptions (id, organization_id, status, plan_tier, provider, provider_customer_id, merchant_account_id, environment) "
-                     "VALUES (:id, :org_id, 'active', 'pro', 'razorpay', 'cust_2', 'acc_1', 'live')"),
+                     "VALUES (:id, :org_id, 'canceled', 'pro', 'razorpay', 'cust_2', 'acc_1', 'live')"),
                 {"id": sub_id2, "org_id": org_id},
             )
             conn.execute(
@@ -361,7 +361,7 @@ def test_5_existing_provenance_disagreeing_with_invoice_evidence(pg_engine) -> N
             )
             conn.execute(
                 text("INSERT INTO subscriptions (id, organization_id, status, plan_tier, provider, provider_customer_id, merchant_account_id, environment) "
-                     "VALUES (:id, :org_id, 'active', 'pro', 'razorpay', 'cust_2', 'acc_1', 'live')"),
+                     "VALUES (:id, :org_id, 'canceled', 'pro', 'razorpay', 'cust_2', 'acc_1', 'live')"),
                 {"id": sub_id2, "org_id": org_id},
             )
             # Period already has subscription_id = sub_id1
@@ -617,7 +617,7 @@ def test_12_reassignment_of_established_period_provenance_rejected(pg_engine) ->
             )
             conn.execute(
                 text("INSERT INTO subscriptions (id, organization_id, status, plan_tier, provider, provider_customer_id, merchant_account_id, environment) "
-                     "VALUES (:id, :org_id, 'active', 'pro', 'razorpay', 'cust_2', 'acc_1', 'live')"),
+                     "VALUES (:id, :org_id, 'canceled', 'pro', 'razorpay', 'cust_2', 'acc_1', 'live')"),
                 {"id": sub_id2, "org_id": org_id},
             )
             conn.execute(
