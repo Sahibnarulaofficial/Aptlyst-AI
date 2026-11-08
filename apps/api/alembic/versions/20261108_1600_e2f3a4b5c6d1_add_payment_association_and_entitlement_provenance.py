@@ -352,8 +352,17 @@ def upgrade() -> None:
                 RETURN NEW;
             END;
             $$ LANGUAGE plpgsql;
-
-            DROP TRIGGER IF EXISTS trg_prevent_billing_payment_checkout_attempt_mutation ON billing_payments;
+            """
+        )
+    )
+    op.execute(
+        sa.text(
+            "DROP TRIGGER IF EXISTS trg_prevent_billing_payment_checkout_attempt_mutation ON billing_payments;"
+        )
+    )
+    op.execute(
+        sa.text(
+            """
             CREATE TRIGGER trg_prevent_billing_payment_checkout_attempt_mutation
             BEFORE UPDATE ON billing_payments
             FOR EACH ROW EXECUTE FUNCTION prevent_billing_payment_checkout_attempt_mutation();
@@ -374,8 +383,17 @@ def upgrade() -> None:
                 RETURN NEW;
             END;
             $$ LANGUAGE plpgsql;
-
-            DROP TRIGGER IF EXISTS trg_prevent_checkout_attempt_payment_mutation ON billing_checkout_attempts;
+            """
+        )
+    )
+    op.execute(
+        sa.text(
+            "DROP TRIGGER IF EXISTS trg_prevent_checkout_attempt_payment_mutation ON billing_checkout_attempts;"
+        )
+    )
+    op.execute(
+        sa.text(
+            """
             CREATE TRIGGER trg_prevent_checkout_attempt_payment_mutation
             BEFORE UPDATE ON billing_checkout_attempts
             FOR EACH ROW EXECUTE FUNCTION prevent_checkout_attempt_payment_mutation();
@@ -396,8 +414,17 @@ def upgrade() -> None:
                 RETURN NEW;
             END;
             $$ LANGUAGE plpgsql;
-
-            DROP TRIGGER IF EXISTS trg_prevent_billing_period_subscription_mutation ON organization_billing_periods;
+            """
+        )
+    )
+    op.execute(
+        sa.text(
+            "DROP TRIGGER IF EXISTS trg_prevent_billing_period_subscription_mutation ON organization_billing_periods;"
+        )
+    )
+    op.execute(
+        sa.text(
+            """
             CREATE TRIGGER trg_prevent_billing_period_subscription_mutation
             BEFORE UPDATE ON organization_billing_periods
             FOR EACH ROW EXECUTE FUNCTION prevent_billing_period_subscription_mutation();
