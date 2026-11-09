@@ -3,10 +3,12 @@
 Validates unified provenance backfill, conflict detection, triggers,
 check constraints, composite foreign keys, and downgrade guards.
 
-NOTE: As per Step 5.2D.3.3A.1 requirements:
+NOTE: As per Step 5.2D.3.3A.1 requirements and Phase 1 CI hardening:
 - SQLite MUST NOT be used as a substitute for PostgreSQL constraint testing.
-- Tests execute ONLY if a disposable PostgreSQL database is available via POSTGRES_TEST_URL.
-- If POSTGRES_TEST_URL is not set or PostgreSQL is unreachable, tests are skipped with a clear notice.
+- When `REQUIRE_POSTGRES_TESTS=1` (e.g. CI), tests NEVER skip and MUST fail closed unless a verified
+  isolated local PostgreSQL 16 test database is reachable via `POSTGRES_TEST_URL`.
+- Locally without `REQUIRE_POSTGRES_TESTS`, if `POSTGRES_TEST_URL` is unset or an isolated local
+  database is unreachable, tests skip safely without ever touching Supabase or `.env` `DATABASE_URL`.
 """
 
 import os
@@ -26,42 +28,54 @@ if sys.platform == "win32":
 import uuid
 from datetime import datetime, timezone
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, IntegrityError
+
+from tests.postgres_test_guard import (
+    PostgresTestConfigError,
+    _OptionalPostgresUnreachableError,
+    is_postgres_tests_required,
+    normalize_to_sync_postgres_url,
+    resolve_verified_pg_engine,
+)
 
 
 POSTGRES_TEST_URL = os.environ.get("POSTGRES_TEST_URL")
+REQUIRE_POSTGRES_TESTS = is_postgres_tests_required()
+_SKIP_IF_OPTIONAL_POSTGRES = pytest.mark.skipif(
+    not POSTGRES_TEST_URL and not REQUIRE_POSTGRES_TESTS,
+    reason="Disposable PostgreSQL environment required",
+)
 
 
 def _get_sync_postgres_url(raw_url: str) -> str:
     """Normalize async database URLs to sync psycopg2 URLs for engine creation."""
-    if raw_url.startswith("postgresql+asyncpg://"):
-        return raw_url.replace("postgresql+asyncpg://", "postgresql+psycopg2://", 1)
-    if raw_url.startswith("postgres://"):
-        return raw_url.replace("postgres://", "postgresql://", 1)
-    return raw_url
+    return normalize_to_sync_postgres_url(raw_url)
 
 
 @pytest.fixture(scope="module")
 def pg_engine():
-    """Provides a PostgreSQL engine if available, otherwise skips."""
-    if not POSTGRES_TEST_URL:
+    """Provides a verified PostgreSQL 16 engine; skips only when optional and unset/unreachable."""
+    try:
+        engine, _summary, _required = resolve_verified_pg_engine()
+    except _OptionalPostgresUnreachableError as exc:
+        pytest.skip(str(exc))
+    except PostgresTestConfigError as exc:
+        pytest.fail(str(exc), pytrace=False)
+
+    if engine is None:
         pytest.skip(
             "Disposable PostgreSQL test database not available in environment. "
             "Set POSTGRES_TEST_URL to execute live PostgreSQL constraint & trigger integration tests."
         )
-    sync_url = _get_sync_postgres_url(POSTGRES_TEST_URL)
-    engine = create_engine(sync_url, echo=False)
+
     try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-    except Exception as exc:
-        pytest.skip(f"PostgreSQL connection to POSTGRES_TEST_URL failed: {exc}")
-    yield engine
-    engine.dispose()
+        yield engine
+    finally:
+        engine.dispose()
 
 
-@pytest.mark.skipif(not POSTGRES_TEST_URL, reason="Disposable PostgreSQL environment required")
+@_SKIP_IF_OPTIONAL_POSTGRES
 def test_1_valid_stripe_provenance_backfill(pg_engine) -> None:
     """Scenario 1: Valid 1:1 Stripe invoice evidence correctly backfills billing period."""
     with pg_engine.connect() as conn:
@@ -122,7 +136,7 @@ def test_1_valid_stripe_provenance_backfill(pg_engine) -> None:
             conn.rollback()
 
 
-@pytest.mark.skipif(not POSTGRES_TEST_URL, reason="Disposable PostgreSQL environment required")
+@_SKIP_IF_OPTIONAL_POSTGRES
 def test_2_valid_provider_neutral_provenance_backfill(pg_engine) -> None:
     """Scenario 2: Valid provider-neutral invoice evidence correctly backfills billing period."""
     with pg_engine.connect() as conn:
@@ -182,7 +196,7 @@ def test_2_valid_provider_neutral_provenance_backfill(pg_engine) -> None:
             conn.rollback()
 
 
-@pytest.mark.skipif(not POSTGRES_TEST_URL, reason="Disposable PostgreSQL environment required")
+@_SKIP_IF_OPTIONAL_POSTGRES
 def test_3_multiple_invoices_pointing_to_same_subscription(pg_engine) -> None:
     """Scenario 3: Multiple invoices pointing to the exact same subscription resolve without error."""
     with pg_engine.connect() as conn:
@@ -272,7 +286,7 @@ def test_3_multiple_invoices_pointing_to_same_subscription(pg_engine) -> None:
             conn.rollback()
 
 
-@pytest.mark.skipif(not POSTGRES_TEST_URL, reason="Disposable PostgreSQL environment required")
+@_SKIP_IF_OPTIONAL_POSTGRES
 def test_4_stripe_and_neutral_evidence_disagreeing(pg_engine) -> None:
     """Scenario 4: Stripe and provider-neutral evidence pointing to different subscriptions triggers abort."""
     with pg_engine.connect() as conn:
@@ -342,7 +356,7 @@ def test_4_stripe_and_neutral_evidence_disagreeing(pg_engine) -> None:
             conn.rollback()
 
 
-@pytest.mark.skipif(not POSTGRES_TEST_URL, reason="Disposable PostgreSQL environment required")
+@_SKIP_IF_OPTIONAL_POSTGRES
 def test_5_existing_provenance_disagreeing_with_invoice_evidence(pg_engine) -> None:
     """Scenario 5: Existing non-null subscription_id disagreeing with invoice evidence triggers abort."""
     with pg_engine.connect() as conn:
@@ -407,7 +421,7 @@ def test_5_existing_provenance_disagreeing_with_invoice_evidence(pg_engine) -> N
             conn.rollback()
 
 
-@pytest.mark.skipif(not POSTGRES_TEST_URL, reason="Disposable PostgreSQL environment required")
+@_SKIP_IF_OPTIONAL_POSTGRES
 def test_6_active_pro_period_without_provenance_aborts(pg_engine) -> None:
     """Scenario 6: Active Pro period remaining with NULL subscription_id triggers Abort Gate."""
     with pg_engine.connect() as conn:
@@ -441,7 +455,7 @@ def test_6_active_pro_period_without_provenance_aborts(pg_engine) -> None:
             conn.rollback()
 
 
-@pytest.mark.skipif(not POSTGRES_TEST_URL, reason="Disposable PostgreSQL environment required")
+@_SKIP_IF_OPTIONAL_POSTGRES
 def test_7_free_period_with_null_provenance_succeeds(pg_engine) -> None:
     """Scenario 7: Free tier billing period with NULL subscription_id is ignored by Abort Gate."""
     with pg_engine.connect() as conn:
@@ -475,7 +489,7 @@ def test_7_free_period_with_null_provenance_succeeds(pg_engine) -> None:
             conn.rollback()
 
 
-@pytest.mark.skipif(not POSTGRES_TEST_URL, reason="Disposable PostgreSQL environment required")
+@_SKIP_IF_OPTIONAL_POSTGRES
 def test_8_composite_foreign_key_mismatch_rejection(pg_engine) -> None:
     """Scenario 8: Inserting payment with mismatched composite identity fails composite foreign key constraint."""
     with pg_engine.connect() as conn:
@@ -500,7 +514,7 @@ def test_8_composite_foreign_key_mismatch_rejection(pg_engine) -> None:
             conn.rollback()
 
 
-@pytest.mark.skipif(not POSTGRES_TEST_URL, reason="Disposable PostgreSQL environment required")
+@_SKIP_IF_OPTIONAL_POSTGRES
 def test_9_composite_foreign_key_null_bypass_rejection(pg_engine) -> None:
     """Scenario 9: Inserting payment with checkout_attempt_id set but provider_payment_id NULL violates check constraint."""
     with pg_engine.connect() as conn:
@@ -526,7 +540,7 @@ def test_9_composite_foreign_key_null_bypass_rejection(pg_engine) -> None:
             conn.rollback()
 
 
-@pytest.mark.skipif(not POSTGRES_TEST_URL, reason="Disposable PostgreSQL environment required")
+@_SKIP_IF_OPTIONAL_POSTGRES
 def test_10_successful_initial_payment_association(pg_engine) -> None:
     """Scenario 10: Legitimate initial association from NULL -> verified ID succeeds without trigger error."""
     with pg_engine.connect() as conn:
@@ -568,7 +582,7 @@ def test_10_successful_initial_payment_association(pg_engine) -> None:
             conn.rollback()
 
 
-@pytest.mark.skipif(not POSTGRES_TEST_URL, reason="Disposable PostgreSQL environment required")
+@_SKIP_IF_OPTIONAL_POSTGRES
 def test_11_reassignment_of_established_payment_association_rejected(pg_engine) -> None:
     """Scenario 11: Modifying established checkout_attempt_id triggers immutability exception."""
     with pg_engine.connect() as conn:
@@ -599,7 +613,7 @@ def test_11_reassignment_of_established_payment_association_rejected(pg_engine) 
             conn.rollback()
 
 
-@pytest.mark.skipif(not POSTGRES_TEST_URL, reason="Disposable PostgreSQL environment required")
+@_SKIP_IF_OPTIONAL_POSTGRES
 def test_12_reassignment_of_established_period_provenance_rejected(pg_engine) -> None:
     """Scenario 12: Modifying established subscription_id on billing period triggers immutability exception."""
     with pg_engine.connect() as conn:
@@ -636,7 +650,7 @@ def test_12_reassignment_of_established_period_provenance_rejected(pg_engine) ->
             conn.rollback()
 
 
-@pytest.mark.skipif(not POSTGRES_TEST_URL, reason="Disposable PostgreSQL environment required")
+@_SKIP_IF_OPTIONAL_POSTGRES
 def test_13_concurrent_attempts_to_associate_conflicting_records(pg_engine) -> None:
     """Scenario 13: Unique constraint uq_billing_payments_checkout_attempt rejects second payment linking to same attempt across independent connections."""
     org_id = uuid.uuid4()
@@ -680,7 +694,7 @@ def test_13_concurrent_attempts_to_associate_conflicting_records(pg_engine) -> N
                 cleanup_conn.execute(text("DELETE FROM organizations WHERE id = :id"), {"id": org_id})
 
 
-@pytest.mark.skipif(not POSTGRES_TEST_URL, reason="Disposable PostgreSQL environment required")
+@_SKIP_IF_OPTIONAL_POSTGRES
 def test_14_downgrade_refusal_when_financial_associations_exist(pg_engine) -> None:
     """Scenario 14: Downgrade guard aborts if any linked payments, periods, or attempts exist."""
     with pg_engine.connect() as conn:

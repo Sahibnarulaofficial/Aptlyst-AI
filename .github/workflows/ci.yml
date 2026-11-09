@@ -14,6 +14,9 @@ jobs:
   postgres-integration:
     name: PostgreSQL 16 Integration & Provenance Verification
     runs-on: ubuntu-latest
+    env:
+      ENVIRONMENT: test
+      RUN_SUPABASE_INTEGRATION_TESTS: "0"
 
     services:
       postgres:
@@ -25,7 +28,7 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U aptlyst_ci_user -d aptlyst_ci_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -47,63 +50,172 @@ jobs:
           pip install -r apps/api/requirements.txt
           pip install -r apps/api/requirements-dev.txt
 
-      - name: Verify PostgreSQL service container readiness
+      - name: Verify PostgreSQL 16 service readiness and target isolation
+        working-directory: apps/api
+        env:
+          REQUIRE_POSTGRES_TESTS: "1"
+          POSTGRES_TEST_URL: postgresql+psycopg2://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
         run: |
-          python -c "
-          import socket, time, sys
-          s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-          for i in range(30):
+          python - <<'PY'
+          import os
+          import sys
+          import time
+          from tests.postgres_test_guard import (
+              PostgresTestConfigError,
+              PostgresTestConnectionError,
+              redact_postgres_secrets,
+              resolve_verified_pg_engine,
+              validate_postgres_test_url,
+          )
+
+          raw_url = os.environ.get("POSTGRES_TEST_URL")
+          validate_postgres_test_url(raw_url, require_postgres=True)
+          last_error = "unknown error"
+          for _ in range(30):
               try:
-                  s.connect(('127.0.0.1', 5432))
-                  print('PostgreSQL container port 5432 is open and accepting connections.')
-                  s.close()
-                  sys.exit(0)
-              except Exception:
+                  engine, summary, _ = resolve_verified_pg_engine()
+              except PostgresTestConnectionError as exc:
+                  last_error = str(exc)
                   time.sleep(1)
-          print('Timed out waiting for PostgreSQL container port 5432.')
+              except PostgresTestConfigError as exc:
+                  print(f"Fail-closed PostgreSQL configuration/version error: {exc}", file=sys.stderr)
+                  sys.exit(1)
+              else:
+                  try:
+                      print(f"Verified isolated CI database: {summary}")
+                  finally:
+                      if engine is not None:
+                          engine.dispose()
+                  sys.exit(0)
+          print(
+              f"Timed out waiting for PostgreSQL 16 service: {redact_postgres_secrets(last_error, raw_url)}",
+              file=sys.stderr,
+          )
           sys.exit(1)
-          "
+          PY
 
       - name: Provision dummy Supabase roles in disposable CI database
+        working-directory: apps/api
+        env:
+          REQUIRE_POSTGRES_TESTS: "1"
+          POSTGRES_TEST_URL: postgresql+psycopg2://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
         run: |
-          python -c "
-          import psycopg2
-          conn = psycopg2.connect('postgresql://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test')
-          conn.autocommit = True
-          with conn.cursor() as cur:
-              for role in ('anon', 'authenticated'):
-                  cur.execute('SELECT 1 FROM pg_roles WHERE rolname = %s;', (role,))
-                  if not cur.fetchone():
-                      cur.execute('CREATE ROLE ' + role + ' NOLOGIN;')
-                      print('Provisioned role: ' + role + ' (NOLOGIN)')
-                  else:
-                      print('Role already exists: ' + role)
-              cur.execute('SELECT rolname, rolcanlogin FROM pg_roles WHERE rolname IN %s;', (('anon', 'authenticated'),))
-              for row in cur.fetchall():
-                  print('Verified role in pg_roles: ' + str(row[0]) + ', canlogin=' + str(row[1]))
-          conn.close()
-          print('Successfully provisioned and verified dummy Supabase roles.')
-          "
+          python - <<'PY'
+          from sqlalchemy import text
+          from tests.postgres_test_guard import resolve_verified_pg_engine
+
+          engine, summary, _ = resolve_verified_pg_engine()
+          assert engine is not None
+          try:
+              with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                  for role in ("anon", "authenticated"):
+                      exists = conn.execute(
+                          text("SELECT 1 FROM pg_roles WHERE rolname = :role"),
+                          {"role": role},
+                      ).scalar()
+                      if not exists:
+                          conn.execute(text(f"CREATE ROLE {role} NOLOGIN;"))
+                          print(f"Provisioned role: {role} (NOLOGIN)")
+                      else:
+                          print(f"Role already exists: {role}")
+
+                  rows = conn.execute(
+                      text(
+                          "SELECT rolname, rolcanlogin FROM pg_roles "
+                          "WHERE rolname IN ('anon', 'authenticated') ORDER BY rolname"
+                      )
+                  ).fetchall()
+                  found = {str(r[0]): bool(r[1]) for r in rows}
+                  assert found == {"anon": False, "authenticated": False}, (
+                      f"Unexpected role configuration: {found}"
+                  )
+                  for role_name, can_login in found.items():
+                      print(f"Verified role in pg_roles: {role_name}, canlogin={can_login}")
+              print(f"Successfully provisioned dummy Supabase roles on {summary}.")
+          finally:
+              engine.dispose()
+          PY
 
       - name: Apply Alembic migrations on disposable database
         working-directory: apps/api
         env:
-          DATABASE_URL: postgresql+asyncpg://aptlyst_ci_user:aptlyst_ci_password_secure@localhost:5432/aptlyst_ci_test
+          REQUIRE_POSTGRES_TESTS: "1"
+          DATABASE_URL: postgresql+asyncpg://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
+          POSTGRES_TEST_URL: postgresql+psycopg2://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
         run: |
+          python - <<'PY'
+          import os
+          from tests.postgres_test_guard import DISALLOWED_ENVIRONMENTS, validate_postgres_test_url
+
+          env_name = os.environ.get("ENVIRONMENT", "").strip().lower()
+          assert env_name == "test", f"Expected ENVIRONMENT=test, got {env_name!r}"
+          assert env_name not in DISALLOWED_ENVIRONMENTS
+          db_target = validate_postgres_test_url(os.environ.get("DATABASE_URL"), require_postgres=True)
+          pg_target = validate_postgres_test_url(os.environ.get("POSTGRES_TEST_URL"), require_postgres=True)
+          assert db_target is not None and pg_target is not None
+          print(f"Validated migration targets: {db_target.redacted_target} and {pg_target.redacted_target}")
+          PY
           python -m alembic upgrade head
+          python - <<'PY'
+          import alembic.config
+          import alembic.script
+          from sqlalchemy import text
+          from tests.postgres_test_guard import resolve_verified_pg_engine
+
+          heads = alembic.script.ScriptDirectory.from_config(alembic.config.Config("alembic.ini")).get_heads()
+          assert len(heads) == 1, f"Expected single Alembic head, got {heads}"
+          engine, summary, _ = resolve_verified_pg_engine()
+          assert engine is not None
+          try:
+              with engine.connect() as conn:
+                  applied = [
+                      str(r[0])
+                      for r in conn.execute(text("SELECT version_num FROM alembic_version")).fetchall()
+                  ]
+              assert applied == heads, f"Expected alembic_version={heads}, got {applied}"
+              print(f"Verified Alembic schema head on {summary}: {applied[0]}")
+          finally:
+              engine.dispose()
+          PY
 
       - name: Run PostgreSQL Integration Tests (14 scenarios)
         working-directory: apps/api
         env:
-          DATABASE_URL: postgresql+asyncpg://aptlyst_ci_user:aptlyst_ci_password_secure@localhost:5432/aptlyst_ci_test
-          POSTGRES_TEST_URL: postgresql+psycopg2://aptlyst_ci_user:aptlyst_ci_password_secure@localhost:5432/aptlyst_ci_test
+          REQUIRE_POSTGRES_TESTS: "1"
+          DATABASE_URL: postgresql+asyncpg://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
+          POSTGRES_TEST_URL: postgresql+psycopg2://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
         run: |
+          rm -f test-results-postgres.xml
           python -m pytest -v tests/test_postgres_provenance_integration.py --junitxml=test-results-postgres.xml
 
-      - name: Run Focused Migration and Model Regression Tests
+      - name: Enforce zero skipped tests in PostgreSQL integration JUnit report
         working-directory: apps/api
         run: |
-          python -m pytest -v tests/test_payment_association_migration.py tests/test_provider_neutral_billing_models.py tests/test_provider_neutral_migration.py --junitxml=test-results-models.xml
+          python - <<'PY'
+          from tests.postgres_test_guard import assert_junit_zero_skips
+
+          tests, skipped, failures, errors = assert_junit_zero_skips(
+              "test-results-postgres.xml",
+              expected_exact_tests=14,
+              max_age_seconds=1800,
+              require_testcase_elements=True,
+          )
+          print(
+              f"Verified PostgreSQL JUnit gate: tests={tests}, skipped={skipped}, "
+              f"failures={failures}, errors={errors}"
+          )
+          PY
+
+      - name: Run Focused Migration, Guard, and Model Regression Tests
+        working-directory: apps/api
+        run: |
+          rm -f test-results-models.xml
+          python -m pytest -v \
+            tests/test_postgres_test_guard.py \
+            tests/test_payment_association_migration.py \
+            tests/test_provider_neutral_billing_models.py \
+            tests/test_provider_neutral_migration.py \
+            --junitxml=test-results-models.xml
 
       - name: Preserve Test Results Artifacts
         if: always()
