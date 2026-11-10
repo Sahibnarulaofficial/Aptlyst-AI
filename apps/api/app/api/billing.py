@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.organizations import _require_org_role
 from app.auth.dependencies import AuthenticatedUser
 from app.config import settings
-from app.db.session import get_db
+from app.db.session import AsyncSessionFactory, get_db, get_session_factory
 from app.models.billing import OrganizationBillingPeriod
 from app.models.organization import MemberRole, Organization
 from app.models.subscription import Subscription, SubscriptionStatus
@@ -90,6 +90,7 @@ router = APIRouter(prefix="/organizations/{org_id}/billing", tags=["billing"])
 webhook_router = APIRouter(prefix="/billing", tags=["billing-webhook"])
 
 DbSession = Annotated[AsyncSession, Depends(get_db)]
+BillingSessionFactory = Annotated[AsyncSessionFactory, Depends(get_session_factory)]
 
 
 def validate_stripe_redirect_url(url: str) -> None:
@@ -366,6 +367,7 @@ async def create_razorpay_checkout_subscription_endpoint(
     org_id: uuid.UUID,
     current_user: AuthenticatedUser,
     db: DbSession,
+    session_factory: BillingSessionFactory,
 ) -> RazorpaySubscriptionCheckoutOut:
     """Initiate or reuse a Razorpay Pro subscription checkout session for the organization.
 
@@ -393,6 +395,7 @@ async def create_razorpay_checkout_subscription_endpoint(
             db=db,
             organization=org,
             user_email=current_user.email,
+            customer_session_factory=session_factory,
         )
     except (RazorpayBillingDisabledError, RazorpayConfigurationError) as exc:
         logger.warning("Razorpay billing disabled/misconfigured for org %s: %s", org_id, exc)

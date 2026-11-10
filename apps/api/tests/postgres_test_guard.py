@@ -19,7 +19,7 @@ import os
 from pathlib import Path
 import re
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, unquote, urlsplit
 import xml.etree.ElementTree as ET
 
@@ -457,6 +457,162 @@ def resolve_verified_pg_engine(
         raise _OptionalPostgresUnreachableError(
             f"PostgreSQL connection to {target.redacted_target} failed: {type(exc).__name__}: {safe_err}"
         ) from None
+
+
+async def verify_live_postgres_16_target_async(engine: Any, expected_database: str) -> str:
+    """Verify connected asyncpg server is PostgreSQL 16 and matches the expected isolated test database."""
+    from sqlalchemy import text
+
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text(
+                "SELECT current_database(), "
+                "current_setting('server_version_num')::integer, "
+                "version()"
+            )
+        )
+        row = result.one()
+
+    actual_db = str(row[0] or "")
+    version_num = int(row[1])
+    full_version = str(row[2] or "")
+
+    if actual_db != expected_database:
+        raise PostgresTestConfigError(
+            f"Connected database '{actual_db}' does not match expected dedicated test database "
+            f"'{expected_database}'."
+        )
+
+    if not (160000 <= version_num < 170000) or not full_version.startswith("PostgreSQL 16"):
+        major_detected = version_num // 10000
+        raise PostgresTestConfigError(
+            f"PostgreSQL 16 is required, but connected server reported major version {major_detected} "
+            f"(server_version_num={version_num})."
+        )
+
+    return f"PostgreSQL {version_num // 10000} ({version_num}) on database '{actual_db}'"
+
+
+def _default_async_pg_engine_factory(url: str):
+    """Create a production-parity AsyncEngine (NullPool, prepared statement caches disabled)."""
+    from sqlalchemy import pool
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    return create_async_engine(
+        url,
+        echo=False,
+        poolclass=pool.NullPool,
+        connect_args={
+            "statement_cache_size": 0,
+            "prepared_statement_cache_size": 0,
+        },
+    )
+
+
+async def resolve_verified_async_pg_engine(
+    environ: Mapping[str, str] | None = None,
+    *,
+    async_engine_factory=None,
+) -> tuple[Any | None, str | None, bool]:
+    """Resolve and verify a live PostgreSQL 16 AsyncEngine or return skip state when optional."""
+    env = os.environ if environ is None else environ
+    required = is_postgres_tests_required(env)
+    raw_url = env.get(POSTGRES_TEST_URL_ENV_VAR)
+    env_name = str(env.get("ENVIRONMENT", "") or "").strip().lower()
+
+    if not required and not (raw_url or "").strip():
+        return None, None, False
+
+    if env_name in DISALLOWED_ENVIRONMENTS:
+        raise PostgresTestConfigError(
+            f"Refusing to run PostgreSQL integration tests with ENVIRONMENT='{env_name}'."
+        )
+
+    ambient_overrides = detect_ambient_pg_overrides(env)
+    if async_engine_factory is None and environ is not None:
+        ambient_overrides = sorted(set(ambient_overrides) | set(detect_ambient_pg_overrides(os.environ)))
+    if ambient_overrides:
+        raise PostgresTestConfigError(
+            f"Disallowed ambient PostgreSQL/libpq environment override(s) detected: {ambient_overrides}. "
+            "Unset PG* override variables so validated connection targets cannot be redirected."
+        )
+
+    target = validate_postgres_test_url(raw_url, require_postgres=required)
+    assert target is not None
+
+    if required and (env.get("DATABASE_URL") or "").strip():
+        db_target = validate_postgres_test_url(env.get("DATABASE_URL"), require_postgres=True)
+        assert db_target is not None
+        if (db_target.host, db_target.port, db_target.database) != (
+            target.host,
+            target.port,
+            target.database,
+        ):
+            raise PostgresTestConfigError(
+                "DATABASE_URL target does not match POSTGRES_TEST_URL target while REQUIRE_POSTGRES_TESTS=1."
+            )
+
+    make_engine = async_engine_factory or _default_async_pg_engine_factory
+    engine = None
+    try:
+        engine = make_engine(target.async_url)
+        summary = await verify_live_postgres_16_target_async(engine, target.database)
+        return engine, summary, required
+    except PostgresTestConfigError:
+        if engine is not None:
+            await engine.dispose()
+        raise
+    except Exception as exc:
+        if engine is not None:
+            await engine.dispose()
+        safe_err = redact_postgres_secrets(str(exc), raw_url)
+        if required:
+            raise PostgresTestConnectionError(
+                f"Required PostgreSQL 16 async connection/verification failed for {target.redacted_target}: "
+                f"{type(exc).__name__}: {safe_err}"
+            ) from None
+        raise _OptionalPostgresUnreachableError(
+            f"PostgreSQL async connection to {target.redacted_target} failed: {type(exc).__name__}: {safe_err}"
+        ) from None
+
+
+def create_verified_async_session_factory(engine: Any):
+    """Create a production-parity async_sessionmaker bound to a verified AsyncEngine."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    return async_sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+
+
+def assert_async_session_local_isolated(
+    target: ValidatedPostgresTestTarget,
+    *,
+    session_engine: Any | None = None,
+) -> None:
+    """Fail closed unless app.db.session.engine targets the exact verified local test database."""
+    if session_engine is None:
+        from app.db.session import engine as default_engine
+
+        session_engine = default_engine
+
+    url = getattr(session_engine, "url", None)
+    actual_host = (getattr(url, "host", None) or "").strip().lower()
+    actual_port = int(getattr(url, "port", None) or 5432)
+    actual_db = (getattr(url, "database", None) or "").strip()
+
+    if (
+        actual_host not in PERMITTED_LOCAL_HOSTS
+        or actual_db not in PERMITTED_CI_DATABASES
+        or (actual_host, actual_port, actual_db) != (target.host, target.port, target.database)
+    ):
+        raise PostgresTestConfigError(
+            "Refusing to exercise default AsyncSessionLocal because app.db.session.engine "
+            f"targets '{actual_host}:{actual_port}/{actual_db}' instead of verified test target "
+            f"'{target.host}:{target.port}/{target.database}'."
+        )
 
 
 class _OptionalPostgresUnreachableError(RuntimeError):

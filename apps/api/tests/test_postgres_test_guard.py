@@ -18,6 +18,19 @@ import shlex
 import signal
 import subprocess
 import sys
+
+if sys.platform == "win32":
+    import socket
+    from asyncio.proactor_events import BaseProactorEventLoop
+
+    def _safe_make_self_pipe(self):  # type: ignore[no-untyped-def]
+        self._ssock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._csock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._internal_fds += 1
+
+    BaseProactorEventLoop._make_self_pipe = _safe_make_self_pipe
+    BaseProactorEventLoop._loop_self_reading = lambda self, f=None: None
+
 import tempfile
 import time
 import xml.etree.ElementTree as ET
@@ -29,15 +42,19 @@ from tests.postgres_test_guard import (
     PostgresTestConfigError,
     PostgresTestConnectionError,
     _OptionalPostgresUnreachableError,
+    assert_async_session_local_isolated,
     assert_junit_zero_skips,
+    create_verified_async_session_factory,
     detect_ambient_pg_overrides,
     is_postgres_tests_required,
     normalize_to_async_postgres_url,
     normalize_to_sync_postgres_url,
     redact_postgres_secrets,
+    resolve_verified_async_pg_engine,
     resolve_verified_pg_engine,
     validate_postgres_test_url,
     verify_live_postgres_16_target,
+    verify_live_postgres_16_target_async,
 )
 
 
@@ -1048,3 +1065,273 @@ def test_provenance_subprocess_timeout_terminates_child_and_reports_diagnostics(
     assert "partial_stderr_marker" in failure_msg
     assert _DUMMY_SECRET not in failure_msg
     assert "<redacted>" in failure_msg
+
+
+# =============================================================================
+# Async Guard & Customer PostgreSQL 16 Subprocess Enforcement Tests
+# =============================================================================
+
+
+class _FakeAsyncConnection:
+    def __init__(self, row: tuple[str, int, str] | None = None, exc: Exception | None = None) -> None:
+        self._row = row
+        self._exc = exc
+
+    async def __aenter__(self) -> _FakeAsyncConnection:
+        if self._exc is not None:
+            raise self._exc
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    async def execute(self, statement) -> _FakeResultRow:
+        if self._exc is not None:
+            raise self._exc
+        assert self._row is not None
+        return _FakeResultRow(self._row)
+
+
+class _FakeAsyncEngine:
+    def __init__(
+        self,
+        row: tuple[str, int, str] | None = None,
+        exc: Exception | None = None,
+        url: object | None = None,
+    ) -> None:
+        self._row = row
+        self._exc = exc
+        self.url = url
+        self.disposed = False
+
+    def connect(self) -> _FakeAsyncConnection:
+        return _FakeAsyncConnection(row=self._row, exc=self._exc)
+
+    async def dispose(self) -> None:
+        self.disposed = True
+
+
+async def test_async_guard_optional_mode_returns_none_when_unset() -> None:
+    calls: list[str] = []
+    engine, summary, required = await resolve_verified_async_pg_engine(
+        {},
+        async_engine_factory=lambda url: calls.append(url) or _FakeAsyncEngine(),
+    )
+    assert (engine, summary, required) == (None, None, False)
+    assert calls == []
+
+
+async def test_async_guard_required_mode_rejects_missing_unsafe_and_ambient_overrides() -> None:
+    calls: list[str] = []
+    with pytest.raises(PostgresTestConfigError, match="REQUIRE_POSTGRES_TESTS=1"):
+        await resolve_verified_async_pg_engine(
+            {"REQUIRE_POSTGRES_TESTS": "1"},
+            async_engine_factory=lambda url: calls.append(url) or _FakeAsyncEngine(),
+        )
+
+    supa_url = f"postgresql+asyncpg://postgres:{_DUMMY_SECRET}@aws-0-ap-southeast-2.pooler.supabase.com:5432/postgres"
+    with pytest.raises(PostgresTestConfigError) as supa_exc:
+        await resolve_verified_async_pg_engine(
+            {"REQUIRE_POSTGRES_TESTS": "1", "POSTGRES_TEST_URL": supa_url},
+            async_engine_factory=lambda url: calls.append(url) or _FakeAsyncEngine(),
+        )
+    assert _DUMMY_SECRET not in str(supa_exc.value)
+
+    valid_async_url = f"postgresql+asyncpg://ci_user:{_DUMMY_SECRET}@127.0.0.1:5432/aptlyst_ci_test"
+    with pytest.raises(PostgresTestConfigError, match="PGHOST"):
+        await resolve_verified_async_pg_engine(
+            {
+                "REQUIRE_POSTGRES_TESTS": "1",
+                "POSTGRES_TEST_URL": valid_async_url,
+                "PGHOST": "evil.example.com",
+            },
+            async_engine_factory=lambda url: calls.append(url) or _FakeAsyncEngine(),
+        )
+    assert calls == []
+
+
+async def test_async_guard_verifies_pg16_version_and_database_and_disposes_on_mismatch() -> None:
+    valid_async_url = f"postgresql+asyncpg://ci_user:{_DUMMY_SECRET}@127.0.0.1:5432/aptlyst_ci_test"
+
+    wrong_db_engine = _FakeAsyncEngine(row=("postgres", 160004, "PostgreSQL 16.4"))
+    with pytest.raises(PostgresTestConfigError, match="does not match expected dedicated test database"):
+        await resolve_verified_async_pg_engine(
+            {"REQUIRE_POSTGRES_TESTS": "1", "POSTGRES_TEST_URL": valid_async_url},
+            async_engine_factory=lambda url: wrong_db_engine,
+        )
+    assert wrong_db_engine.disposed is True
+
+    pg15_engine = _FakeAsyncEngine(row=("aptlyst_ci_test", 150008, "PostgreSQL 15.8"))
+    with pytest.raises(PostgresTestConfigError, match="PostgreSQL 16 is required"):
+        await resolve_verified_async_pg_engine(
+            {"REQUIRE_POSTGRES_TESTS": "1", "POSTGRES_TEST_URL": valid_async_url},
+            async_engine_factory=lambda url: pg15_engine,
+        )
+    assert pg15_engine.disposed is True
+
+    pg16_engine = _FakeAsyncEngine(row=("aptlyst_ci_test", 160006, "PostgreSQL 16.6"))
+    eng, summary, req = await resolve_verified_async_pg_engine(
+        {
+            "REQUIRE_POSTGRES_TESTS": "1",
+            "POSTGRES_TEST_URL": valid_async_url,
+            "DATABASE_URL": valid_async_url,
+        },
+        async_engine_factory=lambda url: pg16_engine,
+    )
+    assert eng is pg16_engine
+    assert summary == "PostgreSQL 16 (160006) on database 'aptlyst_ci_test'"
+    assert req is True
+
+    direct_summary = await verify_live_postgres_16_target_async(pg16_engine, "aptlyst_ci_test")
+    assert direct_summary == "PostgreSQL 16 (160006) on database 'aptlyst_ci_test'"
+    session_factory = create_verified_async_session_factory(pg16_engine)
+    assert session_factory.kw.get("expire_on_commit") is False
+
+
+def test_assert_async_session_local_isolated_rejects_supabase_and_accepts_matching_target() -> None:
+    from sqlalchemy.engine import make_url
+
+    target = validate_postgres_test_url(
+        f"postgresql+asyncpg://ci_user:{_DUMMY_SECRET}@127.0.0.1:5432/aptlyst_ci_test",
+        require_postgres=True,
+    )
+    assert target is not None
+
+    supa_engine = _FakeAsyncEngine(
+        url=make_url(
+            f"postgresql+asyncpg://postgres:{_DUMMY_SECRET}@aws-0-ap-southeast-2.pooler.supabase.com:5432/postgres"
+        )
+    )
+    with pytest.raises(PostgresTestConfigError, match="Refusing to exercise default AsyncSessionLocal"):
+        assert_async_session_local_isolated(target, session_engine=supa_engine)
+
+    wrong_db_engine = _FakeAsyncEngine(
+        url=make_url(f"postgresql+asyncpg://ci_user:{_DUMMY_SECRET}@127.0.0.1:5432/postgres")
+    )
+    with pytest.raises(PostgresTestConfigError, match="Refusing to exercise default AsyncSessionLocal"):
+        assert_async_session_local_isolated(target, session_engine=wrong_db_engine)
+
+    matching_engine = _FakeAsyncEngine(
+        url=make_url(f"postgresql+asyncpg://ci_user:{_DUMMY_SECRET}@127.0.0.1:5432/aptlyst_ci_test")
+    )
+    assert_async_session_local_isolated(target, session_engine=matching_engine)
+
+
+def _run_customer_pg_subprocess(
+    env_overrides: dict[str, str | None],
+    junit_path: Path,
+    *,
+    timeout_seconds: float = _PROVENANCE_SUBPROCESS_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    for key in (
+        "POSTGRES_TEST_URL",
+        "REQUIRE_POSTGRES_TESTS",
+        "DATABASE_URL",
+        "ENVIRONMENT",
+        *AMBIENT_PG_OVERRIDE_ENV_VARS,
+    ):
+        env.pop(key, None)
+    for key, value in env_overrides.items():
+        if value is not None:
+            env[key] = value
+
+    api_root = _API_ROOT.resolve()
+    cmd = [
+        sys.executable,
+        "-B",
+        "-m",
+        "pytest",
+        "-c",
+        str(api_root / "pytest.ini"),
+        f"--rootdir={api_root}",
+        "-p",
+        "no:cacheprovider",
+        "-q",
+        "tests/test_postgres_customer_integration.py",
+        f"--junitxml={junit_path}",
+    ]
+    return _execute_subprocess_with_timeout(
+        cmd,
+        cwd=api_root,
+        env=env,
+        timeout_seconds=timeout_seconds,
+        secret_url=env.get("POSTGRES_TEST_URL") or env.get("DATABASE_URL"),
+    )
+
+
+def test_customer_pg_subprocess_optional_unset_skips_all_20_cleanly(tmp_path: Path) -> None:
+    junit_xml = tmp_path / "customer_optional.xml"
+    proc = _run_customer_pg_subprocess({}, junit_xml)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    suite = ET.parse(junit_xml).getroot().find("testsuite")
+    assert suite is not None
+    assert suite.attrib["tests"] == "20"
+    assert suite.attrib["skipped"] == "20"
+    assert suite.attrib["failures"] == "0"
+    assert suite.attrib["errors"] == "0"
+
+
+def test_customer_pg_subprocess_required_without_url_fails_closed_zero_skips(tmp_path: Path) -> None:
+    junit_xml = tmp_path / "customer_required_missing_url.xml"
+    proc = _run_customer_pg_subprocess(
+        {
+            "REQUIRE_POSTGRES_TESTS": "1",
+            "DATABASE_URL": f"postgresql+asyncpg://postgres:{_DUMMY_SECRET}@aws-0-ap-southeast-2.pooler.supabase.com:5432/postgres",
+        },
+        junit_xml,
+    )
+    assert proc.returncode != 0
+    combined_output = proc.stdout + proc.stderr
+    assert "REQUIRE_POSTGRES_TESTS=1 is enabled" in combined_output
+    assert _DUMMY_SECRET not in combined_output
+    assert _DUMMY_SECRET not in junit_xml.read_text(encoding="utf-8")
+
+    suite = ET.parse(junit_xml).getroot().find("testsuite")
+    assert suite is not None
+    assert suite.attrib["tests"] == "20"
+    assert suite.attrib["skipped"] == "0"
+    with pytest.raises(PostgresTestConfigError):
+        assert_junit_zero_skips(junit_xml, expected_exact_tests=20)
+
+
+def test_customer_pg_subprocess_supabase_url_rejected_zero_skips_no_secret_leak(tmp_path: Path) -> None:
+    junit_xml = tmp_path / "customer_supabase_url.xml"
+    proc = _run_customer_pg_subprocess(
+        {
+            "REQUIRE_POSTGRES_TESTS": "1",
+            "POSTGRES_TEST_URL": f"postgresql+asyncpg://postgres:{_DUMMY_SECRET}@aws-0-ap-southeast-2.pooler.supabase.com:5432/postgres",
+        },
+        junit_xml,
+    )
+    assert proc.returncode != 0
+    combined_output = proc.stdout + proc.stderr
+    assert "permitted local allowlist" in combined_output
+    assert _DUMMY_SECRET not in combined_output
+    assert _DUMMY_SECRET not in junit_xml.read_text(encoding="utf-8")
+
+    suite = ET.parse(junit_xml).getroot().find("testsuite")
+    assert suite is not None
+    assert suite.attrib["tests"] == "20"
+    assert suite.attrib["skipped"] == "0"
+
+
+def test_customer_pg_subprocess_unreachable_local_port_fails_closed_zero_skips(tmp_path: Path) -> None:
+    junit_xml = tmp_path / "customer_unreachable.xml"
+    proc = _run_customer_pg_subprocess(
+        {
+            "REQUIRE_POSTGRES_TESTS": "1",
+            "POSTGRES_TEST_URL": f"postgresql+asyncpg://ci_user:{_DUMMY_SECRET}@127.0.0.1:59998/aptlyst_ci_test",
+        },
+        junit_xml,
+    )
+    assert proc.returncode != 0
+    combined_output = proc.stdout + proc.stderr
+    assert _DUMMY_SECRET not in combined_output
+    assert _DUMMY_SECRET not in junit_xml.read_text(encoding="utf-8")
+
+    suite = ET.parse(junit_xml).getroot().find("testsuite")
+    assert suite is not None
+    assert suite.attrib["tests"] == "20"
+    assert suite.attrib["skipped"] == "0"

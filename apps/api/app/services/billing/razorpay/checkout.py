@@ -45,9 +45,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.db.session import AsyncSessionFactory
 from app.models.organization import Organization
 from app.models.payment import (
     BillingCheckoutAttempt,
+    BillingCustomerProvision,
+    CustomerProvisionStatus,
     PaymentReconciliation,
     ReconciliationStatus,
 )
@@ -71,6 +74,10 @@ from app.services.billing.razorpay.client import (
 from app.services.billing.razorpay.customer import (
     _get_provisioning_scope,
     get_or_create_razorpay_customer,
+)
+from app.services.billing.razorpay.handler_base import (
+    is_terminal_subscription,
+    stage_or_update_payment_reconciliation,
 )
 
 logger = logging.getLogger(__name__)
@@ -207,6 +214,14 @@ def _parse_timestamp(val: Any) -> datetime | None:
     return None
 
 
+async def _safe_rollback(db: AsyncSession) -> None:
+    """Safely rollback an open database transaction without masking primary errors."""
+    try:
+        await db.rollback()
+    except Exception:
+        pass
+
+
 # =============================================================================
 # Subscription Checkout Creation Service
 # =============================================================================
@@ -217,14 +232,19 @@ async def create_razorpay_subscription_checkout(
     organization: Organization,
     user_email: str | None = None,
     idempotency_key: str | None = None,
+    customer_session_factory: AsyncSessionFactory | None = None,
 ) -> RazorpaySubscriptionCheckoutResult:
     """Initiate or reuse a Razorpay subscription checkout attempt for an organization.
 
     Guarantees:
     1. Validates billing configuration and provider scope upfront.
-    2. Enforces single active checkout attempt per organization.
-    3. Reuses valid existing 'open' checkout sessions idempotently.
-    4. Resolves customer identity through the decoupled customer provisioning service.
+    2. Phase A (Isolated Customer Provisioning): Runs get_or_create_razorpay_customer() in its
+       own committed transaction lifecycle strictly before Phase B acquires checkout locks.
+    3. Phase B (Fresh Locked Checkout Transaction): Acquires Organization FOR UPDATE ->
+       BillingCustomerProvision FOR UPDATE (populate_existing=True) -> Subscription FOR UPDATE ->
+       BillingCheckoutAttempt FOR UPDATE, revalidating organization existence and customer mapping.
+    4. Enforces single active checkout attempt per organization and expires stale 'open' attempts
+       atomically inside the same Phase B transaction (no mid-lock commits).
     5. Commits durable 'creating' attempt BEFORE invoking external Razorpay API.
     6. External API request runs with zero open database transactions or row locks.
     7. Classifies network/server failures into 'failed' (definite) vs 'recovery_required' (ambiguous).
@@ -232,7 +252,7 @@ async def create_razorpay_subscription_checkout(
     9. NEVER grants Pro entitlements or provisions billing periods.
     """
     # -------------------------------------------------------------------------
-    # Phase 1: Pre-HTTP Configuration & Existing State Inspection
+    # Pre-Flight Configuration Validation (Zero DB / HTTP Calls)
     # -------------------------------------------------------------------------
     if not is_razorpay_enabled():
         raise RazorpayBillingDisabledError(
@@ -253,121 +273,221 @@ async def create_razorpay_subscription_checkout(
 
     currency = (settings.razorpay_plan_currency or "USD").strip().upper()
 
-    now_utc = datetime.now(timezone.utc)
+    # -------------------------------------------------------------------------
+    # Phase A: Isolated Customer Provisioning (Independent TX + HTTP Boundary)
+    # -------------------------------------------------------------------------
+    org_id = organization.id
+    org_name = getattr(organization, "name", None)
 
-    # 1.1 Check if organization already possesses an active Pro subscription
-    stmt_sub = (
-        select(Subscription)
-        .where(
-            Subscription.organization_id == organization.id,
-            Subscription.status.in_([SubscriptionStatus.active, SubscriptionStatus.trialing]),
-            Subscription.plan_tier == "pro",
-        )
-        .limit(1)
+    # Close any prior caller read transaction (e.g., API RBAC / org lookup)
+    # so customer provisioning executes in its own isolated transaction scope.
+    if hasattr(db, "in_transaction") and db.in_transaction():
+        await db.commit()
+
+    customer_id = await get_or_create_razorpay_customer(
+        organization_id=org_id,
+        user_email=user_email,
+        organization_name=org_name,
+        session_factory=customer_session_factory,
     )
-    res_sub = await db.execute(stmt_sub)
-    if res_sub.scalar_one_or_none() is not None:
-        raise ActiveSubscriptionExistsError(
-            f"Organization {organization.id} already has an active Pro subscription."
-        )
 
-    # 1.2 Inspect existing active checkout attempts for this organization in current scope
-    stmt_active = (
-        select(BillingCheckoutAttempt)
-        .where(
-            BillingCheckoutAttempt.organization_id == organization.id,
-            BillingCheckoutAttempt.provider == "razorpay",
-            BillingCheckoutAttempt.merchant_account_id == merchant_account_id,
-            BillingCheckoutAttempt.environment == environment,
-            BillingCheckoutAttempt.status.in_([
-                CheckoutAttemptStatus.creating,
-                CheckoutAttemptStatus.recovery_required,
-                CheckoutAttemptStatus.open,
-                CheckoutAttemptStatus.payment_pending,
-            ]),
-        )
-        .order_by(BillingCheckoutAttempt.created_at.desc())
-        .limit(1)
-    )
-    res_active = await db.execute(stmt_active)
-    active_attempt = res_active.scalar_one_or_none()
+    # Guarantee Phase A left zero open database transactions before Phase B opens.
+    if hasattr(db, "in_transaction") and db.in_transaction():
+        await db.commit()
 
-    if active_attempt is not None:
-        # Case A: Existing 'open' attempt with valid subscription
-        if active_attempt.status == CheckoutAttemptStatus.open:
-            # Check if session has expired
-            if (
-                active_attempt.session_expires_at is not None
-                and now_utc >= active_attempt.session_expires_at
-            ):
-                logger.info(
-                    "Expiring open checkout attempt %s for organization %s (expired at %s)",
-                    active_attempt.id,
-                    organization.id,
-                    active_attempt.session_expires_at,
-                )
-                active_attempt.status = CheckoutAttemptStatus.expired
-                await db.commit()
-            else:
-                # Idempotent return of existing open attempt
-                if active_attempt.provider_subscription_id:
+    # -------------------------------------------------------------------------
+    # Phase B: Fresh Transaction — Checkout Locks, Revalidation & Attempt Staging
+    # Lock order (L1B -> L3 -> L6):
+    #   Organization FOR UPDATE
+    #     -> BillingCustomerProvision FOR UPDATE
+    #     -> Subscription FOR UPDATE
+    #     -> BillingCheckoutAttempt FOR UPDATE
+    # Zero external HTTP calls permitted in Phase B.
+    # -------------------------------------------------------------------------
+    try:
+        stmt_org_lock = (
+            select(Organization)
+            .where(Organization.id == organization.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        res_org = await db.execute(stmt_org_lock)
+        locked_org = res_org.scalar_one_or_none()
+        if locked_org is None:
+            await _safe_rollback(db)
+            raise RazorpayCheckoutNotFoundError(
+                f"Organization {organization.id} is unavailable or was removed before checkout creation."
+            )
+
+        stmt_prov_lock = (
+            select(BillingCustomerProvision)
+            .where(
+                BillingCustomerProvision.organization_id == organization.id,
+                BillingCustomerProvision.provider == "razorpay",
+                BillingCustomerProvision.merchant_account_id == merchant_account_id,
+                BillingCustomerProvision.environment == environment,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        res_prov = await db.execute(stmt_prov_lock)
+        locked_provision = res_prov.scalar_one_or_none()
+
+        if locked_provision is None:
+            await _safe_rollback(db)
+            raise RazorpayCheckoutConflictError(
+                f"Razorpay customer mapping for organization {organization.id} disappeared between "
+                f"customer provisioning and checkout creation."
+            )
+
+        if locked_provision.status != CustomerProvisionStatus.resolved:
+            await _safe_rollback(db)
+            raise RazorpayCheckoutConflictError(
+                f"Razorpay customer mapping for organization {organization.id} transitioned to "
+                f"'{locked_provision.status.value}' between customer provisioning and checkout creation."
+            )
+
+        revalidated_customer_id = (
+            locked_provision.provider_customer_id.strip()
+            if isinstance(locked_provision.provider_customer_id, str)
+            and locked_provision.provider_customer_id.strip()
+            else None
+        )
+        if not revalidated_customer_id:
+            await _safe_rollback(db)
+            raise RazorpayCheckoutConflictError(
+                f"Razorpay customer mapping for organization {organization.id} is missing a resolved customer ID."
+            )
+
+        if revalidated_customer_id != customer_id:
+            await _safe_rollback(db)
+            raise RazorpayCheckoutConflictError(
+                f"Razorpay customer mapping for organization {organization.id} changed between provisioning "
+                f"('{customer_id}') and checkout creation ('{revalidated_customer_id}')."
+            )
+
+        # Check if organization already possesses an active Pro subscription under lock
+        stmt_sub = (
+            select(Subscription)
+            .where(
+                Subscription.organization_id == organization.id,
+                Subscription.status.in_([SubscriptionStatus.active, SubscriptionStatus.trialing]),
+                Subscription.plan_tier == "pro",
+            )
+            .order_by(Subscription.id.asc())
+            .limit(1)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        res_sub = await db.execute(stmt_sub)
+        if res_sub.scalar_one_or_none() is not None:
+            await _safe_rollback(db)
+            raise ActiveSubscriptionExistsError(
+                f"Organization {organization.id} already has an active Pro subscription."
+            )
+
+        # Evaluate timestamp after acquiring Phase B row locks
+        now_utc = datetime.now(timezone.utc)
+
+        # Inspect existing active checkout attempts for this organization in current scope under lock
+        stmt_active = (
+            select(BillingCheckoutAttempt)
+            .where(
+                BillingCheckoutAttempt.organization_id == organization.id,
+                BillingCheckoutAttempt.provider == "razorpay",
+                BillingCheckoutAttempt.merchant_account_id == merchant_account_id,
+                BillingCheckoutAttempt.environment == environment,
+                BillingCheckoutAttempt.status.in_([
+                    CheckoutAttemptStatus.creating,
+                    CheckoutAttemptStatus.recovery_required,
+                    CheckoutAttemptStatus.open,
+                    CheckoutAttemptStatus.payment_pending,
+                ]),
+            )
+            .order_by(BillingCheckoutAttempt.created_at.desc(), BillingCheckoutAttempt.id.asc())
+            .limit(1)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        res_active = await db.execute(stmt_active)
+        active_attempt = res_active.scalar_one_or_none()
+
+        if active_attempt is not None:
+            # Case A: Existing 'open' attempt with valid subscription
+            if active_attempt.status == CheckoutAttemptStatus.open:
+                open_expires_at = _parse_timestamp(active_attempt.session_expires_at)
+                if open_expires_at is not None and now_utc >= open_expires_at:
+                    logger.info(
+                        "Expiring open checkout attempt %s for organization %s (expired at %s)",
+                        active_attempt.id,
+                        organization.id,
+                        active_attempt.session_expires_at,
+                    )
+                    # Flush inside the same Phase B transaction; never commit mid-lock before staging replacement.
+                    active_attempt.status = CheckoutAttemptStatus.expired
+                    await db.flush()
+                elif active_attempt.provider_subscription_id:
+                    reused_attempt_id = active_attempt.id
+                    reused_sub_id = active_attempt.provider_subscription_id
+                    reused_checkout_url = active_attempt.checkout_url
+                    await db.commit()
                     return RazorpaySubscriptionCheckoutResult(
-                        attempt_id=active_attempt.id,
+                        attempt_id=reused_attempt_id,
                         organization_id=organization.id,
                         provider="razorpay",
-                        subscription_id=active_attempt.provider_subscription_id,
+                        subscription_id=reused_sub_id,
                         key_id=key_id,
                         plan_id=plan_id,
-                        checkout_url=active_attempt.checkout_url,
+                        checkout_url=reused_checkout_url,
                         status=CheckoutAttemptStatus.open,
                     )
+                else:
+                    await _safe_rollback(db)
+                    raise CheckoutRecoveryRequiredError(
+                        f"Open checkout attempt {active_attempt.id} lacks a subscription ID and requires recovery."
+                    )
 
-        # Case B: In-progress payment pending verification
-        if active_attempt.status == CheckoutAttemptStatus.payment_pending:
-            raise CheckoutInProgressError(
-                f"A checkout payment is currently pending verification for organization {organization.id}."
-            )
+            # Case B: In-progress payment pending verification
+            elif active_attempt.status == CheckoutAttemptStatus.payment_pending:
+                await _safe_rollback(db)
+                raise CheckoutInProgressError(
+                    f"A checkout payment is currently pending verification for organization {organization.id}."
+                )
 
-        # Case C: Previous ambiguous outcome requiring reconciliation
-        if active_attempt.status == CheckoutAttemptStatus.recovery_required:
-            raise CheckoutRecoveryRequiredError(
-                f"A previous checkout attempt ({active_attempt.id}) requires recovery or reconciliation "
-                f"before a new subscription checkout can be initiated."
-            )
+            # Case C: Previous ambiguous outcome requiring reconciliation
+            elif active_attempt.status == CheckoutAttemptStatus.recovery_required:
+                await _safe_rollback(db)
+                raise CheckoutRecoveryRequiredError(
+                    f"A previous checkout attempt ({active_attempt.id}) requires recovery or reconciliation "
+                    f"before a new subscription checkout can be initiated."
+                )
 
-        # Case D: Attempt is currently in 'creating' state
-        if active_attempt.status == CheckoutAttemptStatus.creating:
-            lease_expires = active_attempt.attempt_lease_expires_at
-            if lease_expires is not None:
-                if lease_expires.tzinfo is None:
-                    lease_expires = lease_expires.replace(tzinfo=timezone.utc)
-                if now_utc < lease_expires:
+            # Case D: Attempt is currently in 'creating' state
+            elif active_attempt.status == CheckoutAttemptStatus.creating:
+                lease_expires = _parse_timestamp(active_attempt.attempt_lease_expires_at)
+                if lease_expires is not None and now_utc < lease_expires:
+                    await _safe_rollback(db)
                     raise CheckoutInProgressError(
                         f"Subscription checkout creation is already in progress for organization {organization.id}."
                     )
 
-            # Lease expired while in 'creating' state: mark recovery_required
-            logger.warning(
-                "Checkout attempt %s lease expired while creating; transitioning to recovery_required.",
-                active_attempt.id,
-            )
-            active_attempt.status = CheckoutAttemptStatus.recovery_required
-            active_attempt.error_message = "creation_lease_expired"
-            await db.commit()
-            raise CheckoutRecoveryRequiredError(
-                f"Checkout attempt {active_attempt.id} creation lease expired; recovery required before retry."
-            )
+                # Lease expired while in 'creating' state: durably mark recovery_required
+                logger.warning(
+                    "Checkout attempt %s lease expired while creating; transitioning to recovery_required.",
+                    active_attempt.id,
+                )
+                active_attempt.status = CheckoutAttemptStatus.recovery_required
+                active_attempt.error_message = "creation_lease_expired"
+                await db.commit()
+                raise CheckoutRecoveryRequiredError(
+                    f"Checkout attempt {active_attempt.id} creation lease expired; recovery required before retry."
+                )
+    except Exception:
+        if not hasattr(db, "in_transaction") or db.in_transaction():
+            await _safe_rollback(db)
+        raise
 
-    # 1.3 Resolve Razorpay customer identity
-    customer_id = await get_or_create_razorpay_customer(
-        db=db,
-        organization=organization,
-        user_email=user_email,
-    )
-
-    # -------------------------------------------------------------------------
-    # Phase 2: Durable Attempt Staging (Short Write Transaction)
-    # -------------------------------------------------------------------------
+    # Durable Attempt Staging (Atomic with any expired-open update in Phase B)
     attempt_id = uuid.uuid4()
     effective_idempotency_key = idempotency_key or f"rzp_sub_{organization.id}_{uuid.uuid4().hex[:12]}"
     lease_expires_at = now_utc + timedelta(seconds=CHECKOUT_LEASE_SECONDS)
@@ -378,7 +498,7 @@ async def create_razorpay_subscription_checkout(
         provider="razorpay",
         merchant_account_id=merchant_account_id,
         environment=environment,
-        provider_customer_id=customer_id,
+        provider_customer_id=revalidated_customer_id,
         provider_subscription_id=None,
         provider_order_id=None,
         provider_session_id=None,
@@ -389,7 +509,7 @@ async def create_razorpay_subscription_checkout(
         checkout_url=None,
         request_payload={
             "plan_id": plan_id,
-            "customer_id": customer_id,
+            "customer_id": revalidated_customer_id,
             "currency": currency,
         },
         attempt_lease_expires_at=lease_expires_at,
@@ -401,7 +521,7 @@ async def create_razorpay_subscription_checkout(
     try:
         await db.commit()
     except IntegrityError as exc:
-        await db.rollback()
+        await _safe_rollback(db)
         logger.warning(
             "Integrity conflict staging checkout attempt for organization %s: %s",
             organization.id,
@@ -410,10 +530,15 @@ async def create_razorpay_subscription_checkout(
         raise CheckoutInProgressError(
             f"Concurrent checkout attempt detected for organization {organization.id}."
         ) from exc
+    except Exception:
+        await _safe_rollback(db)
+        raise
 
-    # Ensure transaction is fully committed before external HTTP call
-    if db.in_transaction():
-        await db.commit()
+    # Guarantee transaction and locks are completely released before Phase 3 HTTP call
+    if hasattr(db, "in_transaction") and db.in_transaction():
+        raise AssertionError(
+            "Phase B checkout staging attempted external HTTP while DB transaction was still open."
+        )
 
     # -------------------------------------------------------------------------
     # Phase 3: External Gateway Invocation (Zero Open DB Transactions)
@@ -428,7 +553,7 @@ async def create_razorpay_subscription_checkout(
         sub_data = await client.create_subscription(
             plan_id=plan_id,
             total_count=120,
-            customer_id=customer_id,
+            customer_id=revalidated_customer_id,
             customer_notify=1,
             notes=notes,
         )
@@ -1166,6 +1291,139 @@ async def recover_razorpay_checkout_attempt(
 # =============================================================================
 
 
+def _extract_checkout_payment_binding(
+    attempt: BillingCheckoutAttempt,
+) -> tuple[str | None, dict[str, Any] | None, str | None]:
+    """Extract authoritative payment binding from column and verification payload."""
+    bound_payment_id = (
+        attempt.provider_payment_id.strip()
+        if isinstance(attempt.provider_payment_id, str) and attempt.provider_payment_id.strip()
+        else None
+    )
+    verification_data = (
+        attempt.request_payload.get("verification")
+        if isinstance(attempt.request_payload, dict)
+        else None
+    )
+    verified_payment_id = (
+        str(verification_data["payment_id"]).strip()
+        if isinstance(verification_data, dict)
+        and verification_data.get("payment_id")
+        and str(verification_data["payment_id"]).strip()
+        else None
+    )
+    if bound_payment_id and verified_payment_id and bound_payment_id != verified_payment_id:
+        raise RazorpayCheckoutConflictError(
+            f"Checkout attempt {attempt.id} has conflicting payment binding "
+            f"('{bound_payment_id}' vs '{verified_payment_id}')."
+        )
+    associated_payment_id = bound_payment_id or verified_payment_id
+    return (
+        bound_payment_id,
+        verification_data if isinstance(verification_data, dict) else None,
+        associated_payment_id,
+    )
+
+
+def _is_attempt_session_expired(
+    attempt: BillingCheckoutAttempt,
+    now_utc: datetime,
+) -> bool:
+    """Return True when attempt is expired by status or open session deadline."""
+    if attempt.status == CheckoutAttemptStatus.expired:
+        return True
+    if attempt.status == CheckoutAttemptStatus.open and attempt.session_expires_at is not None:
+        expires_at = _parse_timestamp(attempt.session_expires_at)
+        if expires_at is not None and now_utc >= expires_at:
+            return True
+    return False
+
+
+def _validate_attempt_binding_attributes(
+    attempt: BillingCheckoutAttempt,
+    *,
+    organization_id: uuid.UUID,
+    merchant_account_id: str,
+    environment: str,
+    server_sub_id: str,
+    pay_id: str,
+) -> None:
+    """Validate all composite identity attributes required before binding provider_payment_id."""
+    if (
+        attempt.organization_id != organization_id
+        or (attempt.provider or "").strip().lower() != "razorpay"
+        or (attempt.merchant_account_id or "").strip() != merchant_account_id
+        or (attempt.environment or "").strip().lower() != environment
+        or (attempt.provider_subscription_id or "").strip() != server_sub_id
+        or not pay_id
+    ):
+        raise RazorpayCheckoutConflictError(
+            f"Checkout attempt {attempt.id} lacks consistent composite identity attributes for payment binding."
+        )
+
+
+def _apply_verified_payment_metadata(
+    locked_attempt: BillingCheckoutAttempt,
+    payment_data: dict[str, Any],
+    verification_payload: dict[str, Any],
+) -> None:
+    """Apply validated payment metadata and verification payload onto locked attempt."""
+    if payment_data.get("amount") is not None:
+        try:
+            amount_val = int(payment_data["amount"])
+            if amount_val >= 0:
+                locked_attempt.amount_minor_units = amount_val
+        except (ValueError, TypeError):
+            pass
+    if payment_data.get("currency"):
+        currency_code = str(payment_data["currency"]).strip().upper()
+        if len(currency_code) == 3:
+            locked_attempt.currency = currency_code
+
+    payload_copy = dict(locked_attempt.request_payload or {})
+    payload_copy["verification"] = verification_payload
+    locked_attempt.request_payload = payload_copy
+
+
+async def _commit_checkout_verification(
+    db: AsyncSession,
+    *,
+    attempt_id: uuid.UUID,
+    operation: str,
+) -> None:
+    """Commit checkout verification changes atomically with explicit rollback on failure."""
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback failed after IntegrityError during %s for attempt %s",
+                operation,
+                attempt_id,
+            )
+        logger.warning(
+            "Database integrity conflict during %s for attempt %s: %s",
+            operation,
+            attempt_id,
+            exc,
+        )
+        raise RazorpayCheckoutConflictError(
+            f"Checkout verification conflict on attempt {attempt_id} during {operation}."
+        ) from exc
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback failed after database error during %s for attempt %s",
+                operation,
+                attempt_id,
+            )
+        raise
+
+
 async def verify_razorpay_checkout_callback(
     db: AsyncSession,
     organization_id: uuid.UUID,
@@ -1174,20 +1432,24 @@ async def verify_razorpay_checkout_callback(
     razorpay_subscription_id: str,
     razorpay_signature: str,
 ) -> RazorpayCheckoutVerificationResult:
-    """Verify a Razorpay checkout callback, validate payment status, and record outcome.
+    """Verify a Razorpay checkout callback, validate payment status, and bind payment ID.
 
     Requirements & Guarantees:
     1. Resolves expected subscription ID from the server-side checkout attempt.
     2. Never trusts browser-supplied subscription ID; rejects mismatches immediately.
-    3. Cryptographic HMAC-SHA256 signature verification using constant-time comparison.
+    3. Cryptographic HMAC-SHA256 signature verification using constant-time comparison
+       before idempotent replay responses or gateway calls.
     4. Retrieves payment status from Razorpay API outside database transactions.
     5. Validates payment association, merchant account, and environment.
-    6. Distinguishes 'captured' (complete) from 'authorized' (payment_pending).
-    7. Idempotent: repeated callbacks with matching payment ID return existing verified result.
-    8. Entitlement Protection: NEVER marks subscription as Pro or provisions paid quota.
+    6. Atomically binds provider_payment_id alongside transition to 'complete' strictly for
+       verified 'captured' payments; 'authorized' moves to 'payment_pending' without binding.
+    7. Preserves expired attempts and terminal subscriptions (never resurrects; records
+       PaymentReconciliation with deterministic case_key for delayed captures).
+    8. Idempotent: repeated callbacks with matching payment ID return existing verified result.
+    9. Entitlement Protection: NEVER marks subscription as Pro or provisions paid quota.
     """
     # -------------------------------------------------------------------------
-    # 1. Input Sanitization & Validation
+    # 1. Input Sanitization & Configuration Validation
     # -------------------------------------------------------------------------
     pay_id = str(razorpay_payment_id).strip() if razorpay_payment_id else ""
     client_sub_id = str(razorpay_subscription_id).strip() if razorpay_subscription_id else ""
@@ -1198,10 +1460,14 @@ async def verify_razorpay_checkout_callback(
             "Callback data is incomplete. Missing payment_id, subscription_id, or signature."
         )
 
+    merchant_account_id, environment = _get_provisioning_scope()
+    key_secret = settings.razorpay_key_secret.get_secret_value().strip()
+    if not key_secret:
+        raise RazorpayConfigurationError("RAZORPAY_KEY_SECRET is not configured.")
+
     # -------------------------------------------------------------------------
     # 2. Server-Side Checkout Attempt Resolution
     # -------------------------------------------------------------------------
-    merchant_account_id, environment = _get_provisioning_scope()
     stmt = (
         select(BillingCheckoutAttempt)
         .where(
@@ -1221,51 +1487,9 @@ async def verify_razorpay_checkout_callback(
         )
 
     # -------------------------------------------------------------------------
-    # 3. Permanent Payment Binding & Idempotent Replay Handling
+    # 3. Server-Owned Subscription & Cryptographic Signature Verification
     # -------------------------------------------------------------------------
-    verification_data = attempt.request_payload.get("verification") if isinstance(attempt.request_payload, dict) else None
-
-    # Permanent binding check: attempt cannot be switched to a different payment
-    if (
-        verification_data
-        and verification_data.get("payment_id")
-        and verification_data.get("payment_id") != pay_id
-    ):
-        raise RazorpayCheckoutConflictError(
-            f"Checkout attempt {attempt_id} is already associated with payment "
-            f"'{verification_data.get('payment_id')}', cannot verify different payment '{pay_id}'."
-        )
-
-    # Idempotent replay for already-completed attempt with the same payment
-    if (
-        attempt.status == CheckoutAttemptStatus.complete
-        and verification_data
-        and verification_data.get("payment_id") == pay_id
-    ):
-        logger.info(
-            "Idempotent replay of completed checkout verification for attempt %s (payment %s)",
-            attempt_id,
-            pay_id,
-        )
-        return RazorpayCheckoutVerificationResult(
-            attempt_id=attempt.id,
-            organization_id=organization_id,
-            provider="razorpay",
-            subscription_id=attempt.provider_subscription_id or client_sub_id,
-            payment_id=pay_id,
-            status=CheckoutAttemptStatus.complete,
-            payment_status=verification_data.get("payment_status", "captured"),
-        )
-
-    if attempt.status in (CheckoutAttemptStatus.failed, CheckoutAttemptStatus.expired):
-        raise RazorpayCheckoutConflictError(
-            f"Checkout attempt {attempt_id} is in terminal '{attempt.status.value}' state and cannot be verified."
-        )
-
-    # -------------------------------------------------------------------------
-    # 4. Server-Owned Subscription ID Association & Mismatch Rejection
-    # -------------------------------------------------------------------------
-    server_sub_id = attempt.provider_subscription_id
+    server_sub_id = (attempt.provider_subscription_id or "").strip()
     if not server_sub_id:
         raise RazorpayCheckoutError(
             f"Checkout attempt {attempt_id} does not have an associated server-owned subscription ID."
@@ -1282,13 +1506,6 @@ async def verify_razorpay_checkout_callback(
             "Subscription ID mismatch: browser-supplied subscription ID does not match the server-owned checkout attempt."
         )
 
-    # -------------------------------------------------------------------------
-    # 5. Cryptographic Signature Verification (HMAC-SHA256)
-    # -------------------------------------------------------------------------
-    key_secret = settings.razorpay_key_secret.get_secret_value().strip()
-    if not key_secret:
-        raise RazorpayConfigurationError("RAZORPAY_KEY_SECRET is not configured.")
-
     is_valid_signature = verify_razorpay_subscription_signature(
         payment_id=pay_id,
         subscription_id=server_sub_id,
@@ -1304,7 +1521,83 @@ async def verify_razorpay_checkout_callback(
         raise RazorpayCheckoutSignatureError("Invalid checkout signature.")
 
     # -------------------------------------------------------------------------
-    # 6. Retrieve Payment Status from Razorpay API (Outside Database Transactions)
+    # 4. Pre-HTTP Binding, Lifecycle & Idempotent Replay Validation
+    # -------------------------------------------------------------------------
+    bound_payment_id, verification_data, associated_payment_id = _extract_checkout_payment_binding(attempt)
+
+    if associated_payment_id and associated_payment_id != pay_id:
+        raise RazorpayCheckoutConflictError(
+            f"Checkout attempt {attempt_id} is already associated with payment "
+            f"'{associated_payment_id}', cannot verify different payment '{pay_id}'."
+        )
+
+    if attempt.status in (
+        CheckoutAttemptStatus.failed,
+        CheckoutAttemptStatus.creating,
+        CheckoutAttemptStatus.recovery_required,
+    ):
+        raise RazorpayCheckoutConflictError(
+            f"Checkout attempt {attempt_id} is in '{attempt.status.value}' state and cannot be verified."
+        )
+
+    now_utc = datetime.now(timezone.utc)
+    is_expired_pre_http = _is_attempt_session_expired(attempt, now_utc)
+
+    # Inspect local subscription state (read-only pre-check)
+    stmt_sub = (
+        select(Subscription)
+        .where(
+            Subscription.provider == "razorpay",
+            Subscription.merchant_account_id == merchant_account_id,
+            Subscription.environment == environment,
+            Subscription.provider_subscription_id == server_sub_id,
+        )
+    )
+    res_sub = await db.execute(stmt_sub)
+    pre_sub = res_sub.scalar_one_or_none()
+
+    if pre_sub is not None and pre_sub.organization_id != organization_id:
+        raise RazorpayCheckoutConflictError(
+            f"Subscription '{server_sub_id}' belongs to a different organization."
+        )
+
+    is_sub_terminal_pre_http = pre_sub is not None and is_terminal_subscription(pre_sub.status)
+
+    # Idempotent replay when already completed and cleanly bound (or pre-bound captured verification)
+    already_bound_and_complete = (
+        attempt.status == CheckoutAttemptStatus.complete
+        and (
+            bound_payment_id == pay_id
+            or (
+                bound_payment_id is None
+                and verification_data is not None
+                and str(verification_data.get("payment_id", "")).strip() == pay_id
+                and str(verification_data.get("payment_status", "")).strip().lower() == "captured"
+            )
+        )
+    )
+    if already_bound_and_complete:
+        logger.info(
+            "Idempotent replay of completed checkout verification for attempt %s (payment %s)",
+            attempt_id,
+            pay_id,
+        )
+        return RazorpayCheckoutVerificationResult(
+            attempt_id=attempt.id,
+            organization_id=organization_id,
+            provider="razorpay",
+            subscription_id=server_sub_id,
+            payment_id=pay_id,
+            status=CheckoutAttemptStatus.complete,
+            payment_status=(
+                str(verification_data.get("payment_status", "captured"))
+                if verification_data is not None
+                else "captured"
+            ),
+        )
+
+    # -------------------------------------------------------------------------
+    # 5. Retrieve Payment Status from Razorpay API (Outside Database Transactions)
     # -------------------------------------------------------------------------
     if db.in_transaction():
         await db.commit()
@@ -1312,36 +1605,61 @@ async def verify_razorpay_checkout_callback(
     client = get_razorpay_client()
     try:
         payment_data = await client.get_payment(pay_id)
-    except RazorpayAPIError as exc:
+    except RazorpayClientError as exc:
         logger.error(
             "Failed to retrieve payment %s from Razorpay API for attempt %s: %s",
             pay_id,
             attempt_id,
             exc,
         )
+        if is_sub_terminal_pre_http and pre_sub is not None:
+            pre_sub_status_label = (
+                pre_sub.status.value
+                if isinstance(pre_sub.status, SubscriptionStatus)
+                else str(pre_sub.status)
+            )
+            raise RazorpayCheckoutConflictError(
+                f"Subscription '{server_sub_id}' is in terminal '{pre_sub_status_label}' state and cannot complete checkout verification."
+            ) from exc
+        if is_expired_pre_http:
+            stmt_exp = (
+                select(BillingCheckoutAttempt)
+                .where(
+                    BillingCheckoutAttempt.id == attempt_id,
+                    BillingCheckoutAttempt.organization_id == organization_id,
+                    BillingCheckoutAttempt.provider == "razorpay",
+                    BillingCheckoutAttempt.merchant_account_id == merchant_account_id,
+                    BillingCheckoutAttempt.environment == environment,
+                )
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+            res_exp = await db.execute(stmt_exp)
+            exp_attempt = res_exp.scalar_one_or_none()
+            if exp_attempt is not None and exp_attempt.status == CheckoutAttemptStatus.open and _is_attempt_session_expired(exp_attempt, datetime.now(timezone.utc)):
+                exp_attempt.status = CheckoutAttemptStatus.expired
+                await _commit_checkout_verification(
+                    db,
+                    attempt_id=attempt_id,
+                    operation="expired checkout status preservation",
+                )
+            elif db.in_transaction():
+                await db.rollback()
+            raise RazorpayCheckoutConflictError(
+                f"Checkout attempt {attempt_id} has expired and cannot be verified."
+            ) from exc
         raise RazorpayCheckoutPaymentError(
             f"Payment verification failed: could not retrieve payment details from Razorpay: {exc}"
         ) from exc
 
     if not isinstance(payment_data, dict) or payment_data.get("id") != pay_id:
         raise RazorpayCheckoutPaymentError("Payment verification failed: invalid payment data returned by gateway.")
+    if "entity" in payment_data and str(payment_data.get("entity", "")).strip().lower() != "payment":
+        raise RazorpayCheckoutPaymentError("Payment verification failed: invalid payment entity returned by gateway.")
 
-    payment_status = str(payment_data.get("status", "")).lower()
-    if payment_status == "failed":
-        logger.warning(
-            "Payment %s for attempt %s has failed status on Razorpay",
-            pay_id,
-            attempt_id,
-        )
-        await _record_attempt_outcome(
-            db=db,
-            attempt_id=attempt_id,
-            status=CheckoutAttemptStatus.failed,
-            error_message=f"payment_failed: {payment_data.get('error_description')}",
-        )
-        raise RazorpayCheckoutPaymentError("Payment was marked as failed by the payment provider.")
+    payment_status = str(payment_data.get("status", "")).strip().lower()
 
-    # 6.1 Validate Payment-to-Subscription Binding (Fail Closed)
+    # 5.1 Validate Payment-to-Subscription Binding (Fail Closed)
     payment_sub_id = payment_data.get("subscription_id")
     if not payment_sub_id or not str(payment_sub_id).strip():
         logger.error(
@@ -1364,7 +1682,7 @@ async def verify_razorpay_checkout_callback(
             f"Payment subscription ID '{payment_sub_id}' does not match expected subscription '{server_sub_id}'."
         )
 
-    # 6.2 Validate Metadata / Organization if present
+    # 5.2 Validate Metadata, Merchant Account & Customer Association if Present
     payment_notes = payment_data.get("notes") or {}
     if isinstance(payment_notes, dict):
         noted_org_id = payment_notes.get("organization_id")
@@ -1377,72 +1695,365 @@ async def verify_razorpay_checkout_callback(
             )
             raise RazorpayCheckoutConflictError("Payment metadata organization mismatch.")
 
-    # -------------------------------------------------------------------------
-    # 7. Persist Verification Outcome (Short Write Transaction)
-    # -------------------------------------------------------------------------
-    # Determine attempt target status based on payment state:
-    # captured -> complete; authorized -> payment_pending
-    target_attempt_status = (
-        CheckoutAttemptStatus.complete
-        if payment_status == "captured"
-        else CheckoutAttemptStatus.payment_pending
-    )
+        noted_attempt_id = payment_notes.get("attempt_id")
+        if noted_attempt_id and str(noted_attempt_id).strip() != str(attempt_id):
+            logger.error(
+                "Payment %s checkout attempt mismatch: expected %s, got %s",
+                pay_id,
+                attempt_id,
+                noted_attempt_id,
+            )
+            raise RazorpayCheckoutConflictError("Payment metadata checkout attempt mismatch.")
 
-    now_utc = datetime.now(timezone.utc)
+    payment_account_id = payment_data.get("account_id")
+    if (
+        payment_account_id
+        and merchant_account_id != "default"
+        and str(payment_account_id).strip() != merchant_account_id
+    ):
+        logger.error(
+            "Payment %s merchant account mismatch: expected %s, got %s",
+            pay_id,
+            merchant_account_id,
+            payment_account_id,
+        )
+        raise RazorpayCheckoutConflictError("Payment merchant account mismatch.")
+
+    payment_customer_id = payment_data.get("customer_id")
+    if (
+        payment_customer_id
+        and attempt.provider_customer_id
+        and str(payment_customer_id).strip() != attempt.provider_customer_id.strip()
+    ):
+        logger.error(
+            "Payment %s customer mismatch: expected %s, got %s",
+            pay_id,
+            attempt.provider_customer_id,
+            payment_customer_id,
+        )
+        raise RazorpayCheckoutConflictError("Payment customer mismatch.")
+
+    # -------------------------------------------------------------------------
+    # 6. Persist Verification Outcome Under Row Locks (Short Write Transaction)
+    # -------------------------------------------------------------------------
+    now_lock = datetime.now(timezone.utc)
     new_verification_payload: dict[str, Any] = {
         "payment_id": pay_id,
         "payment_status": payment_status,
         "amount": payment_data.get("amount"),
         "currency": payment_data.get("currency"),
         "method": payment_data.get("method"),
-        "verified_at": now_utc.isoformat(),
+        "verified_at": now_lock.isoformat(),
     }
 
-    # Re-fetch attempt with row lock to avoid concurrency races
+    # Acquire Subscription lock before BillingCheckoutAttempt lock to stay aligned with
+    # webhook agreement handlers (agreement_handlers.py locks Subscription -> BillingCheckoutAttempt).
+    stmt_sub_lock = (
+        select(Subscription)
+        .where(
+            Subscription.provider == "razorpay",
+            Subscription.merchant_account_id == merchant_account_id,
+            Subscription.environment == environment,
+            Subscription.provider_subscription_id == server_sub_id,
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    res_sub_lock = await db.execute(stmt_sub_lock)
+    locked_sub = res_sub_lock.scalar_one_or_none()
+
+    if locked_sub is not None and locked_sub.organization_id != organization_id:
+        if db.in_transaction():
+            await db.rollback()
+        raise RazorpayCheckoutConflictError(
+            f"Subscription '{server_sub_id}' belongs to a different organization."
+        )
+
+    # Re-fetch attempt with row lock + populate_existing=True to bypass identity-map staleness
     stmt_lock = (
         select(BillingCheckoutAttempt)
-        .where(BillingCheckoutAttempt.id == attempt_id)
+        .where(
+            BillingCheckoutAttempt.id == attempt_id,
+            BillingCheckoutAttempt.organization_id == organization_id,
+            BillingCheckoutAttempt.provider == "razorpay",
+            BillingCheckoutAttempt.merchant_account_id == merchant_account_id,
+            BillingCheckoutAttempt.environment == environment,
+        )
+        .execution_options(populate_existing=True)
         .with_for_update()
     )
     res_lock = await db.execute(stmt_lock)
     locked_attempt = res_lock.scalar_one_or_none()
 
-    if locked_attempt is not None:
-        # Enforce monotonic state transitions:
-        # 1. A 'complete' attempt must NEVER be downgraded to 'payment_pending' or 'failed'.
-        # 2. A 'failed' attempt is terminal.
-        # 3. Monotonic transitions allowed:
-        #    - open -> payment_pending
-        #    - open -> complete
-        #    - payment_pending -> complete
-        #    - payment_pending -> payment_pending (refresh verification timestamp)
-        if locked_attempt.status == CheckoutAttemptStatus.complete:
-            logger.info(
-                "Attempt %s is already complete; ignoring stale payment status '%s'",
-                attempt_id,
-                payment_status,
+    if locked_attempt is None:
+        if db.in_transaction():
+            await db.rollback()
+        raise RazorpayCheckoutNotFoundError(
+            f"Checkout attempt {attempt_id} not found for organization {organization_id} in scope {environment}."
+        )
+
+    if (locked_attempt.provider_subscription_id or "").strip() != server_sub_id:
+        if db.in_transaction():
+            await db.rollback()
+        raise RazorpayCheckoutConflictError(
+            f"Checkout attempt {attempt_id} subscription binding changed concurrently."
+        )
+
+    try:
+        locked_bound_pay_id, locked_verification_data, locked_associated_pay_id = _extract_checkout_payment_binding(locked_attempt)
+    except RazorpayCheckoutConflictError:
+        if db.in_transaction():
+            await db.rollback()
+        raise
+
+    if locked_associated_pay_id and locked_associated_pay_id != pay_id:
+        if db.in_transaction():
+            await db.rollback()
+        raise RazorpayCheckoutConflictError(
+            f"Checkout attempt {attempt_id} is already associated with payment "
+            f"'{locked_associated_pay_id}', cannot verify different payment '{pay_id}'."
+        )
+
+    locked_already_bound_and_complete = (
+        locked_attempt.status == CheckoutAttemptStatus.complete
+        and (
+            locked_bound_pay_id == pay_id
+            or (
+                locked_bound_pay_id is None
+                and locked_verification_data is not None
+                and str(locked_verification_data.get("payment_id", "")).strip() == pay_id
+                and str(locked_verification_data.get("payment_status", "")).strip().lower() == "captured"
             )
-            target_attempt_status = CheckoutAttemptStatus.complete
-        elif locked_attempt.status != CheckoutAttemptStatus.failed:
-            locked_attempt.status = target_attempt_status
+        )
+    )
+
+    if locked_already_bound_and_complete:
+        if db.in_transaction():
+            await db.rollback()
+        logger.info(
+            "Attempt %s is already complete and bound to payment %s; ignoring stale status '%s'",
+            attempt_id,
+            pay_id,
+            payment_status,
+        )
+        target_attempt_status = CheckoutAttemptStatus.complete
+        result_payment_status = (
+            str(locked_verification_data.get("payment_status", "captured"))
+            if locked_verification_data is not None
+            else "captured"
+        )
+    elif locked_sub is not None and is_terminal_subscription(locked_sub.status):
+        logger.warning(
+            "Refusing checkout verification for terminal subscription %s (status=%s, attempt=%s, payment=%s)",
+            server_sub_id,
+            locked_sub.status,
+            attempt_id,
+            pay_id,
+        )
+        if payment_status == "captured":
+            await stage_or_update_payment_reconciliation(
+                db=db,
+                case_key=f"payment_for_terminal_subscription:{locked_sub.id}:{pay_id}",
+                reason="payment_for_terminal_subscription",
+                provider="razorpay",
+                merchant_account_id=merchant_account_id,
+                environment=environment,
+                organization_id=organization_id,
+                subscription_id=locked_sub.id,
+                diagnostic_data={
+                    "attempt_id": str(attempt_id),
+                    "provider_payment_id": pay_id,
+                    "provider_subscription_id": server_sub_id,
+                    "subscription_status": (
+                        locked_sub.status.value
+                        if isinstance(locked_sub.status, SubscriptionStatus)
+                        else str(locked_sub.status)
+                    ),
+                    "payment_status": payment_status,
+                    "amount": payment_data.get("amount"),
+                    "currency": payment_data.get("currency"),
+                    "detected_at": now_lock.isoformat(),
+                },
+                now=now_lock,
+            )
+            await _commit_checkout_verification(
+                db,
+                attempt_id=attempt_id,
+                operation="terminal subscription reconciliation",
+            )
+        elif db.in_transaction():
+            await db.rollback()
+        sub_status_label = (
+            locked_sub.status.value
+            if isinstance(locked_sub.status, SubscriptionStatus)
+            else str(locked_sub.status)
+        )
+        raise RazorpayCheckoutConflictError(
+            f"Subscription '{server_sub_id}' is in terminal '{sub_status_label}' state and cannot complete checkout verification."
+        )
+    elif _is_attempt_session_expired(locked_attempt, now_lock):
+        state_changed = False
+        if locked_attempt.status == CheckoutAttemptStatus.open:
+            locked_attempt.status = CheckoutAttemptStatus.expired
+            state_changed = True
+
+        if payment_status == "captured":
+            await stage_or_update_payment_reconciliation(
+                db=db,
+                case_key=f"delayed_capture_expired_checkout:{locked_attempt.id}:{pay_id}",
+                reason="delayed_capture_after_checkout_expiration",
+                provider="razorpay",
+                merchant_account_id=merchant_account_id,
+                environment=environment,
+                organization_id=organization_id,
+                subscription_id=locked_sub.id if locked_sub is not None else None,
+                diagnostic_data={
+                    "attempt_id": str(attempt_id),
+                    "provider_payment_id": pay_id,
+                    "provider_subscription_id": server_sub_id,
+                    "payment_status": payment_status,
+                    "amount": payment_data.get("amount"),
+                    "currency": payment_data.get("currency"),
+                    "session_expires_at": (
+                        locked_attempt.session_expires_at.isoformat()
+                        if locked_attempt.session_expires_at is not None
+                        else None
+                    ),
+                    "detected_at": now_lock.isoformat(),
+                },
+                now=now_lock,
+            )
+            await _commit_checkout_verification(
+                db,
+                attempt_id=attempt_id,
+                operation="expired checkout reconciliation",
+            )
+            raise RazorpayCheckoutConflictError(
+                f"Checkout attempt {attempt_id} has expired; captured payment '{pay_id}' recorded for reconciliation."
+            )
+
+        if state_changed:
+            await _commit_checkout_verification(
+                db,
+                attempt_id=attempt_id,
+                operation="expired checkout transition",
+            )
+        elif db.in_transaction():
+            await db.rollback()
+        raise RazorpayCheckoutConflictError(
+            f"Checkout attempt {attempt_id} has expired and cannot be verified."
+        )
+    elif locked_attempt.status in (
+        CheckoutAttemptStatus.failed,
+        CheckoutAttemptStatus.creating,
+        CheckoutAttemptStatus.recovery_required,
+    ):
+        if db.in_transaction():
+            await db.rollback()
+        raise RazorpayCheckoutConflictError(
+            f"Checkout attempt {attempt_id} is in '{locked_attempt.status.value}' state and cannot be verified."
+        )
+    elif payment_status == "failed":
+        logger.warning(
+            "Payment %s for attempt %s has failed status on Razorpay",
+            pay_id,
+            attempt_id,
+        )
+        if locked_attempt.status == CheckoutAttemptStatus.complete:
+            if db.in_transaction():
+                await db.rollback()
+            raise RazorpayCheckoutPaymentError("Payment was marked as failed by the payment provider.")
+
+        locked_attempt.status = CheckoutAttemptStatus.failed
+        locked_attempt.error_message = f"payment_failed: {payment_data.get('error_description')}"
+        await _commit_checkout_verification(
+            db,
+            attempt_id=attempt_id,
+            operation="failed payment outcome",
+        )
+        raise RazorpayCheckoutPaymentError("Payment was marked as failed by the payment provider.")
+    elif payment_status == "refunded":
+        if db.in_transaction():
+            await db.rollback()
+        raise RazorpayCheckoutPaymentError("Payment has been refunded by the payment provider.")
+    elif locked_attempt.status == CheckoutAttemptStatus.complete:
+        # Attempt was already marked 'complete' (e.g., via subscription.activated webhook)
+        # without an established provider_payment_id. Bind ONLY when verified 'captured'.
+        target_attempt_status = CheckoutAttemptStatus.complete
+        if payment_status == "captured":
+            try:
+                _validate_attempt_binding_attributes(
+                    locked_attempt,
+                    organization_id=organization_id,
+                    merchant_account_id=merchant_account_id,
+                    environment=environment,
+                    server_sub_id=server_sub_id,
+                    pay_id=pay_id,
+                )
+            except RazorpayCheckoutConflictError:
+                if db.in_transaction():
+                    await db.rollback()
+                raise
+            locked_attempt.provider_payment_id = pay_id
             locked_attempt.error_message = None
-
-            if payment_data.get("amount") is not None:
-                try:
-                    locked_attempt.amount_minor_units = int(payment_data["amount"])
-                except (ValueError, TypeError):
-                    pass
-            if payment_data.get("currency"):
-                locked_attempt.currency = str(payment_data["currency"]).strip().upper()
-
-            payload_copy = dict(locked_attempt.request_payload or {})
-            payload_copy["verification"] = new_verification_payload
-            locked_attempt.request_payload = payload_copy
-
-            await db.commit()
+            _apply_verified_payment_metadata(locked_attempt, payment_data, new_verification_payload)
+            await _commit_checkout_verification(
+                db,
+                attempt_id=attempt_id,
+                operation="complete payment binding backfill",
+            )
+            result_payment_status = "captured"
+        else:
+            if locked_verification_data is None:
+                _apply_verified_payment_metadata(locked_attempt, payment_data, new_verification_payload)
+                await _commit_checkout_verification(
+                    db,
+                    attempt_id=attempt_id,
+                    operation="complete uncaptured verification metadata",
+                )
+            elif db.in_transaction():
+                await db.rollback()
+            result_payment_status = payment_status
+    elif payment_status == "captured":
+        try:
+            _validate_attempt_binding_attributes(
+                locked_attempt,
+                organization_id=organization_id,
+                merchant_account_id=merchant_account_id,
+                environment=environment,
+                server_sub_id=server_sub_id,
+                pay_id=pay_id,
+            )
+        except RazorpayCheckoutConflictError:
+            if db.in_transaction():
+                await db.rollback()
+            raise
+        target_attempt_status = CheckoutAttemptStatus.complete
+        locked_attempt.status = CheckoutAttemptStatus.complete
+        locked_attempt.provider_payment_id = pay_id
+        locked_attempt.error_message = None
+        _apply_verified_payment_metadata(locked_attempt, payment_data, new_verification_payload)
+        await _commit_checkout_verification(
+            db,
+            attempt_id=attempt_id,
+            operation="captured payment binding",
+        )
+        result_payment_status = "captured"
+    else:
+        # Authorized or uncaptured pending payment: NEVER bind provider_payment_id
+        target_attempt_status = CheckoutAttemptStatus.payment_pending
+        locked_attempt.status = CheckoutAttemptStatus.payment_pending
+        locked_attempt.error_message = None
+        _apply_verified_payment_metadata(locked_attempt, payment_data, new_verification_payload)
+        await _commit_checkout_verification(
+            db,
+            attempt_id=attempt_id,
+            operation="pending payment verification",
+        )
+        result_payment_status = payment_status
 
     # -------------------------------------------------------------------------
-    # 8. Entitlement Protection Invariant Assertion
+    # 7. Entitlement Protection Invariant Assertion
     # -------------------------------------------------------------------------
     # VERIFICATION ALONE NEVER PROVISIONS PAID QUOTA.
     # Subscription.plan_tier is UNTOUCHED.
@@ -1456,7 +2067,7 @@ async def verify_razorpay_checkout_callback(
         subscription_id=server_sub_id,
         payment_id=pay_id,
         status=target_attempt_status,
-        payment_status=payment_status,
+        payment_status=result_payment_status,
     )
 
 
@@ -1477,6 +2088,7 @@ async def _record_attempt_outcome(
             select(BillingCheckoutAttempt)
             .where(BillingCheckoutAttempt.id == attempt_id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         res = await db.execute(stmt)
         attempt = res.scalar_one_or_none()
@@ -1484,6 +2096,8 @@ async def _record_attempt_outcome(
             attempt.status = status
             attempt.error_message = error_message
             await db.commit()
+        else:
+            await _safe_rollback(db)
     except Exception as exc:
         logger.warning(
             "Failed to record checkout attempt %s outcome %s: %s",
@@ -1491,10 +2105,7 @@ async def _record_attempt_outcome(
             status,
             exc,
         )
-        try:
-            await db.rollback()
-        except Exception:
-            pass
+        await _safe_rollback(db)
 
 
 async def _record_attempt_success(
@@ -1505,18 +2116,25 @@ async def _record_attempt_success(
     session_expires_at: datetime | None,
 ) -> None:
     """Record successful remote subscription creation on the checkout attempt."""
-    stmt = (
-        select(BillingCheckoutAttempt)
-        .where(BillingCheckoutAttempt.id == attempt_id)
-        .with_for_update()
-    )
-    res = await db.execute(stmt)
-    attempt = res.scalar_one_or_none()
-    if attempt is not None:
-        attempt.provider_subscription_id = subscription_id
-        attempt.provider_session_id = subscription_id
-        attempt.checkout_url = checkout_url
-        attempt.session_expires_at = session_expires_at
-        attempt.status = CheckoutAttemptStatus.open
-        attempt.error_message = None
-        await db.commit()
+    try:
+        stmt = (
+            select(BillingCheckoutAttempt)
+            .where(BillingCheckoutAttempt.id == attempt_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        res = await db.execute(stmt)
+        attempt = res.scalar_one_or_none()
+        if attempt is not None:
+            attempt.provider_subscription_id = subscription_id
+            attempt.provider_session_id = subscription_id
+            attempt.checkout_url = checkout_url
+            attempt.session_expires_at = session_expires_at
+            attempt.status = CheckoutAttemptStatus.open
+            attempt.error_message = None
+            await db.commit()
+        else:
+            await _safe_rollback(db)
+    except Exception:
+        await _safe_rollback(db)
+        raise
