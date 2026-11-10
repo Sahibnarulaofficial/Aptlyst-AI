@@ -51,6 +51,20 @@ import pytest
 from sqlalchemy import delete, inspect as sa_inspect, insert, select, text, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import configure_mappers
+
+# Register all application ORM models on Base.metadata before mapper configuration
+# (mirrors alembic/env.py and tests/test_razorpay_customer.py).
+import app.models.billing  # noqa: F401
+import app.models.chatbot  # noqa: F401
+import app.models.conversation  # noqa: F401
+import app.models.generation  # noqa: F401
+import app.models.generation_attempt  # noqa: F401
+import app.models.organization  # noqa: F401
+import app.models.payment  # noqa: F401
+import app.models.subscription  # noqa: F401
+
+configure_mappers()
 
 from app.config import settings
 from app.models.organization import Organization
