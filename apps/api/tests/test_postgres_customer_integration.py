@@ -627,10 +627,16 @@ async def test_pg16_d2_caller_session_core_sql_dml_untouched(
         )
         await caller_db.execute(
             update(Organization)
-            .where(Organization.id == org_target.id)
+            .where(Organization.id == org_core_id)
             .values(name="Core Updated Org 05")
         )
         assert caller_db.in_transaction() is True
+        in_tx_name = (
+            await caller_db.execute(
+                select(Organization.name).where(Organization.id == org_core_id)
+            )
+        ).scalar_one()
+        assert in_tx_name == "Core Updated Org 05"
 
         customer_id = await get_or_create_razorpay_customer(
             organization_id=org_target.id,
@@ -639,16 +645,19 @@ async def test_pg16_d2_caller_session_core_sql_dml_untouched(
         assert customer_id == expected_customer_id
         assert caller_db.in_transaction() is True
 
-        # Observer sees neither Core insert nor Core update prior to caller commit.
+        # Observer sees neither Core insert nor Core update prior to caller rollback.
         async with pg.session_factory() as obs_db:
             assert await obs_db.get(Organization, org_core_id) is None
-            obs_target = await obs_db.get(Organization, org_target.id)
-            assert obs_target is not None
-            assert obs_target.name == "Original Core Target 05"
 
         await caller_db.rollback()
 
     # Rollback reverted caller Core DML while keeping committed provision intact.
+    async with pg.session_factory() as verify_db:
+        assert await verify_db.get(Organization, org_core_id) is None
+        verify_target = await verify_db.get(Organization, org_target.id)
+        assert verify_target is not None
+        assert verify_target.name == "Original Core Target 05"
+
     prov = await _fetch_provision(pg.session_factory, org_target.id)
     assert prov is not None
     assert prov.status == CustomerProvisionStatus.resolved
