@@ -41,8 +41,10 @@ if sys.platform == "win32":
     BaseProactorEventLoop._loop_self_reading = lambda self, f=None: None
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+import logging
 from typing import Any
 import uuid
 
@@ -103,6 +105,8 @@ from tests.postgres_test_guard import (
     validate_postgres_test_url,
 )
 
+
+logger = logging.getLogger(__name__)
 
 POSTGRES_TEST_URL = os.environ.get("POSTGRES_TEST_URL")
 REQUIRE_POSTGRES_TESTS = is_postgres_tests_required()
@@ -317,20 +321,104 @@ async def _wait_for_pg_lock_waiter(
     )
 
 
-async def _count_idle_in_transaction_backends(
+async def _get_pg_backend_pid(db: AsyncSession) -> int:
+    """Return the PostgreSQL backend PID bound to the active session connection."""
+    return int((await db.execute(text("SELECT pg_backend_pid()"))).scalar_one())
+
+
+async def _fetch_pg_stat_activity_backends(
     session_factory: async_sessionmaker[AsyncSession],
-) -> int:
-    """Count non-observer sessions currently in 'idle in transaction' on the test database."""
+    *,
+    state: str | None = None,
+    pids: Sequence[int] | None = None,
+    exclude_pids: Sequence[int] = (),
+) -> list[dict[str, Any]]:
+    """Fetch non-observer pg_stat_activity rows on the test database with full diagnostic metadata."""
+    include_pids = {int(pid) for pid in pids} if pids is not None else None
+    excluded_pids = {int(pid) for pid in exclude_pids}
+
     async with session_factory() as obs_db:
         res = await obs_db.execute(
             text(
-                "SELECT count(*) FROM pg_stat_activity "
+                "SELECT pid, application_name, state, wait_event_type, wait_event, "
+                "query, xact_start, backend_start "
+                "FROM pg_stat_activity "
                 "WHERE datname = current_database() "
                 "AND pid <> pg_backend_pid() "
-                "AND state = 'idle in transaction'"
+                "ORDER BY pid"
             )
         )
-        return int(res.scalar_one())
+        rows: list[dict[str, Any]] = []
+        for mapping in res.mappings():
+            pid = int(mapping["pid"])
+            row_state = mapping["state"]
+            if state is not None and row_state != state:
+                continue
+            if include_pids is not None and pid not in include_pids:
+                continue
+            if pid in excluded_pids:
+                continue
+            xact_start = mapping["xact_start"]
+            backend_start = mapping["backend_start"]
+            rows.append(
+                {
+                    "pid": pid,
+                    "application_name": mapping["application_name"],
+                    "state": row_state,
+                    "wait_event_type": mapping["wait_event_type"],
+                    "wait_event": mapping["wait_event"],
+                    "query": mapping["query"],
+                    "xact_start": xact_start.isoformat()
+                    if hasattr(xact_start, "isoformat")
+                    else xact_start,
+                    "backend_start": backend_start.isoformat()
+                    if hasattr(backend_start, "isoformat")
+                    else backend_start,
+                }
+            )
+        return rows
+
+
+def _format_pg_stat_activity_diagnostics(rows: Sequence[dict[str, Any]]) -> str:
+    """Format pg_stat_activity metadata rows for failure diagnostics."""
+    if not rows:
+        return "[]"
+    return "; ".join(
+        (
+            f"pid={row['pid']} application_name={row['application_name']!r} "
+            f"state={row['state']!r} wait_event_type={row['wait_event_type']!r} "
+            f"wait_event={row['wait_event']!r} query={row['query']!r} "
+            f"xact_start={row['xact_start']!r} backend_start={row['backend_start']!r}"
+        )
+        for row in rows
+    )
+
+
+async def _count_idle_in_transaction_backends(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    exclude_pids: Sequence[int] = (),
+) -> int:
+    """Count non-observer sessions currently in 'idle in transaction' on the test database."""
+    rows = await _fetch_pg_stat_activity_backends(
+        session_factory,
+        state="idle in transaction",
+        exclude_pids=exclude_pids,
+    )
+    if rows:
+        diagnostics = _format_pg_stat_activity_diagnostics(rows)
+        logger.warning(
+            "Observed %s idle-in-transaction PG16 backend(s) (exclude_pids=%s): %s",
+            len(rows),
+            [int(pid) for pid in exclude_pids],
+            diagnostics,
+        )
+        print(
+            f"[pg_stat_activity idle in transaction count={len(rows)} "
+            f"exclude_pids={[int(pid) for pid in exclude_pids]}]: {diagnostics}",
+            flush=True,
+        )
+    return len(rows)
 
 
 async def _fetch_provision(
@@ -1627,11 +1715,14 @@ async def test_pg16_cancellation_during_blocked_for_update_lock_releases_connect
     async with pg.session_factory() as caller_db:
         preloaded_org = await caller_db.get(Organization, org.id)
         assert preloaded_org is not None
+        caller_pid = await _get_pg_backend_pid(caller_db)
 
         async with pg.session_factory() as locker_db:
             await locker_db.execute(
                 select(Organization).where(Organization.id == org.id).with_for_update()
             )
+            locker_pid = await _get_pg_backend_pid(locker_db)
+            assert locker_pid != caller_pid
 
             task = asyncio.create_task(
                 get_or_create_razorpay_customer(
@@ -1639,10 +1730,11 @@ async def test_pg16_cancellation_during_blocked_for_update_lock_releases_connect
                     session_factory=pg.session_factory,
                 )
             )
-            await _wait_for_pg_lock_waiter(
+            blocked_pid = await _wait_for_pg_lock_waiter(
                 pg.session_factory,
                 query_fragment="FROM organizations",
             )
+            assert blocked_pid not in {caller_pid, locker_pid}
 
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -1650,9 +1742,27 @@ async def test_pg16_cancellation_during_blocked_for_update_lock_releases_connect
 
             await locker_db.rollback()
 
-        assert await _count_idle_in_transaction_backends(pg.session_factory) == 0
+        lingering_backends = await _fetch_pg_stat_activity_backends(
+            pg.session_factory,
+            pids=(blocked_pid, locker_pid),
+        )
+        assert lingering_backends == [], (
+            "Cancelled provisioning / closed locker backend still present in pg_stat_activity "
+            f"(blocked_pid={blocked_pid}, locker_pid={locker_pid}): "
+            f"{_format_pg_stat_activity_diagnostics(lingering_backends)}"
+        )
+
+        assert (
+            await _count_idle_in_transaction_backends(
+                pg.session_factory,
+                exclude_pids=(caller_pid,),
+            )
+            == 0
+        )
         assert preloaded_org in caller_db.identity_map.values()
         assert sa_inspect(preloaded_org).expired is False
+
+    assert await _count_idle_in_transaction_backends(pg.session_factory) == 0
 
     # Subsequent provisioning after lock release succeeds cleanly.
     resolved_id = await get_or_create_razorpay_customer(
