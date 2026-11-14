@@ -321,11 +321,15 @@ class Pg16WebhookHarness:
             provider="razorpay",
             merchant_account_id="default",
             environment="test",
-            plan_tier="pro",
+            idempotency_key=f"idem_attempt_{uuid.uuid4().hex}",
             status=status,
+            amount_minor_units=0,
+            currency="INR",
+            request_payload={"plan_tier": "pro"},
+            attempt_lease_expires_at=now + timedelta(seconds=300),
+            session_expires_at=expires_at or (now + timedelta(hours=2)),
             provider_subscription_id=provider_sub_id,
             provider_payment_id=provider_payment_id,
-            expires_at=expires_at or (now + timedelta(hours=2)),
             created_at=now,
             updated_at=now,
         )
@@ -1136,13 +1140,16 @@ async def test_pg16_d04a_04_concurrent_quota_reservation_and_settlement_stress(p
 
     async def reserve_task(t_id: uuid.UUID):
         async with pg.session_factory() as db:
-            return await reserve_usage(
+            r = await reserve_usage(
                 session=db,
                 organization_id=org.id,
                 task_id=t_id,
                 billing_period_id=period.id,
                 pricing=pricing,
             )
+            if r.success:
+                await db.commit()
+            return r
 
     # Run 4 concurrent reservations
     res_list = await asyncio.gather(*[reserve_task(t.id) for t in tasks], return_exceptions=True)
@@ -1153,7 +1160,7 @@ async def test_pg16_d04a_04_concurrent_quota_reservation_and_settlement_stress(p
     async def settle_task(res: ReservationResult):
         async with pg.session_factory() as db:
             assert res.reservation is not None
-            return await settle_reservation(
+            s = await settle_reservation(
                 session=db,
                 reservation_id=res.reservation.id,
                 organization_id=org.id,
@@ -1161,6 +1168,9 @@ async def test_pg16_d04a_04_concurrent_quota_reservation_and_settlement_stress(p
                 actual_cost_micros=2_500,
                 pricing=pricing,
             )
+            if s.success:
+                await db.commit()
+            return s
 
     settle_list = await asyncio.gather(*[settle_task(r) for r in successful_reservations], return_exceptions=True)
     for s in settle_list:
@@ -1206,13 +1216,14 @@ async def test_pg16_d04a_04_double_settlement_prevention(pg: Pg16WebhookHarness)
             billing_period_id=period.id,
             pricing=pricing,
         )
-    assert res.success is True
+        assert res.success is True
+        await db.commit()
 
     # Concurrent settlement of the exact same reservation with different usage amounts
     assert res.reservation is not None
     async def try_settle(tokens: int, micros: int):
         async with pg.session_factory() as db:
-            return await settle_reservation(
+            s_res = await settle_reservation(
                 session=db,
                 reservation_id=res.reservation.id,
                 organization_id=org.id,
@@ -1220,6 +1231,9 @@ async def test_pg16_d04a_04_double_settlement_prevention(pg: Pg16WebhookHarness)
                 actual_cost_micros=micros,
                 pricing=pricing,
             )
+            if s_res.success:
+                await db.commit()
+            return s_res
 
     outcomes = await asyncio.gather(
         try_settle(400, 2000),
@@ -1367,4 +1381,8 @@ async def test_pg16_d04a_05_native_on_conflict_do_update_reconciliation_with_jso
             diag_payload = json.loads(diag_payload)
         history = diag_payload.get("history", [])
         assert len(history) == 2
-        assert diag_payload.get("latest", {}).get("code") == "ERR_2"
+        latest = diag_payload.get("latest", {})
+        if isinstance(latest, str):
+            import json
+            latest = json.loads(latest)
+        assert latest.get("code") == "ERR_2"
