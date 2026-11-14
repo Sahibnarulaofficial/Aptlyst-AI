@@ -91,6 +91,9 @@ from app.services.billing.accounting import (
     settle_reservation,
 )
 from app.services.billing.pricing import ModelPricing
+from app.services.billing.razorpay.agreement_handlers import (
+    register_razorpay_agreement_handlers,
+)
 from app.services.billing.razorpay.checkout import (
     RazorpayCheckoutConflictError,
     create_razorpay_subscription_checkout,
@@ -652,10 +655,11 @@ async def test_pg16_d04a_01_checkout_verification_vs_subscription_activated_webh
             )
         assert claimed is not None
         assert claimed.event_id == event.id
+        handler = default_razorpay_dispatcher.get_handler(claimed.event_type)
         return await execute_claimed_razorpay_webhook_event(
             session_factory=pg.session_factory,
             claimed=claimed,
-            handler=None,
+            handler=handler,
         )
 
     results = await asyncio.gather(
