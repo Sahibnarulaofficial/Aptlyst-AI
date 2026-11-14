@@ -33,13 +33,16 @@ Guarantees & Invariants:
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+import json
 import logging
 import re
 from typing import Any
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import case, cast, func, select
+from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.dml import Insert
 
 from app.config import settings
 from app.models.payment import (
@@ -59,75 +62,37 @@ from app.services.billing.razorpay.lock import (
 )
 from app.services.billing.razorpay.webhook_engine import (
     ClaimedWebhookEvent,
+    RazorpayBusinessRejectionError,
+    RazorpayDatabasePermanentError,
+    RazorpayDatabaseRetryableError,
+    RazorpayMissingEntityIdError,
+    RazorpayPayloadValidationError,
+    RazorpayProviderPermanentError,
+    RazorpayProviderTransientError,
+    RazorpayScopeMismatchError,
+    RazorpayTransientRaceRetryError,
+    RazorpayUnknownEventError,
+    RazorpayUnverifiedEventError,
+    RazorpayWebhookEngineError,
+    RazorpayWebhookPermanentError,
+    RazorpayWebhookReconciliationConflictError,
+    RazorpayWebhookRetryableError,
     StaleLeaseError,
+)
+from app.services.billing.webhook_errors import (
+    sanitize_billing_error_message,
+    sanitize_conflict_diagnostic_payload,
 )
 
 logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# Error Hierarchy
+# Error Hierarchy (Unified Canonical Aliases and Re-exports)
 # =============================================================================
 
-
-class RazorpayWebhookHandlerError(Exception):
-    """Base error for all Razorpay business webhook handler processing."""
-
-
-class RazorpayWebhookRetryableError(RazorpayWebhookHandlerError):
-    """Raised for transient errors (lock contention, serialization failure, network glitches)
-
-    Worker will increment attempts and schedule exponential retry backoff.
-    """
-
-
-class RazorpayWebhookPermanentError(RazorpayWebhookHandlerError):
-    """Raised for permanent errors that must quarantine immediately without retry.
-
-    Includes malformed payloads, unverified signatures, missing required IDs.
-    """
-
-
-class RazorpayWebhookReconciliationConflictError(RazorpayWebhookPermanentError):
-    """Raised when an event conflicts with authoritative state and requires audit reconciliation.
-
-    Stages a PaymentReconciliation case and quarantines the event.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        case_key: str,
-        reason: str,
-        organization_id: uuid.UUID | None = None,
-        subscription_id: uuid.UUID | None = None,
-        invoice_id: uuid.UUID | None = None,
-        payment_id: uuid.UUID | None = None,
-        raw_event_id: uuid.UUID | None = None,
-        diagnostic_payload: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.case_key = case_key
-        self.reason = reason
-        self.organization_id = organization_id
-        self.subscription_id = subscription_id
-        self.invoice_id = invoice_id
-        self.payment_id = payment_id
-        self.raw_event_id = raw_event_id
-        self.diagnostic_payload = diagnostic_payload or {}
-
-
-class RazorpayPayloadValidationError(RazorpayWebhookPermanentError):
-    """Raised when event payload violates strict schema or validation rules."""
-
-
-class RazorpayScopeMismatchError(RazorpayWebhookPermanentError):
-    """Raised when provider, merchant account, or environment does not match expected scope."""
-
-
-class RazorpayMissingEntityIdError(RazorpayWebhookPermanentError):
-    """Raised when a mandatory provider entity identifier (subscription_id, payment_id, invoice_id) is missing."""
+# Canonical alias: RazorpayWebhookHandlerError IS RazorpayWebhookEngineError
+RazorpayWebhookHandlerError = RazorpayWebhookEngineError
 
 
 # =============================================================================
@@ -218,6 +183,7 @@ class RazorpayEventContext:
     subscription: RazorpaySubscriptionEntity | None = None
     payment: RazorpayPaymentEntity | None = None
     invoice: RazorpayInvoiceEntity | None = None
+    worker_now: datetime | None = None
 
 
 # =============================================================================
@@ -531,6 +497,7 @@ def validate_razorpay_event_envelope(
     event_or_payload: ClaimedWebhookEvent | BillingWebhookEvent | dict[str, Any],
     expected_merchant_id: str | None = None,
     expected_environment: str | None = None,
+    worker_now: datetime | None = None,
 ) -> RazorpayEventContext:
     """Validate provider, merchant account, environment, signature, and envelope payload.
 
@@ -561,7 +528,7 @@ def validate_razorpay_event_envelope(
         # 2. Signature verification guard (Fail closed)
         sig_verified = getattr(event_model, "signature_verified", True)
         if not sig_verified:
-            raise RazorpayWebhookPermanentError(
+            raise RazorpayUnverifiedEventError(
                 f"Event {getattr(event_model, 'provider_event_id', 'unknown')}: signature_verified is False. "
                 "Unverified webhook events must never be processed."
             )
@@ -655,6 +622,8 @@ def validate_razorpay_event_envelope(
         except (RazorpayPayloadValidationError, RazorpayMissingEntityIdError):
             invoice_entity = None
 
+    ctx_worker_now = worker_now or getattr(event_or_payload, "worker_now", None)
+
     return RazorpayEventContext(
         event_id=event_id,
         provider="razorpay",
@@ -671,6 +640,7 @@ def validate_razorpay_event_envelope(
         subscription=subscription_entity,
         payment=payment_entity,
         invoice=invoice_entity,
+        worker_now=ctx_worker_now,
     )
 
 
@@ -801,7 +771,7 @@ async def resolve_tenant_organization(
         f"Unbound Razorpay entity '{entity_ref}'. No local customer provision or subscription found.",
         case_key=f"unbound_entity:{entity_ref}",
         reason="unbound_provider_customer",
-        organization_id=notes_org_id,
+        organization_id=None,
         diagnostic_payload={
             "customer_id": clean_customer_id,
             "subscription_id": clean_subscription_id,
@@ -912,6 +882,157 @@ async def stage_or_update_payment_reconciliation(
     return new_case
 
 
+def build_payment_reconciliation_upsert_stmt(
+    *,
+    case_key: str,
+    reason: str,
+    provider: str = "razorpay",
+    merchant_account_id: str = "default",
+    environment: str = "live",
+    organization_id: uuid.UUID | None = None,
+    subscription_id: uuid.UUID | None = None,
+    invoice_id: uuid.UUID | None = None,
+    payment_id: uuid.UUID | None = None,
+    raw_event_id: uuid.UUID | None = None,
+    diagnostic_data: dict[str, Any] | None = None,
+    status: ReconciliationStatus = ReconciliationStatus.pending_review,
+    now: datetime | None = None,
+) -> Insert:
+    """Build atomic PostgreSQL INSERT ... ON CONFLICT DO UPDATE for PaymentReconciliation.
+
+    Guarantees:
+    - Targets unique constraint 'uq_payment_reconciliations_case_key'.
+    - Atomically updates reason, updated_at, and coalesces foreign keys (organization_id,
+      subscription_id, invoice_id, payment_id, raw_event_id).
+    - Status reopening rule: transitions resolved cases (resolved_refunded, resolved_ignored)
+      back to pending_review on newly conflicting events.
+    - Appends sanitized history entry to diagnostic_payload['history'] and sets 'latest'.
+    - Returns returning(PaymentReconciliation) statement.
+    """
+    now_utc = now or datetime.now(timezone.utc)
+    clean_data = sanitize_conflict_diagnostic_payload(diagnostic_data or {})
+    new_history_entry = [{
+        "timestamp": now_utc.isoformat(),
+        "reason": reason,
+        "details": clean_data,
+    }]
+    initial_payload = {
+        "history": new_history_entry,
+        "latest": clean_data,
+    }
+
+    stmt = pg_insert(PaymentReconciliation).values(
+        id=uuid.uuid4(),
+        provider=provider,
+        merchant_account_id=merchant_account_id,
+        environment=environment,
+        case_key=case_key,
+        organization_id=organization_id,
+        subscription_id=subscription_id,
+        invoice_id=invoice_id,
+        payment_id=payment_id,
+        raw_event_id=raw_event_id,
+        reason=reason,
+        status=status,
+        diagnostic_payload=initial_payload,
+        created_at=now_utc,
+        updated_at=now_utc,
+    )
+
+    payload_update = PaymentReconciliation.diagnostic_payload.concat(
+        func.jsonb_build_object(
+            "history",
+            func.coalesce(
+                PaymentReconciliation.diagnostic_payload["history"].as_json(),
+                cast("[]", JSONB),
+            ).concat(cast(json.dumps(new_history_entry), JSONB)),
+            "latest",
+            cast(json.dumps(clean_data), JSONB),
+        )
+    )
+
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_payment_reconciliations_case_key",
+        set_={
+            "organization_id": func.coalesce(
+                PaymentReconciliation.organization_id, stmt.excluded.organization_id
+            ),
+            "subscription_id": func.coalesce(
+                PaymentReconciliation.subscription_id, stmt.excluded.subscription_id
+            ),
+            "invoice_id": func.coalesce(
+                PaymentReconciliation.invoice_id, stmt.excluded.invoice_id
+            ),
+            "payment_id": func.coalesce(
+                PaymentReconciliation.payment_id, stmt.excluded.payment_id
+            ),
+            "raw_event_id": func.coalesce(
+                PaymentReconciliation.raw_event_id, stmt.excluded.raw_event_id
+            ),
+            "reason": stmt.excluded.reason,
+            "status": case(
+                (
+                    PaymentReconciliation.status.in_([
+                        ReconciliationStatus.resolved_refunded,
+                        ReconciliationStatus.resolved_ignored,
+                    ]),
+                    ReconciliationStatus.pending_review,
+                ),
+                else_=PaymentReconciliation.status,
+            ),
+            "diagnostic_payload": payload_update,
+            "updated_at": stmt.excluded.updated_at,
+        },
+    ).returning(PaymentReconciliation)
+
+    return stmt
+
+
+async def upsert_payment_reconciliation(
+    db: AsyncSession,
+    *,
+    case_key: str,
+    reason: str,
+    provider: str = "razorpay",
+    merchant_account_id: str = "default",
+    environment: str = "live",
+    organization_id: uuid.UUID | None = None,
+    subscription_id: uuid.UUID | None = None,
+    invoice_id: uuid.UUID | None = None,
+    payment_id: uuid.UUID | None = None,
+    raw_event_id: uuid.UUID | None = None,
+    diagnostic_data: dict[str, Any] | None = None,
+    status: ReconciliationStatus = ReconciliationStatus.pending_review,
+    now: datetime | None = None,
+) -> PaymentReconciliation | None:
+    """Atomically upsert a payment reconciliation case using PostgreSQL ON CONFLICT.
+
+    Guarantees:
+    - Atomically handles concurrent insert races on uq_payment_reconciliations_case_key.
+    - Appends timestamped diagnostic history without losing previous history.
+    - Coalesces non-null foreign keys safely.
+    - Reopens previously resolved cases back to pending_review.
+    - Returns the upserted PaymentReconciliation record (via RETURNING).
+    """
+    stmt = build_payment_reconciliation_upsert_stmt(
+        case_key=case_key,
+        reason=reason,
+        provider=provider,
+        merchant_account_id=merchant_account_id,
+        environment=environment,
+        organization_id=organization_id,
+        subscription_id=subscription_id,
+        invoice_id=invoice_id,
+        payment_id=payment_id,
+        raw_event_id=raw_event_id,
+        diagnostic_data=diagnostic_data,
+        status=status,
+        now=now,
+    )
+    res = await db.execute(stmt)
+    return res.scalar_one_or_none()
+
+
 # =============================================================================
 # Entity-Level Idempotency Helpers
 # =============================================================================
@@ -962,11 +1083,12 @@ async def assert_valid_worker_lease(
     expected_lease_token: uuid.UUID,
     expected_worker_id: str,
     now: datetime | None = None,
+    rollback_on_failure: bool = True,
 ) -> None:
     """Verify under row lock that worker still owns an unexpired lease before committing business mutations.
 
-    If lease ownership was lost, replaced, or expired, rolls back the transaction immediately
-    and raises StaleLeaseError.
+    If lease ownership was lost, replaced, or expired, optionally rolls back the transaction
+    (default rollback_on_failure=True) and raises StaleLeaseError.
     """
     now_utc = now or datetime.now(timezone.utc)
 
@@ -979,7 +1101,8 @@ async def assert_valid_worker_lease(
     event = res.scalar_one_or_none()
 
     if event is None:
-        await db.rollback()
+        if rollback_on_failure:
+            await db.rollback()
         raise StaleLeaseError(f"Event '{event_id}' not found during lease assertion.")
 
     is_same_token = event.lease_token == expected_lease_token
@@ -987,7 +1110,8 @@ async def assert_valid_worker_lease(
     is_unexpired = event.lease_expires_at is not None and event.lease_expires_at >= now_utc
 
     if not (is_same_token and is_same_worker and is_unexpired):
-        await db.rollback()
+        if rollback_on_failure:
+            await db.rollback()
         logger.warning(
             "Worker %s lost lease on event %s before committing domain transaction (token_match=%s, worker_match=%s, unexpired=%s)",
             expected_worker_id,

@@ -234,6 +234,34 @@ jobs:
           )
           PY
 
+      - name: Run PostgreSQL 16 Webhook Concurrency Integration Tests (14 scenarios)
+        working-directory: apps/api
+        env:
+          REQUIRE_POSTGRES_TESTS: "1"
+          DATABASE_URL: postgresql+asyncpg://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
+          POSTGRES_TEST_URL: postgresql+psycopg2://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
+        run: |
+          rm -f test-results-postgres-webhook.xml
+          python -m pytest -v tests/test_postgres_webhook_concurrency_integration.py --junitxml=test-results-postgres-webhook.xml
+
+      - name: Enforce zero skipped tests in PostgreSQL webhook concurrency JUnit report
+        working-directory: apps/api
+        run: |
+          python - <<'PY'
+          from tests.postgres_test_guard import assert_junit_zero_skips
+
+          tests, skipped, failures, errors = assert_junit_zero_skips(
+              "test-results-postgres-webhook.xml",
+              expected_exact_tests=14,
+              max_age_seconds=1800,
+              require_testcase_elements=True,
+          )
+          print(
+              f"Verified PostgreSQL Webhook Concurrency JUnit gate: tests={tests}, skipped={skipped}, "
+              f"failures={failures}, errors={errors}"
+          )
+          PY
+
       - name: Run Focused Migration, Guard, Billing, and Model Regression Tests
         working-directory: apps/api
         run: |
@@ -256,4 +284,5 @@ jobs:
           path: |
             apps/api/test-results-postgres.xml
             apps/api/test-results-postgres-customer.xml
+            apps/api/test-results-postgres-webhook.xml
             apps/api/test-results-models.xml

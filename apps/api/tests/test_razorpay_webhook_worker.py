@@ -50,8 +50,20 @@ import app.models.conversation  # noqa: F401
 import app.models.generation  # noqa: F401
 import app.models.generation_attempt  # noqa: F401
 import app.models.organization  # noqa: F401
-from app.models.payment import BillingWebhookEvent
-from app.models.subscription import WebhookProcessingStatus
+from app.models.payment import (
+    BillingCheckoutAttempt,
+    BillingCustomerProvision,
+    BillingWebhookEvent,
+    CheckoutAttemptStatus,
+    CustomerProvisionStatus,
+    PaymentReconciliation,
+)
+from app.models.subscription import (
+    ReconciliationStatus,
+    Subscription,
+    SubscriptionStatus,
+    WebhookProcessingStatus,
+)
 from app.services.billing.razorpay.webhook_engine import (
     DEFAULT_LEASE_DURATION_SECONDS,
     MAX_WEBHOOK_ATTEMPTS,
@@ -59,12 +71,15 @@ from app.services.billing.razorpay.webhook_engine import (
     ProcessingOutcome,
     RazorpayWebhookDispatcher,
     RazorpayWebhookPermanentError,
+    RazorpayWebhookReconciliationConflictError,
     RazorpayWebhookRetryableError,
     StaleLeaseError,
     claim_next_razorpay_webhook_event,
+    execute_claimed_razorpay_webhook_event,
     get_retry_backoff_seconds,
     record_razorpay_webhook_outcome,
 )
+from app.services.billing.webhook_errors import sanitize_billing_error_message
 from unittest.mock import AsyncMock, patch
 from app.workers.razorpay_webhook_worker import (
     DEFAULT_BATCH_SIZE,
@@ -90,6 +105,10 @@ class SharedRazorpayEventRepository:
             e.id: deepcopy(e) for e in (events or [])
         }
         self.locked_ids: set[uuid.UUID] = set()
+        self.reconciliations: dict[str, PaymentReconciliation] = {}
+        self.domain_objects: list[Any] = []
+        self.customer_provisions: dict[str, Any] = {}
+        self.checkout_attempts: dict[str, Any] = {}
 
     def get_event(self, event_id: uuid.UUID) -> BillingWebhookEvent | None:
         ev = self.events.get(event_id)
@@ -97,6 +116,50 @@ class SharedRazorpayEventRepository:
 
     def save_event(self, event: BillingWebhookEvent) -> None:
         self.events[event.id] = deepcopy(event)
+
+
+class MockSavepoint:
+    """In-memory savepoint test double supporting nested transactions."""
+
+    def __init__(self, session: "RazorpayWorkerMockDbSession") -> None:
+        self.session = session
+        self.staged_snapshot: dict[uuid.UUID, BillingWebhookEvent] = {}
+        self.domain_snapshot: list[Any] = []
+        self.reconciliation_snapshot: list[PaymentReconciliation] = []
+
+    async def __aenter__(self) -> "MockSavepoint":
+        self.staged_snapshot = deepcopy(self.session.staged_changes)
+        self.domain_snapshot = list(self.session.staged_domain_objects)
+        self.reconciliation_snapshot = list(self.session.staged_reconciliations)
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if exc_type is not None:
+            await self.rollback()
+
+    async def rollback(self) -> None:
+        # Revert attributes of events to preserve object identity in session.staged_changes
+        for eid, snap in self.staged_snapshot.items():
+            if eid in self.session.staged_changes:
+                cur = self.session.staged_changes[eid]
+                cur.status = snap.status
+                cur.attempts = snap.attempts
+                cur.next_retry_at = snap.next_retry_at
+                cur.lease_token = snap.lease_token
+                cur.locked_by = snap.locked_by
+                cur.lease_expires_at = snap.lease_expires_at
+                cur.error_message = snap.error_message
+                cur.quarantined_at = snap.quarantined_at
+                cur.quarantine_reason = snap.quarantine_reason
+        for eid in list(self.session.staged_changes.keys()):
+            if eid not in self.staged_snapshot:
+                del self.session.staged_changes[eid]
+
+        self.session.staged_domain_objects = list(self.domain_snapshot)
+        self.session.staged_reconciliations = list(self.reconciliation_snapshot)
+
+    async def commit(self) -> None:
+        pass
 
 
 class RazorpayWorkerMockDbSession:
@@ -115,12 +178,23 @@ class RazorpayWorkerMockDbSession:
         self.clock_now = clock_now or datetime.now(timezone.utc)
         self.held_locks: set[uuid.UUID] = set()
         self.staged_changes: dict[uuid.UUID, BillingWebhookEvent] = {}
+        self.staged_domain_objects: list[Any] = []
+        self.staged_reconciliations: list[PaymentReconciliation] = []
 
     async def __aenter__(self) -> "RazorpayWorkerMockDbSession":
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         await self.rollback()
+
+    def begin_nested(self) -> MockSavepoint:
+        return MockSavepoint(self)
+
+    def add(self, obj: Any) -> None:
+        self.staged_domain_objects.append(obj)
+
+    async def flush(self) -> None:
+        pass
 
     async def execute(self, statement: Any) -> Any:
         class ScalarResult:
@@ -130,8 +204,80 @@ class RazorpayWorkerMockDbSession:
             def scalar_one_or_none(self) -> Any:
                 return self._item
 
+            def scalar_one(self) -> Any:
+                return self._item
+
+            def scalars(self) -> "ScalarResult":
+                return self
+
+            def all(self) -> list[Any]:
+                return [self._item] if self._item is not None else []
+
+            def first(self) -> Any:
+                return self._item
+
         stmt_str = str(statement)
         now = self.clock_now
+
+        # Reconciliation Upsert query
+        if "payment_reconciliations" in stmt_str:
+            params: dict[str, Any] = {}
+            try:
+                params = statement.compile().params
+            except Exception:
+                pass
+            case_key = params.get("case_key", "default_case_key")
+            reason = params.get("reason", "unknown_conflict")
+            rec_id = params.get("id", uuid.uuid4())
+            existing = self.repo.reconciliations.get(case_key)
+            if existing is not None:
+                existing.updated_at = self.clock_now
+                existing.reason = reason
+                existing.status = ReconciliationStatus.pending_review
+                self.staged_reconciliations.append(existing)
+                return ScalarResult(existing)
+            else:
+                new_rec = PaymentReconciliation(
+                    id=rec_id if isinstance(rec_id, uuid.UUID) else uuid.uuid4(),
+                    provider=params.get("provider", "razorpay"),
+                    merchant_account_id=params.get("merchant_account_id", "default"),
+                    environment=params.get("environment", "test"),
+                    case_key=case_key,
+                    reason=reason,
+                    status=ReconciliationStatus.pending_review,
+                    diagnostic_payload=params.get("diagnostic_payload", {}),
+                    created_at=self.clock_now,
+                    updated_at=self.clock_now,
+                )
+                self.staged_reconciliations.append(new_rec)
+                return ScalarResult(new_rec)
+
+        # Race retry check: BillingCustomerProvision
+        if "billing_customer_provisions" in stmt_str:
+            params = {}
+            try:
+                params = statement.compile().params
+            except Exception:
+                pass
+            cust_id = params.get("provider_customer_id_1")
+            prov = self.repo.customer_provisions.get(cust_id) if cust_id else None
+            return ScalarResult(prov)
+
+        # Race retry check: BillingCheckoutAttempt
+        if "billing_checkout_attempts" in stmt_str:
+            params = {}
+            try:
+                params = statement.compile().params
+            except Exception:
+                pass
+            sub_id = params.get("provider_subscription_id_1")
+            cust_id = params.get("provider_customer_id_1")
+            att = None
+            if sub_id and sub_id in self.repo.checkout_attempts:
+                att = self.repo.checkout_attempts[sub_id]
+            elif cust_id and cust_id in self.repo.checkout_attempts:
+                att = self.repo.checkout_attempts[cust_id]
+            return ScalarResult(att)
 
         # 1. Claim query: SELECT ... FROM billing_webhook_events WHERE ... ORDER BY received_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED
         if "ORDER BY" in stmt_str and "LIMIT" in stmt_str:
@@ -229,6 +375,12 @@ class RazorpayWorkerMockDbSession:
         for eid, modified in self.staged_changes.items():
             self.repo.save_event(modified)
         self.staged_changes.clear()
+        for rec in self.staged_reconciliations:
+            self.repo.reconciliations[rec.case_key] = rec
+        self.staged_reconciliations.clear()
+        for obj in self.staged_domain_objects:
+            self.repo.domain_objects.append(obj)
+        self.staged_domain_objects.clear()
         for lid in list(self.held_locks):
             self.repo.locked_ids.discard(lid)
         self.held_locks.clear()
@@ -236,6 +388,8 @@ class RazorpayWorkerMockDbSession:
     async def rollback(self) -> None:
         """Discard staged changes and release held locks."""
         self.staged_changes.clear()
+        self.staged_reconciliations.clear()
+        self.staged_domain_objects.clear()
         for lid in list(self.held_locks):
             self.repo.locked_ids.discard(lid)
         self.held_locks.clear()
@@ -1026,3 +1180,445 @@ async def test_23_worker_polling_loop_tolerates_transient_exceptions() -> None:
 
     assert call_count >= 2
     assert worker._stop_event.is_set() is True
+
+
+# =============================================================================
+# Mock Worker Transaction Engine & Hardening Tests (MOCK-WRK-01..10)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_mock_wrk_01_atomic_success() -> None:
+    """MOCK-WRK-01: Atomic success commits domain changes and marks event processed in single tx."""
+    now = datetime.now(timezone.utc)
+    event = make_test_event("evt_wrk_01", received_at=now)
+    repo = SharedRazorpayEventRepository([event])
+    dispatcher = RazorpayWebhookDispatcher()
+
+    created_sub = Subscription(
+        id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        provider="razorpay",
+        provider_subscription_id="sub_wrk_01",
+        status=SubscriptionStatus.active,
+    )
+
+    async def success_handler(payload: dict[str, Any], db: Any) -> None:
+        db.add(created_sub)
+
+    dispatcher.register("subscription.charged", success_handler)
+
+    worker = RazorpayWebhookWorker(
+        session_factory=lambda: RazorpayWorkerMockDbSession(repo, clock_now=now),
+        dispatcher=dispatcher,
+        worker_id="worker_wrk_01",
+        clock=lambda: now,
+    )
+
+    result = await worker.process_one()
+    assert result is not None
+    assert result.success is True
+    assert result.status == WebhookProcessingStatus.processed
+    assert result.attempts == 0
+
+    # Domain mutations committed
+    assert created_sub in repo.domain_objects
+
+    # Event committed as processed and lease cleared
+    saved_event = repo.get_event(event.id)
+    assert saved_event is not None
+    assert saved_event.status == WebhookProcessingStatus.processed
+    assert saved_event.lease_token is None
+    assert saved_event.locked_by is None
+    assert saved_event.lease_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_mock_wrk_02_conflict_error_savepoint_rollback_and_reconciliation_upsert() -> None:
+    """MOCK-WRK-02: Conflict error rolls back savepoint, upserts PaymentReconciliation, quarantines event."""
+    now = datetime.now(timezone.utc)
+    event = make_test_event("evt_wrk_02", received_at=now)
+    repo = SharedRazorpayEventRepository([event])
+    dispatcher = RazorpayWebhookDispatcher()
+
+    aborted_sub = Subscription(
+        id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        provider="razorpay",
+        provider_subscription_id="sub_wrk_02",
+        status=SubscriptionStatus.active,
+    )
+
+    async def conflict_handler(payload: dict[str, Any], db: Any) -> None:
+        db.add(aborted_sub)
+        raise RazorpayWebhookReconciliationConflictError(
+            "Metadata tenant mismatch: notes claim org A, but subscription belongs to org B",
+            case_key="metadata_mismatch:sub_wrk_02",
+            reason="metadata_tenant_mismatch",
+            diagnostic_payload={"subscription_id": "sub_wrk_02"},
+        )
+
+    dispatcher.register("subscription.charged", conflict_handler)
+
+    worker = RazorpayWebhookWorker(
+        session_factory=lambda: RazorpayWorkerMockDbSession(repo, clock_now=now),
+        dispatcher=dispatcher,
+        worker_id="worker_wrk_02",
+        clock=lambda: now,
+    )
+
+    result = await worker.process_one()
+    assert result is not None
+    assert result.success is False
+    assert result.status == WebhookProcessingStatus.quarantined
+    assert result.reconciliation_upserted is True
+    assert result.failure_category == "reconciliation_conflict"
+
+    # Domain mutations were rolled back!
+    assert aborted_sub not in repo.domain_objects
+
+    # Reconciliation case was upserted in outer transaction
+    assert "metadata_mismatch:sub_wrk_02" in repo.reconciliations
+    rec = repo.reconciliations["metadata_mismatch:sub_wrk_02"]
+    assert rec.reason == "metadata_tenant_mismatch"
+    assert rec.status == ReconciliationStatus.pending_review
+
+    # Event committed as quarantined and lease cleared
+    saved_event = repo.get_event(event.id)
+    assert saved_event is not None
+    assert saved_event.status == WebhookProcessingStatus.quarantined
+    assert saved_event.lease_token is None
+    assert saved_event.locked_by is None
+
+
+@pytest.mark.asyncio
+async def test_mock_wrk_03_ed02_unbound_customer_race_retry() -> None:
+    """MOCK-WRK-03: ED-02 unbound customer schedules single 2s race retry when in-flight record exists."""
+    now = datetime.now(timezone.utc)
+    event = make_test_event("evt_wrk_03", attempts=0, received_at=now)
+    repo = SharedRazorpayEventRepository([event])
+    dispatcher = RazorpayWebhookDispatcher()
+
+    # Pre-populate qualifying customer provision in repo
+    repo.customer_provisions["cust_racing_123"] = BillingCustomerProvision(
+        id=uuid.uuid4(),
+        provider="razorpay",
+        merchant_account_id=event.merchant_account_id,
+        environment=event.environment,
+        provider_customer_id="cust_racing_123",
+        status=CustomerProvisionStatus.resolved,
+    )
+
+    async def unbound_handler(payload: dict[str, Any], db: Any) -> None:
+        raise RazorpayWebhookReconciliationConflictError(
+            "Unbound customer entity: cust_racing_123",
+            case_key="unbound_entity:cust_racing_123",
+            reason="unbound_provider_customer",
+            diagnostic_payload={"customer_id": "cust_racing_123"},
+        )
+
+    dispatcher.register("subscription.charged", unbound_handler)
+
+    worker = RazorpayWebhookWorker(
+        session_factory=lambda: RazorpayWorkerMockDbSession(repo, clock_now=now),
+        dispatcher=dispatcher,
+        worker_id="worker_wrk_03",
+        clock=lambda: now,
+    )
+
+    result = await worker.process_one()
+    assert result is not None
+    assert result.success is False
+    assert result.status == WebhookProcessingStatus.failed
+    assert result.attempts == 1
+    assert result.failure_category == "concurrent_binding_race"
+
+    # No reconciliation record created during race retry
+    assert len(repo.reconciliations) == 0
+
+    # Event scheduled with 2s delay
+    saved_event = repo.get_event(event.id)
+    assert saved_event is not None
+    assert saved_event.status == WebhookProcessingStatus.failed
+    assert saved_event.attempts == 1
+    assert saved_event.next_retry_at == now + timedelta(seconds=2)
+    assert saved_event.lease_token is None
+
+
+@pytest.mark.asyncio
+async def test_mock_wrk_04_ed01_unexpected_internal_error_savepoint_rollback() -> None:
+    """MOCK-WRK-04: Unexpected internal error rolls back savepoint and schedules exponential retry."""
+    now = datetime.now(timezone.utc)
+    event = make_test_event("evt_wrk_04", attempts=0, received_at=now)
+    repo = SharedRazorpayEventRepository([event])
+    dispatcher = RazorpayWebhookDispatcher()
+
+    aborted_sub = Subscription(
+        id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        provider="razorpay",
+        provider_subscription_id="sub_wrk_04",
+        status=SubscriptionStatus.active,
+    )
+
+    async def faulty_handler(payload: dict[str, Any], db: Any) -> None:
+        db.add(aborted_sub)
+        raise RuntimeError("Unexpected internal crash in domain business logic")
+
+    dispatcher.register("subscription.charged", faulty_handler)
+
+    worker = RazorpayWebhookWorker(
+        session_factory=lambda: RazorpayWorkerMockDbSession(repo, clock_now=now),
+        dispatcher=dispatcher,
+        worker_id="worker_wrk_04",
+        clock=lambda: now,
+    )
+
+    result = await worker.process_one()
+    assert result is not None
+    assert result.success is False
+    assert result.status == WebhookProcessingStatus.failed
+    assert result.attempts == 1
+    assert result.failure_category == "unexpected_internal_error"
+
+    # Domain mutations rolled back
+    assert aborted_sub not in repo.domain_objects
+
+    # Event scheduled with attempt 1 backoff (5 seconds)
+    saved_event = repo.get_event(event.id)
+    assert saved_event is not None
+    assert saved_event.status == WebhookProcessingStatus.failed
+    assert saved_event.attempts == 1
+    assert saved_event.next_retry_at == now + timedelta(seconds=5)
+    assert saved_event.lease_token is None
+
+
+@pytest.mark.asyncio
+async def test_mock_wrk_05_permanent_error_quarantines_without_retry() -> None:
+    """MOCK-WRK-05: Permanent error triggers immediate quarantine on first attempt without retrying."""
+    now = datetime.now(timezone.utc)
+    event = make_test_event("evt_wrk_05", attempts=0, received_at=now)
+    repo = SharedRazorpayEventRepository([event])
+    dispatcher = RazorpayWebhookDispatcher()
+
+    async def perm_handler(payload: dict[str, Any], db: Any) -> None:
+        raise RazorpayWebhookPermanentError("Malformed invoice structure: negative amount")
+
+    dispatcher.register("subscription.charged", perm_handler)
+
+    worker = RazorpayWebhookWorker(
+        session_factory=lambda: RazorpayWorkerMockDbSession(repo, clock_now=now),
+        dispatcher=dispatcher,
+        worker_id="worker_wrk_05",
+        clock=lambda: now,
+    )
+
+    result = await worker.process_one()
+    assert result is not None
+    assert result.success is False
+    assert result.status == WebhookProcessingStatus.quarantined
+    assert result.attempts == 1
+    assert result.failure_category == "permanent_failure"
+
+    saved_event = repo.get_event(event.id)
+    assert saved_event is not None
+    assert saved_event.status == WebhookProcessingStatus.quarantined
+    assert saved_event.next_retry_at is None
+    assert saved_event.lease_token is None
+
+
+@pytest.mark.asyncio
+async def test_mock_wrk_06_unknown_event_type_quarantines() -> None:
+    """MOCK-WRK-06: Unregistered event type immediately quarantines without attempting retry."""
+    now = datetime.now(timezone.utc)
+    event = make_test_event("evt_wrk_06", event_type="unregistered.custom.event", received_at=now)
+    repo = SharedRazorpayEventRepository([event])
+    dispatcher = RazorpayWebhookDispatcher()  # Empty dispatcher
+
+    worker = RazorpayWebhookWorker(
+        session_factory=lambda: RazorpayWorkerMockDbSession(repo, clock_now=now),
+        dispatcher=dispatcher,
+        worker_id="worker_wrk_06",
+        clock=lambda: now,
+    )
+
+    result = await worker.process_one()
+    assert result is not None
+    assert result.success is False
+    assert result.status == WebhookProcessingStatus.quarantined
+    assert result.failure_category == "unknown_event"
+
+    saved_event = repo.get_event(event.id)
+    assert saved_event is not None
+    assert saved_event.status == WebhookProcessingStatus.quarantined
+    assert saved_event.next_retry_at is None
+    assert saved_event.lease_token is None
+
+
+@pytest.mark.asyncio
+async def test_mock_wrk_07_ed05_cancelled_error_propagation() -> None:
+    """MOCK-WRK-07: ED-05 CancelledError rolls back transaction without outcome writes and propagates."""
+    now = datetime.now(timezone.utc)
+    event = make_test_event("evt_wrk_07", attempts=0, received_at=now)
+    repo = SharedRazorpayEventRepository([event])
+    dispatcher = RazorpayWebhookDispatcher()
+
+    async def cancelling_handler(payload: dict[str, Any], db: Any) -> None:
+        raise asyncio.CancelledError("Worker cancelled externally")
+
+    dispatcher.register("subscription.charged", cancelling_handler)
+
+    worker = RazorpayWebhookWorker(
+        session_factory=lambda: RazorpayWorkerMockDbSession(repo, clock_now=now),
+        dispatcher=dispatcher,
+        worker_id="worker_wrk_07",
+        clock=lambda: now,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker.process_one()
+
+    # Verify event was NOT updated with failure or attempts
+    saved_event = repo.get_event(event.id)
+    assert saved_event is not None
+    assert saved_event.status == WebhookProcessingStatus.pending
+    assert saved_event.attempts == 0
+    # Lease token remains intact for automatic recovery after expiry
+    assert saved_event.lease_token is not None
+
+
+@pytest.mark.asyncio
+async def test_mock_wrk_08_ed06_logging_sanitization(caplog: pytest.LogCaptureFixture) -> None:
+    """MOCK-WRK-08: ED-06 error messages are sanitized before database persistence and logging."""
+    now = datetime.now(timezone.utc)
+    event = make_test_event("evt_wrk_08", attempts=0, received_at=now)
+    repo = SharedRazorpayEventRepository([event])
+    dispatcher = RazorpayWebhookDispatcher()
+
+    async def leaky_handler(payload: dict[str, Any], db: Any) -> None:
+        raise RuntimeError(
+            "API failure with key_secret=mySuperSecret999 and webhook_secret=whsec_TopSecret123"
+        )
+
+    dispatcher.register("subscription.charged", leaky_handler)
+
+    worker = RazorpayWebhookWorker(
+        session_factory=lambda: RazorpayWorkerMockDbSession(repo, clock_now=now),
+        dispatcher=dispatcher,
+        worker_id="worker_wrk_08",
+        clock=lambda: now,
+    )
+
+    with caplog.at_level("WARNING"):
+        result = await worker.process_one()
+
+    assert result is not None
+    assert result.success is False
+
+    # Check database persisted error message
+    saved_event = repo.get_event(event.id)
+    assert saved_event is not None
+    assert "mySuperSecret999" not in (saved_event.error_message or "")
+    assert "whsec_TopSecret123" not in (saved_event.error_message or "")
+    assert "[REDACTED]" in (saved_event.error_message or "")
+
+    # Check captured logs
+    for record in caplog.records:
+        assert "mySuperSecret999" not in record.message
+        assert "whsec_TopSecret123" not in record.message
+
+
+@pytest.mark.asyncio
+async def test_mock_wrk_09_stale_lease_rejection() -> None:
+    """MOCK-WRK-09: Stale worker loses lease before execution; rejected without mutations."""
+    now = datetime.now(timezone.utc)
+    worker_1_token = uuid.uuid4()
+    worker_2_token = uuid.uuid4()
+
+    # Event in repo already superseded by worker_2
+    event = make_test_event(
+        "evt_wrk_09",
+        lease_token=worker_2_token,
+        locked_by="worker_2",
+        lease_expires_at=now + timedelta(seconds=60),
+    )
+    repo = SharedRazorpayEventRepository([event])
+
+    stale_claim = ClaimedWebhookEvent(
+        event_id=event.id,
+        provider=event.provider,
+        merchant_account_id=event.merchant_account_id,
+        environment=event.environment,
+        provider_event_id=event.provider_event_id,
+        event_type=event.event_type,
+        payload={},
+        attempts=0,
+        lease_token=worker_1_token,  # Stale token
+        locked_by="worker_1",
+        lease_expires_at=now - timedelta(seconds=10),
+        received_at=event.received_at,
+    )
+
+    async def dummy_handler(payload: dict[str, Any], db: Any) -> None:
+        pass
+
+    result = await execute_claimed_razorpay_webhook_event(
+        session_factory=lambda: RazorpayWorkerMockDbSession(repo, clock_now=now),
+        claimed=stale_claim,
+        handler=dummy_handler,
+        now_fn=lambda: now,
+    )
+
+    assert result.success is False
+    assert result.lease_lost is True
+    assert result.failure_category == "stale_lease"
+
+    # DB state unchanged
+    persisted = repo.get_event(event.id)
+    assert persisted is not None
+    assert persisted.lease_token == worker_2_token
+    assert persisted.locked_by == "worker_2"
+
+
+@pytest.mark.asyncio
+async def test_mock_wrk_10_commit_failure_fallback_handling() -> None:
+    """MOCK-WRK-10: Commit failure triggers fenced fallback transaction to record failure."""
+    now = datetime.now(timezone.utc)
+    event = make_test_event("evt_wrk_10", attempts=0, received_at=now)
+    repo = SharedRazorpayEventRepository([event])
+    dispatcher = RazorpayWebhookDispatcher()
+
+    async def simple_handler(payload: dict[str, Any], db: Any) -> None:
+        pass
+
+    dispatcher.register("subscription.charged", simple_handler)
+
+    commit_count = 0
+
+    class FailingCommitMockDbSession(RazorpayWorkerMockDbSession):
+        async def commit(self) -> None:
+            nonlocal commit_count
+            commit_count += 1
+            if commit_count == 2:
+                raise RuntimeError("PostgreSQL connection severed during outer commit")
+            await super().commit()
+
+    worker = RazorpayWebhookWorker(
+        session_factory=lambda: FailingCommitMockDbSession(repo, clock_now=now),
+        dispatcher=dispatcher,
+        worker_id="worker_wrk_10",
+        clock=lambda: now,
+    )
+
+    result = await worker.process_one()
+    assert result is not None
+    assert result.success is False
+    assert result.status == WebhookProcessingStatus.failed
+    assert result.failure_category == "commit_failure"
+    assert result.attempts == 1
+
+    saved_event = repo.get_event(event.id)
+    assert saved_event is not None
+    assert saved_event.status == WebhookProcessingStatus.failed
+    assert saved_event.attempts == 1
+    assert "connection severed" in (saved_event.error_message or "").lower()
