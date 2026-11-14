@@ -118,10 +118,10 @@ from app.services.billing.razorpay.webhook_engine import (
     ProcessingOutcome,
     RazorpayWebhookReconciliationConflictError,
     StaleLeaseError,
-    assert_and_refresh_webhook_lease,
     claim_next_razorpay_webhook_event,
     default_razorpay_dispatcher,
     execute_claimed_razorpay_webhook_event,
+    record_razorpay_webhook_outcome,
 )
 from tests.postgres_test_guard import (
     PostgresTestConfigError,
@@ -920,10 +920,10 @@ async def test_pg16_d04a_03_stale_worker_fenced_after_lease_loss(pg: Pg16Webhook
     assert result.lease_lost is True
     assert result.failure_category == "stale_lease"
 
-    # Verify second fencing path: assert_and_refresh_webhook_lease raises StaleLeaseError without MissingGreenlet
+    # Verify second fencing path: record_razorpay_webhook_outcome raises StaleLeaseError without MissingGreenlet
     async with pg.session_factory() as db_fencing:
         with pytest.raises(StaleLeaseError):
-            await assert_and_refresh_webhook_lease(
+            await record_razorpay_webhook_outcome(
                 db=db_fencing,
                 claimed=claimed1,
                 outcome=ProcessingOutcome.SUCCESS,
