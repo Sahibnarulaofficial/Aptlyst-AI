@@ -115,7 +115,10 @@ from app.services.billing.razorpay.lock import (
 from app.services.billing.razorpay.webhook_engine import (
     ClaimedWebhookEvent,
     ProcessResult,
+    ProcessingOutcome,
     RazorpayWebhookReconciliationConflictError,
+    StaleLeaseError,
+    assert_and_refresh_webhook_lease,
     claim_next_razorpay_webhook_event,
     default_razorpay_dispatcher,
     execute_claimed_razorpay_webhook_event,
@@ -289,6 +292,7 @@ class Pg16WebhookHarness:
             merchant_account_id="default",
             environment="test",
             provider_subscription_id=sub_id_str,
+            provider_customer_id=f"cust_pg16_{uuid.uuid4().hex[:8]}",
             status=status,
             plan_tier="pro",
             current_period_start=now,
@@ -916,7 +920,16 @@ async def test_pg16_d04a_03_stale_worker_fenced_after_lease_loss(pg: Pg16Webhook
     assert result.lease_lost is True
     assert result.failure_category == "stale_lease"
 
-    # Verify event row in DB preserves Worker 2's lease
+    # Verify second fencing path: assert_and_refresh_webhook_lease raises StaleLeaseError without MissingGreenlet
+    async with pg.session_factory() as db_fencing:
+        with pytest.raises(StaleLeaseError):
+            await assert_and_refresh_webhook_lease(
+                db=db_fencing,
+                claimed=claimed1,
+                outcome=ProcessingOutcome.SUCCESS,
+            )
+
+    # Verify event row in DB preserves Worker 2's lease and no accidental modifications occurred
     async with pg.session_factory() as verify_db:
         res = await verify_db.execute(
             select(BillingWebhookEvent).where(BillingWebhookEvent.id == event.id)
@@ -924,6 +937,7 @@ async def test_pg16_d04a_03_stale_worker_fenced_after_lease_loss(pg: Pg16Webhook
         evt = res.scalar_one()
         assert evt.locked_by == "worker_2"
         assert evt.lease_token == new_token
+        assert evt.status == WebhookProcessingStatus.pending
 
 
 @_SKIP_IF_OPTIONAL_POSTGRES
@@ -1138,9 +1152,10 @@ async def test_pg16_d04a_04_concurrent_quota_reservation_and_settlement_stress(p
     # Concurrent settlement of successful reservations
     async def settle_task(res: ReservationResult):
         async with pg.session_factory() as db:
+            assert res.reservation is not None
             return await settle_reservation(
                 session=db,
-                reservation_id=res.reservation_id,
+                reservation_id=res.reservation.id,
                 organization_id=org.id,
                 actual_tokens=500,
                 actual_cost_micros=2_500,
@@ -1194,11 +1209,12 @@ async def test_pg16_d04a_04_double_settlement_prevention(pg: Pg16WebhookHarness)
     assert res.success is True
 
     # Concurrent settlement of the exact same reservation with different usage amounts
+    assert res.reservation is not None
     async def try_settle(tokens: int, micros: int):
         async with pg.session_factory() as db:
             return await settle_reservation(
                 session=db,
-                reservation_id=res.reservation_id,
+                reservation_id=res.reservation.id,
                 organization_id=org.id,
                 actual_tokens=tokens,
                 actual_cost_micros=micros,
@@ -1345,6 +1361,10 @@ async def test_pg16_d04a_05_native_on_conflict_do_update_reconciliation_with_jso
         assert final_rec.status == ReconciliationStatus.pending_review
         assert final_rec.reason == "Second conflict reopening case"
         # JSONB history append verified
-        history = final_rec.diagnostic_payload.get("history", [])
+        diag_payload = final_rec.diagnostic_payload
+        if isinstance(diag_payload, str):
+            import json
+            diag_payload = json.loads(diag_payload)
+        history = diag_payload.get("history", [])
         assert len(history) == 2
-        assert final_rec.diagnostic_payload.get("latest", {}).get("code") == "ERR_2"
+        assert diag_payload.get("latest", {}).get("code") == "ERR_2"

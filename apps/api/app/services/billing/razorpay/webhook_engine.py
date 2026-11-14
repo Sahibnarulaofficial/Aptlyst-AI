@@ -686,15 +686,18 @@ async def record_razorpay_webhook_outcome(
     is_unexpired = event.lease_expires_at is not None and event.lease_expires_at >= now_utc
 
     if not (is_same_token and is_same_worker and is_unexpired):
+        db_token = event.lease_token
+        db_locked_by = event.locked_by
+        db_expires_at = event.lease_expires_at
         await db.rollback()
         logger.warning(
             "Fencing violation: worker %s lost lease on event %s (db_token=%s, held_token=%s, db_locked_by=%s, db_expires_at=%s, now=%s)",
             claimed.locked_by,
             claimed.event_id,
-            event.lease_token,
+            db_token,
             claimed.lease_token,
-            event.locked_by,
-            event.lease_expires_at,
+            db_locked_by,
+            db_expires_at,
             now_utc,
         )
         raise StaleLeaseError(
@@ -974,15 +977,20 @@ async def execute_claimed_razorpay_webhook_event(
         is_unexpired = event.lease_expires_at is not None and event.lease_expires_at >= now
 
         if not (is_same_token and is_same_worker and is_unexpired):
+            db_token = event.lease_token
+            db_locked_by = event.locked_by
+            db_expires_at = event.lease_expires_at
+            event_status = event.status
+            event_attempts = event.attempts
             await work_db.rollback()
             logger.warning(
                 "Fencing violation: worker %s lost lease on event %s (db_token=%s, held_token=%s, db_locked_by=%s, db_expires_at=%s, now=%s)",
                 claimed.locked_by,
                 claimed.event_id,
-                event.lease_token,
+                db_token,
                 claimed.lease_token,
-                event.locked_by,
-                event.lease_expires_at,
+                db_locked_by,
+                db_expires_at,
                 now,
                 extra={
                     "worker_id": claimed.locked_by,
@@ -993,10 +1001,10 @@ async def execute_claimed_razorpay_webhook_event(
             )
             return ProcessResult(
                 success=False,
-                status=event.status,
+                status=event_status,
                 event_id=claimed.event_id,
                 provider_event_id=claimed.provider_event_id,
-                attempts=event.attempts,
+                attempts=event_attempts,
                 message=f"Worker '{claimed.locked_by}' lost lease ownership for event {claimed.event_id}.",
                 lease_lost=True,
                 failure_category="stale_lease",
