@@ -61,6 +61,7 @@ from app.services.billing.razorpay.handler_base import (
     parse_positive_unix_timestamp,
     resolve_tenant_organization,
     stage_or_update_payment_reconciliation,
+    upsert_payment_reconciliation,
     validate_razorpay_event_envelope,
 )
 from app.services.billing.razorpay.webhook_engine import (
@@ -100,6 +101,7 @@ async def handle_subscription_authenticated(
             event_id=ctx.event_id,
             expected_lease_token=ctx.lease_token,
             expected_worker_id=ctx.locked_by,
+            now=ctx.worker_now,
         )
 
     # 2. Level 0 Advisory Lock on provider subscription identity
@@ -125,6 +127,7 @@ async def handle_subscription_authenticated(
             Subscription.environment == ctx.environment,
             Subscription.provider_subscription_id == sub_id,
         )
+        .execution_options(populate_existing=True)
         .with_for_update()
     )
     res_sub = await db.execute(stmt_sub)
@@ -207,6 +210,7 @@ async def handle_subscription_authenticated(
             BillingCheckoutAttempt.environment == ctx.environment,
             BillingCheckoutAttempt.provider_subscription_id == sub_id,
         )
+        .execution_options(populate_existing=True)
         .with_for_update()
     )
     res_attempt = await db.execute(stmt_attempt)
@@ -218,34 +222,18 @@ async def handle_subscription_authenticated(
             sub_id,
             len(attempts),
         )
-        await stage_or_update_payment_reconciliation(
-            db=db,
-            provider="razorpay",
-            merchant_account_id=ctx.merchant_account_id,
-            environment=ctx.environment,
-            case_key=f"ambiguous_checkout_attempt:{sub_id}",
-            reason="ambiguous_checkout_attempt",
-            organization_id=org_id,
-            subscription_id=sub.id if sub is not None else None,
-            raw_event_id=ctx.event_id,
-            diagnostic_data={
-                "provider_subscription_id": sub_id,
-                "attempt_count": len(attempts),
-                "attempt_ids": [str(a.id) for a in attempts],
-                "organization_id": str(org_id),
-                "event_id": str(ctx.event_id) if ctx.event_id else None,
-            },
-            now=ctx.event_created_at,
-        )
         raise RazorpayWebhookReconciliationConflictError(
             f"Multiple checkout attempts found for subscription {sub_id} ({len(attempts)} attempts).",
             case_key=f"ambiguous_checkout_attempt:{sub_id}",
             reason="ambiguous_checkout_attempt",
             organization_id=org_id,
+            raw_event_id=ctx.event_id,
             diagnostic_payload={
                 "provider_subscription_id": sub_id,
                 "attempt_count": len(attempts),
                 "attempt_ids": [str(a.id) for a in attempts],
+                "organization_id": str(org_id),
+                "event_id": str(ctx.event_id) if ctx.event_id else None,
             },
         )
     elif len(attempts) == 0:
@@ -253,7 +241,7 @@ async def handle_subscription_authenticated(
             "No BillingCheckoutAttempt found for subscription %s; staging reconciliation case.",
             sub_id,
         )
-        await stage_or_update_payment_reconciliation(
+        await upsert_payment_reconciliation(
             db=db,
             provider="razorpay",
             merchant_account_id=ctx.merchant_account_id,
@@ -282,34 +270,18 @@ async def handle_subscription_authenticated(
                 attempt.organization_id,
                 org_id,
             )
-            await stage_or_update_payment_reconciliation(
-                db=db,
-                provider="razorpay",
-                merchant_account_id=ctx.merchant_account_id,
-                environment=ctx.environment,
-                case_key=f"checkout_attempt_tenant_mismatch:{attempt.id}:{org_id}",
-                reason="checkout_attempt_tenant_mismatch",
-                organization_id=org_id,
-                subscription_id=sub.id if sub is not None else None,
-                raw_event_id=ctx.event_id,
-                diagnostic_data={
-                    "attempt_id": str(attempt.id),
-                    "attempt_organization_id": str(attempt.organization_id),
-                    "authoritative_organization_id": str(org_id),
-                    "provider_subscription_id": sub_id,
-                },
-                now=ctx.event_created_at,
-            )
             raise RazorpayWebhookReconciliationConflictError(
                 f"Checkout attempt {attempt.id} belongs to organization {attempt.organization_id}, "
                 f"which conflicts with authoritative organization {org_id}.",
                 case_key=f"checkout_attempt_tenant_mismatch:{attempt.id}:{org_id}",
                 reason="checkout_attempt_tenant_mismatch",
                 organization_id=org_id,
+                raw_event_id=ctx.event_id,
                 diagnostic_payload={
                     "attempt_id": str(attempt.id),
                     "attempt_organization_id": str(attempt.organization_id),
                     "authoritative_organization_id": str(org_id),
+                    "provider_subscription_id": sub_id,
                 },
             )
 
@@ -356,6 +328,7 @@ async def handle_subscription_activated(
             event_id=ctx.event_id,
             expected_lease_token=ctx.lease_token,
             expected_worker_id=ctx.locked_by,
+            now=ctx.worker_now,
         )
 
     # 2. Level 0 Advisory Lock
@@ -381,6 +354,7 @@ async def handle_subscription_activated(
             Subscription.environment == ctx.environment,
             Subscription.provider_subscription_id == sub_id,
         )
+        .execution_options(populate_existing=True)
         .with_for_update()
     )
     res_sub = await db.execute(stmt_sub)
@@ -476,6 +450,7 @@ async def handle_subscription_activated(
             BillingCheckoutAttempt.environment == ctx.environment,
             BillingCheckoutAttempt.provider_subscription_id == sub_id,
         )
+        .execution_options(populate_existing=True)
         .with_for_update()
     )
     res_attempt = await db.execute(stmt_attempt)
@@ -487,34 +462,18 @@ async def handle_subscription_activated(
             sub_id,
             len(attempts),
         )
-        await stage_or_update_payment_reconciliation(
-            db=db,
-            provider="razorpay",
-            merchant_account_id=ctx.merchant_account_id,
-            environment=ctx.environment,
-            case_key=f"ambiguous_checkout_attempt:{sub_id}",
-            reason="ambiguous_checkout_attempt",
-            organization_id=org_id,
-            subscription_id=sub.id if sub is not None else None,
-            raw_event_id=ctx.event_id,
-            diagnostic_data={
-                "provider_subscription_id": sub_id,
-                "attempt_count": len(attempts),
-                "attempt_ids": [str(a.id) for a in attempts],
-                "organization_id": str(org_id),
-                "event_id": str(ctx.event_id) if ctx.event_id else None,
-            },
-            now=ctx.event_created_at,
-        )
         raise RazorpayWebhookReconciliationConflictError(
             f"Multiple checkout attempts found for subscription {sub_id} ({len(attempts)} attempts).",
             case_key=f"ambiguous_checkout_attempt:{sub_id}",
             reason="ambiguous_checkout_attempt",
             organization_id=org_id,
+            raw_event_id=ctx.event_id,
             diagnostic_payload={
                 "provider_subscription_id": sub_id,
                 "attempt_count": len(attempts),
                 "attempt_ids": [str(a.id) for a in attempts],
+                "organization_id": str(org_id),
+                "event_id": str(ctx.event_id) if ctx.event_id else None,
             },
         )
     elif len(attempts) == 1:
@@ -526,34 +485,18 @@ async def handle_subscription_activated(
                 attempt.organization_id,
                 org_id,
             )
-            await stage_or_update_payment_reconciliation(
-                db=db,
-                provider="razorpay",
-                merchant_account_id=ctx.merchant_account_id,
-                environment=ctx.environment,
-                case_key=f"checkout_attempt_tenant_mismatch:{attempt.id}:{org_id}",
-                reason="checkout_attempt_tenant_mismatch",
-                organization_id=org_id,
-                subscription_id=sub.id if sub is not None else None,
-                raw_event_id=ctx.event_id,
-                diagnostic_data={
-                    "attempt_id": str(attempt.id),
-                    "attempt_organization_id": str(attempt.organization_id),
-                    "authoritative_organization_id": str(org_id),
-                    "provider_subscription_id": sub_id,
-                },
-                now=ctx.event_created_at,
-            )
             raise RazorpayWebhookReconciliationConflictError(
                 f"Checkout attempt {attempt.id} belongs to organization {attempt.organization_id}, "
                 f"which conflicts with authoritative organization {org_id}.",
                 case_key=f"checkout_attempt_tenant_mismatch:{attempt.id}:{org_id}",
                 reason="checkout_attempt_tenant_mismatch",
                 organization_id=org_id,
+                raw_event_id=ctx.event_id,
                 diagnostic_payload={
                     "attempt_id": str(attempt.id),
                     "attempt_organization_id": str(attempt.organization_id),
                     "authoritative_organization_id": str(org_id),
+                    "provider_subscription_id": sub_id,
                 },
             )
 
@@ -595,6 +538,7 @@ async def handle_subscription_updated(
             event_id=ctx.event_id,
             expected_lease_token=ctx.lease_token,
             expected_worker_id=ctx.locked_by,
+            now=ctx.worker_now,
         )
 
     # 2. Level 0 Advisory Lock
@@ -620,6 +564,7 @@ async def handle_subscription_updated(
             Subscription.environment == ctx.environment,
             Subscription.provider_subscription_id == sub_id,
         )
+        .execution_options(populate_existing=True)
         .with_for_update()
     )
     res_sub = await db.execute(stmt_sub)
@@ -630,7 +575,7 @@ async def handle_subscription_updated(
             "Subscription %s not found during subscription.updated; staging reconciliation.",
             sub_id,
         )
-        await stage_or_update_payment_reconciliation(
+        await upsert_payment_reconciliation(
             db=db,
             case_key=f"unknown_sub_updated:{sub_id}",
             reason="unknown_subscription_updated",
@@ -638,10 +583,16 @@ async def handle_subscription_updated(
             merchant_account_id=ctx.merchant_account_id,
             environment=ctx.environment,
             organization_id=org_id,
+            subscription_id=None,
             raw_event_id=ctx.event_id,
             diagnostic_data={
                 "provider_subscription_id": sub_id,
-                "payload": ctx.raw_payload,
+                "provider_plan_id": sub_entity.plan_id,
+                "provider_customer_id": sub_entity.customer_id,
+                "subscription_status": sub_entity.status,
+                "organization_id": str(org_id) if org_id else None,
+                "event_type": "subscription.updated",
+                "provider_event_id": ctx.provider_event_id,
             },
             now=ctx.event_created_at,
         )
@@ -719,6 +670,7 @@ async def handle_subscription_completed(
             event_id=ctx.event_id,
             expected_lease_token=ctx.lease_token,
             expected_worker_id=ctx.locked_by,
+            now=ctx.worker_now,
         )
 
     # 2. Level 0 Advisory Lock
@@ -743,6 +695,7 @@ async def handle_subscription_completed(
             Subscription.environment == ctx.environment,
             Subscription.provider_subscription_id == sub_id,
         )
+        .execution_options(populate_existing=True)
         .with_for_update()
     )
     res_sub = await db.execute(stmt_sub)
@@ -753,7 +706,7 @@ async def handle_subscription_completed(
             "Subscription %s not found during subscription.completed; staging reconciliation.",
             sub_id,
         )
-        await stage_or_update_payment_reconciliation(
+        await upsert_payment_reconciliation(
             db=db,
             case_key=f"unknown_sub_completed:{sub_id}",
             reason="unknown_subscription_completed",
@@ -761,10 +714,13 @@ async def handle_subscription_completed(
             merchant_account_id=ctx.merchant_account_id,
             environment=ctx.environment,
             organization_id=org_id,
+            subscription_id=None,
             raw_event_id=ctx.event_id,
             diagnostic_data={
                 "provider_subscription_id": sub_id,
-                "payload": ctx.raw_payload,
+                "organization_id": str(org_id) if org_id else None,
+                "event_type": "subscription.completed",
+                "provider_event_id": ctx.provider_event_id,
             },
             now=ctx.event_created_at,
         )

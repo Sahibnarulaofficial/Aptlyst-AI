@@ -99,7 +99,31 @@ from app.services.billing.razorpay.lock import (
 )
 from app.services.billing.razorpay.webhook_engine import (
     ClaimedWebhookEvent,
+    RazorpayDatabasePermanentError,
+    RazorpayDatabaseRetryableError,
+    RazorpayProviderPermanentError,
+    RazorpayProviderTransientError,
+    RazorpayTransientRaceRetryError,
+    RazorpayUnknownEventError,
+    RazorpayUnverifiedEventError,
     StaleLeaseError,
+    classify_client_error,
+)
+import app.services.billing.razorpay as rp
+from app.services.billing.razorpay import webhook_engine as rzp_we
+from app.services.billing.webhook_errors import (
+    BillingWebhookError,
+    BillingWebhookPermanentError,
+    BillingWebhookRetryableError,
+)
+from app.services.billing.razorpay.client import (
+    RazorpayAPIError,
+    RazorpayAuthError,
+    RazorpayBillingDisabledError,
+    RazorpayConfigurationError,
+    RazorpayNetworkError,
+    RazorpayRateLimitError,
+    RazorpayServer5xxError,
 )
 
 
@@ -477,6 +501,72 @@ def test_error_hierarchy_distinguishes_failure_categories() -> None:
     assert conflict.reason == "unbound_provider_customer"
 
 
+def test_unit_exc_01_root_identity_and_alias_parity() -> None:
+    """UNIT-EXC-01: Verifies handler_base.RazorpayWebhookPermanentError is webhook_engine.RazorpayWebhookPermanentError."""
+    assert RazorpayWebhookHandlerError is rzp_we.RazorpayWebhookEngineError
+    assert RazorpayWebhookPermanentError is rzp_we.RazorpayWebhookPermanentError
+    assert RazorpayWebhookRetryableError is rzp_we.RazorpayWebhookRetryableError
+    assert RazorpayPayloadValidationError is rzp_we.RazorpayPayloadValidationError
+    assert RazorpayWebhookReconciliationConflictError is rzp_we.RazorpayWebhookReconciliationConflictError
+    assert issubclass(RazorpayWebhookHandlerError, BillingWebhookError)
+    assert issubclass(rzp_we.RazorpayWebhookEngineError, BillingWebhookError)
+
+
+def test_unit_exc_02_canonical_subclass_hierarchy() -> None:
+    """UNIT-EXC-02: Verifies issubclass(razorpay.RazorpayPayloadValidationError, razorpay.RazorpayWebhookPermanentError) is True,
+
+    and StaleLeaseError is excluded from both Permanent and Retryable hierarchies.
+    """
+    assert issubclass(rp.RazorpayPayloadValidationError, rp.RazorpayWebhookPermanentError)
+    assert issubclass(rp.RazorpayMissingEntityIdError, rp.RazorpayWebhookPermanentError)
+    assert issubclass(rp.RazorpayScopeMismatchError, rp.RazorpayWebhookPermanentError)
+    assert issubclass(rp.RazorpayUnverifiedEventError, rp.RazorpayWebhookPermanentError)
+    assert issubclass(rp.RazorpayUnknownEventError, rp.RazorpayWebhookPermanentError)
+    assert issubclass(rp.RazorpayBusinessRejectionError, rp.RazorpayWebhookPermanentError)
+    assert issubclass(rp.RazorpayDatabasePermanentError, rp.RazorpayWebhookPermanentError)
+    assert issubclass(rp.RazorpayProviderPermanentError, rp.RazorpayWebhookPermanentError)
+    assert issubclass(rp.RazorpayWebhookReconciliationConflictError, rp.RazorpayWebhookPermanentError)
+
+    assert issubclass(rp.RazorpayDatabaseRetryableError, rp.RazorpayWebhookRetryableError)
+    assert issubclass(rp.RazorpayProviderTransientError, rp.RazorpayWebhookRetryableError)
+    assert issubclass(rp.RazorpayTransientRaceRetryError, rp.RazorpayWebhookRetryableError)
+
+    # StaleLeaseError excluded from both Retryable and Permanent
+    assert not issubclass(StaleLeaseError, RazorpayWebhookRetryableError)
+    assert not issubclass(StaleLeaseError, RazorpayWebhookPermanentError)
+    assert not issubclass(StaleLeaseError, BillingWebhookRetryableError)
+    assert not issubclass(StaleLeaseError, BillingWebhookPermanentError)
+    assert issubclass(StaleLeaseError, rzp_we.RazorpayWebhookEngineError)
+
+
+def test_unit_api_01_client_error_classification() -> None:
+    """UNIT-API-01: Verifies all RazorpayClientError -> ProviderPermanent / ProviderTransient mappings."""
+    # 429 Rate Limit -> Transient
+    assert isinstance(classify_client_error(RazorpayRateLimitError("429")), RazorpayProviderTransientError)
+
+    # 5xx Server Error -> Transient
+    assert isinstance(classify_client_error(RazorpayServer5xxError("500", status_code=500)), RazorpayProviderTransientError)
+
+    # Pre-dispatch network error -> Transient
+    assert isinstance(classify_client_error(RazorpayNetworkError("timeout", is_pre_dispatch=True)), RazorpayProviderTransientError)
+
+    # Post-dispatch network error -> Permanent
+    assert isinstance(classify_client_error(RazorpayNetworkError("timeout", is_pre_dispatch=False)), RazorpayProviderPermanentError)
+
+    # Auth error (401) -> Permanent
+    assert isinstance(classify_client_error(RazorpayAuthError("401")), RazorpayProviderPermanentError)
+
+    # Billing disabled / Config -> Permanent
+    assert isinstance(classify_client_error(RazorpayBillingDisabledError("disabled")), RazorpayProviderPermanentError)
+    assert isinstance(classify_client_error(RazorpayConfigurationError("bad config")), RazorpayProviderPermanentError)
+
+    # 4xx API Errors -> Permanent
+    assert isinstance(classify_client_error(RazorpayAPIError("400", status_code=400)), RazorpayProviderPermanentError)
+    assert isinstance(classify_client_error(RazorpayAPIError("404", status_code=404)), RazorpayProviderPermanentError)
+    assert isinstance(classify_client_error(RazorpayAPIError("422", status_code=422)), RazorpayProviderPermanentError)
+
+
+
 # =============================================================================
 # 5. Authoritative Tenant Resolution & Anti-Spoofing Tests
 # =============================================================================
@@ -560,6 +650,8 @@ async def test_resolve_tenant_organization_refuses_fake_binding_for_unbound_cust
             notes={"organization_id": str(client_claimed_org_id)},
         )
     assert exc_info.value.reason == "unbound_provider_customer"
+    assert exc_info.value.organization_id is None
+    assert exc_info.value.diagnostic_payload["notes_claimed_organization_id"] == str(client_claimed_org_id)
 
 
 # =============================================================================
@@ -849,4 +941,101 @@ async def test_composite_payload_parses_all_entities() -> None:
     assert ctx.invoice is not None
     assert ctx.invoice.id == "inv_comp_003"
     assert ctx.invoice.amount_paid == 290000
+
+
+# =============================================================================
+# 13. PaymentReconciliation Atomic PostgreSQL Upsert Tests (Stage 3)
+# =============================================================================
+
+
+def test_unit_rec_01_postgresql_upsert_statement_ast_and_compilation() -> None:
+    """UNIT-REC-01: Verify PostgreSQL AST compilation of build_payment_reconciliation_upsert_stmt.
+
+    Guarantees:
+    - Compiles under sqlalchemy.dialects.postgresql.dialect().
+    - Uses native PostgreSQL ON CONFLICT ON CONSTRAINT uq_payment_reconciliations_case_key DO UPDATE.
+    - Status reopening CASE expression transitions resolved_refunded/resolved_ignored to pending_review.
+    - Foreign keys are preserved via COALESCE(payment_reconciliations.<col>, excluded.<col>).
+    - Diagnostic payload uses JSONB array concatenation (||) and jsonb_build_object.
+    - Diagnostic data undergoes strict secret sanitization before query building.
+    - Statement includes RETURNING clause for atomic return of updated row.
+    """
+    from sqlalchemy.dialects.postgresql import dialect as pg_dialect
+    from app.services.billing.razorpay.handler_base import build_payment_reconciliation_upsert_stmt
+
+    org_id = uuid.uuid4()
+    sub_id = uuid.uuid4()
+    event_id = uuid.uuid4()
+    test_now = datetime(2026, 11, 14, 12, 0, tzinfo=timezone.utc)
+
+    # Diagnostic data containing sensitive values that MUST be sanitized
+    raw_diagnostic = {
+        "provider_subscription_id": "sub_test_001",
+        "api_secret": "mySuperSecret123",
+        "notes": "authorization failed with key rzp_live_secret999",
+        "attempt_count": 2,
+    }
+
+    stmt = build_payment_reconciliation_upsert_stmt(
+        case_key="ambiguous_checkout_attempt:sub_test_001",
+        reason="ambiguous_checkout_attempt",
+        provider="razorpay",
+        merchant_account_id="acc_test_merchant",
+        environment="live",
+        organization_id=org_id,
+        subscription_id=sub_id,
+        raw_event_id=event_id,
+        diagnostic_data=raw_diagnostic,
+        now=test_now,
+    )
+
+    compiled = stmt.compile(dialect=pg_dialect())
+    sql_str = str(compiled)
+
+    # 1. Target table and columns
+    assert "INSERT INTO payment_reconciliations" in sql_str
+
+    # 2. Native ON CONFLICT ON CONSTRAINT uq_payment_reconciliations_case_key DO UPDATE SET
+    assert "ON CONFLICT ON CONSTRAINT uq_payment_reconciliations_case_key DO UPDATE SET" in sql_str
+
+    # 3. Foreign key preservation via COALESCE
+    assert "organization_id = coalesce(payment_reconciliations.organization_id, excluded.organization_id)" in sql_str
+    assert "subscription_id = coalesce(payment_reconciliations.subscription_id, excluded.subscription_id)" in sql_str
+    assert "invoice_id = coalesce(payment_reconciliations.invoice_id, excluded.invoice_id)" in sql_str
+    assert "payment_id = coalesce(payment_reconciliations.payment_id, excluded.payment_id)" in sql_str
+    assert "raw_event_id = coalesce(payment_reconciliations.raw_event_id, excluded.raw_event_id)" in sql_str
+
+    # 4. Reason and updated_at
+    assert "reason = excluded.reason" in sql_str
+    assert "updated_at = excluded.updated_at" in sql_str
+
+    # 5. Status reopening CASE expression
+    assert "status = CASE WHEN (payment_reconciliations.status IN" in sql_str
+
+    # 6. JSONB array concatenation and build object
+    assert "jsonb_build_object" in sql_str
+    assert "||" in sql_str
+
+    # 7. RETURNING clause
+    assert "RETURNING payment_reconciliations.id" in sql_str
+
+    # 8. Sanitized parameter binds (secrets redacted, sensitive keys stripped)
+    params = compiled.params
+    assert params["case_key"] == "ambiguous_checkout_attempt:sub_test_001"
+    assert params["reason"] == "ambiguous_checkout_attempt"
+    assert params["organization_id"] == org_id
+    assert params["subscription_id"] == sub_id
+    assert params["raw_event_id"] == event_id
+
+    # Verify diagnostic payload sanitization
+    diag_payload = params["diagnostic_payload"]
+    history_entry = diag_payload["history"][0]
+    assert history_entry["reason"] == "ambiguous_checkout_attempt"
+    # Sensitive keys are dropped entirely
+    assert "api_secret" not in history_entry["details"]
+    assert history_entry["details"]["provider_subscription_id"] == "sub_test_001"
+    # Safe value strings have secrets redacted
+    assert history_entry["details"]["notes"] == "authorization failed with key [REDACTED_KEY]"
+    assert "mySuperSecret123" not in str(params)
+    assert "rzp_live_secret999" not in str(params)
 

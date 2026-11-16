@@ -75,6 +75,7 @@ from app.models.payment import (
     PaymentReconciliation,
 )
 from app.models.subscription import (
+    ReconciliationStatus,
     Subscription,
     SubscriptionStatus,
     WebhookProcessingStatus,
@@ -220,8 +221,60 @@ class RazorpayAgreementMockDbSession:
             matched_attempts = list(self.checkout_attempts.values())
             return MockScalarResult(matched_attempts)
 
-        # 5. PaymentReconciliation Lookups
+        # 5. PaymentReconciliation Lookups & Upsert Statements
         if "payment_reconciliations" in stmt_str:
+            if "INSERT INTO" in stmt_str:
+                # Intercept PaymentReconciliation upsert statement (Layer B Python orchestration double)
+                params_dict = stmt.compile().params if hasattr(stmt, "compile") else (params or {})
+                case_key = params_dict.get("case_key")
+                rec = self.reconciliations.get(case_key)
+                new_diag = params_dict.get("diagnostic_payload") or {}
+                new_history_entries = new_diag.get("history", [])
+                new_latest = new_diag.get("latest", {})
+                now_utc = datetime.now(timezone.utc)
+
+                if rec is not None:
+                    # Existing case: append history entries, update latest and timestamp
+                    existing_hist = list(rec.diagnostic_payload.get("history", []))
+                    for entry in new_history_entries:
+                        existing_hist.append(entry)
+                    rec.diagnostic_payload = {
+                        **rec.diagnostic_payload,
+                        "history": existing_hist,
+                        "latest": new_latest,
+                    }
+                    rec.reason = params_dict.get("reason", rec.reason)
+                    rec.updated_at = now_utc
+                    # Coalesce foreign keys
+                    for fk in ("organization_id", "subscription_id", "invoice_id", "payment_id", "raw_event_id"):
+                        if params_dict.get(fk) and not getattr(rec, fk, None):
+                            setattr(rec, fk, params_dict[fk])
+                    # Reopen if resolved
+                    if rec.status in (ReconciliationStatus.resolved_refunded, ReconciliationStatus.resolved_ignored):
+                        rec.status = ReconciliationStatus.pending_review
+                else:
+                    # New reconciliation case
+                    rec = PaymentReconciliation(
+                        id=params_dict.get("id") or uuid.uuid4(),
+                        provider=params_dict.get("provider", "razorpay"),
+                        merchant_account_id=params_dict.get("merchant_account_id", "default"),
+                        environment=params_dict.get("environment", "live"),
+                        case_key=case_key,
+                        organization_id=params_dict.get("organization_id"),
+                        subscription_id=params_dict.get("subscription_id"),
+                        invoice_id=params_dict.get("invoice_id"),
+                        payment_id=params_dict.get("payment_id"),
+                        raw_event_id=params_dict.get("raw_event_id"),
+                        reason=params_dict.get("reason", "unknown"),
+                        status=params_dict.get("status", ReconciliationStatus.pending_review),
+                        diagnostic_payload=new_diag,
+                        created_at=now_utc,
+                        updated_at=now_utc,
+                    )
+                    self.reconciliations[case_key] = rec
+                    self.added.append(rec)
+                return MockScalarResult(rec)
+
             for rec in self.reconciliations.values():
                 return MockScalarResult(rec)
             return MockScalarResult(None)
@@ -604,12 +657,18 @@ async def test_subscription_authenticated_ambiguous_checkout_attempts_fails_clos
         session=session,
     )
 
-    with pytest.raises(RazorpayWebhookReconciliationConflictError, match="Multiple checkout attempts"):
+    case_key = f"ambiguous_checkout_attempt:{sub_id}"
+    with pytest.raises(RazorpayWebhookReconciliationConflictError, match="Multiple checkout attempts") as exc_info:
         await handle_subscription_authenticated(claimed, session)
 
-    case_key = f"ambiguous_checkout_attempt:{sub_id}"
-    assert case_key in session.reconciliations
-    assert session.reconciliations[case_key].reason == "ambiguous_checkout_attempt"
+    assert exc_info.value.case_key == case_key
+    assert exc_info.value.reason == "ambiguous_checkout_attempt"
+    assert exc_info.value.organization_id == org_id
+    assert exc_info.value.raw_event_id == claimed.event_id
+    assert exc_info.value.subscription_id is None
+    # Invariant ED-04/ED-06: Handler raises cleanly without performing inline reconciliation write;
+    # reconciliation is handled by outer Phase 3 transaction.
+    assert case_key not in session.reconciliations
 
 
 @pytest.mark.asyncio
@@ -655,12 +714,16 @@ async def test_subscription_authenticated_mismatched_checkout_attempt_fails_clos
         session=session,
     )
 
-    with pytest.raises(RazorpayWebhookReconciliationConflictError, match="conflicts with authoritative"):
+    case_key = f"checkout_attempt_tenant_mismatch:{attempt.id}:{org_authoritative}"
+    with pytest.raises(RazorpayWebhookReconciliationConflictError, match="conflicts with authoritative") as exc_info:
         await handle_subscription_authenticated(claimed, session)
 
-    case_key = f"checkout_attempt_tenant_mismatch:{attempt.id}:{org_authoritative}"
-    assert case_key in session.reconciliations
-    assert session.reconciliations[case_key].reason == "checkout_attempt_tenant_mismatch"
+    assert exc_info.value.case_key == case_key
+    assert exc_info.value.reason == "checkout_attempt_tenant_mismatch"
+    assert exc_info.value.organization_id == org_authoritative
+    assert exc_info.value.raw_event_id == claimed.event_id
+    assert exc_info.value.subscription_id is None
+    assert case_key not in session.reconciliations
 
 
 # =============================================================================
@@ -873,11 +936,16 @@ async def test_subscription_activated_ambiguous_checkout_attempts_fails_closed()
         session=session,
     )
 
-    with pytest.raises(RazorpayWebhookReconciliationConflictError, match="Multiple checkout attempts"):
+    case_key = f"ambiguous_checkout_attempt:{sub_id}"
+    with pytest.raises(RazorpayWebhookReconciliationConflictError, match="Multiple checkout attempts") as exc_info:
         await handle_subscription_activated(claimed, session)
 
-    case_key = f"ambiguous_checkout_attempt:{sub_id}"
-    assert case_key in session.reconciliations
+    assert exc_info.value.case_key == case_key
+    assert exc_info.value.reason == "ambiguous_checkout_attempt"
+    assert exc_info.value.organization_id == org_id
+    assert exc_info.value.raw_event_id == claimed.event_id
+    assert exc_info.value.subscription_id is None
+    assert case_key not in session.reconciliations
 
 
 @pytest.mark.asyncio
@@ -924,11 +992,16 @@ async def test_subscription_activated_mismatched_checkout_attempt_fails_closed()
         session=session,
     )
 
-    with pytest.raises(RazorpayWebhookReconciliationConflictError, match="conflicts with authoritative"):
+    case_key = f"checkout_attempt_tenant_mismatch:{attempt.id}:{org_authoritative}"
+    with pytest.raises(RazorpayWebhookReconciliationConflictError, match="conflicts with authoritative") as exc_info:
         await handle_subscription_activated(claimed, session)
 
-    case_key = f"checkout_attempt_tenant_mismatch:{attempt.id}:{org_authoritative}"
-    assert case_key in session.reconciliations
+    assert exc_info.value.case_key == case_key
+    assert exc_info.value.reason == "checkout_attempt_tenant_mismatch"
+    assert exc_info.value.organization_id == org_authoritative
+    assert exc_info.value.raw_event_id == claimed.event_id
+    assert exc_info.value.subscription_id is None
+    assert case_key not in session.reconciliations
 
 
 # =============================================================================
@@ -1072,7 +1145,17 @@ async def test_subscription_updated_unknown_subscription_stages_reconciliation()
 
     case_key = f"unknown_sub_updated:{sub_id}"
     assert case_key in session.reconciliations
-    assert session.reconciliations[case_key].reason == "unknown_subscription_updated"
+    rec = session.reconciliations[case_key]
+    assert rec.reason == "unknown_subscription_updated"
+    assert rec.organization_id == org_id
+    assert rec.subscription_id is None
+    # Invariant: No raw ctx.raw_payload leak in diagnostic payload
+    assert "payload" not in rec.diagnostic_payload.get("latest", {})
+    assert rec.diagnostic_payload["latest"]["provider_subscription_id"] == sub_id
+    assert rec.diagnostic_payload["latest"]["event_type"] == "subscription.updated"
+
+
+
 
 
 # =============================================================================

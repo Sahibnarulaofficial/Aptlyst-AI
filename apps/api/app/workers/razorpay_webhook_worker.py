@@ -52,8 +52,10 @@ from app.services.billing.razorpay.webhook_engine import (
     StaleLeaseError,
     claim_next_razorpay_webhook_event,
     default_razorpay_dispatcher,
+    execute_claimed_razorpay_webhook_event,
     record_razorpay_webhook_outcome,
 )
+from app.services.billing.webhook_errors import sanitize_billing_error_message
 
 logger = logging.getLogger("app.workers.razorpay_webhook_worker")
 
@@ -75,6 +77,7 @@ class RazorpayWebhookWorker:
         max_attempts: int | None = None,
         environment: str | None = None,
         clock: Callable[[], datetime] | None = None,
+        merchant_account_id: str | None = None,
     ) -> None:
         """Initialize the Razorpay webhook worker.
 
@@ -88,6 +91,7 @@ class RazorpayWebhookWorker:
             max_attempts: Maximum retry threshold before quarantine.
             environment: Optional environment filter ("test" or "live").
             clock: Optional callable returning current UTC datetime (for testing).
+            merchant_account_id: Optional expected merchant account identifier.
         """
         self.session_factory = session_factory or AsyncSessionLocal
         self.dispatcher = dispatcher or default_razorpay_dispatcher
@@ -98,6 +102,7 @@ class RazorpayWebhookWorker:
 
         env_poll = os.getenv("RAZORPAY_WEBHOOK_WORKER_POLL_INTERVAL")
         env_batch = os.getenv("RAZORPAY_WEBHOOK_WORKER_BATCH_SIZE")
+        env_merchant = os.getenv("RAZORPAY_MERCHANT_ACCOUNT_ID")
 
         self.poll_interval = (
             poll_interval
@@ -114,6 +119,9 @@ class RazorpayWebhookWorker:
         )
         self.environment = environment
         self.clock = clock
+        self.merchant_account_id = (
+            merchant_account_id if merchant_account_id is not None else env_merchant
+        )
 
         if self.poll_interval <= 0:
             raise ValueError(f"poll_interval must be greater than 0, got {self.poll_interval}")
@@ -149,17 +157,26 @@ class RazorpayWebhookWorker:
                     now=now,
                 )
                 return claimed
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                logger.error("Error while worker %s claimed event: %s", self.worker_id, exc)
+                logger.error(
+                    "Error while worker %s claimed event: %s",
+                    self.worker_id,
+                    sanitize_billing_error_message(str(exc)),
+                )
                 return None
 
     async def process_one(self) -> ProcessResult | None:
         """Claim, execute, and record outcome for a single webhook event.
 
         Guarantees:
-        - Network/handler calls execute outside the database claim transaction.
-        - The outcome recording transaction validates fencing (lease_token and expiry).
-        - If ownership was lost, StaleLeaseError is caught and no business mutations commit.
+        - Atomic processing: handler domain changes, payment reconciliation upserts,
+          and final webhook event outcome commit in a single database transaction.
+        - Network/handler calls execute within an inner savepoint.
+        - Fencing token and lease duration are validated.
+        - Stale workers or expired leases are rejected without committing domain mutations.
+        - Unhandled cancellations propagate cleanly without committing partial state (Option B).
 
         Returns:
             ProcessResult if an event was claimed and executed, or None if queue is empty.
@@ -168,97 +185,27 @@ class RazorpayWebhookWorker:
         if claimed is None:
             return None
 
-        # Execute handler outside of DB claim transaction
         handler = self.dispatcher.get_handler(claimed.event_type)
-        if handler is None:
-            outcome = ProcessingOutcome.UNKNOWN_EVENT
-            err_to_record: Exception | str | None = f"No handler registered for event type '{claimed.event_type}'"
-        else:
-            try:
-                async with self.session_factory() as handler_db:
-                    sig = inspect.signature(handler)
-                    params = list(sig.parameters.values())
-                    if params and params[0].name in ("event", "claimed", "ctx", "context"):
-                        await handler(claimed, handler_db)
-                    else:
-                        await handler(claimed.payload, handler_db)
-                outcome = ProcessingOutcome.SUCCESS
-                err_to_record = None
-            except StaleLeaseError as exc:
-                logger.warning(
-                    "Worker %s aborted domain execution: lost lease on event %s: %s",
-                    self.worker_id,
-                    claimed.event_id,
-                    exc,
-                )
-                return ProcessResult(
-                    success=False,
-                    status=WebhookProcessingStatus.failed,
-                    event_id=claimed.event_id,
-                    provider_event_id=claimed.provider_event_id,
-                    attempts=claimed.attempts,
-                    message=f"Fencing rejected stale worker during domain execution: {exc}",
-                    error=exc,
-                )
-            except RazorpayWebhookPermanentError as exc:
-                outcome = ProcessingOutcome.PERMANENT_FAILURE
-                err_to_record = exc
-            except (RazorpayWebhookRetryableError, Exception) as exc:
-                outcome = ProcessingOutcome.RETRYABLE_FAILURE
-                err_to_record = exc
 
-        # Complete event in a short transaction with fencing validation
-        now_outcome = self._get_now()
-        async with self.session_factory() as outcome_db:
-            try:
-                updated_event = await record_razorpay_webhook_outcome(
-                    db=outcome_db,
-                    claimed=claimed,
-                    outcome=outcome,
-                    error=err_to_record,
-                    max_attempts=self.max_attempts,
-                    now=now_outcome,
-                )
-                logger.info(
-                    "Worker %s completed event %s (outcome=%s, status=%s, attempts=%d)",
-                    self.worker_id,
-                    claimed.event_id,
-                    outcome.value,
-                    updated_event.status.value,
-                    updated_event.attempts,
-                )
-                return ProcessResult(
-                    success=(outcome == ProcessingOutcome.SUCCESS),
-                    status=updated_event.status,
-                    event_id=claimed.event_id,
-                    provider_event_id=claimed.provider_event_id,
-                    attempts=updated_event.attempts,
-                    message=f"Outcome recorded: {outcome.value}",
-                )
-            except StaleLeaseError as exc:
-                logger.warning(
-                    "Worker %s lost ownership of event %s. Fencing rejected completion: %s",
-                    self.worker_id,
-                    claimed.event_id,
-                    exc,
-                )
-                return ProcessResult(
-                    success=False,
-                    status=WebhookProcessingStatus.failed,
-                    event_id=claimed.event_id,
-                    provider_event_id=claimed.provider_event_id,
-                    attempts=claimed.attempts,
-                    message="Lease lost or expired; completion rejected",
-                    error=exc,
-                )
-            except Exception as exc:
-                logger.error(
-                    "Unexpected error recording outcome for event %s: %s",
-                    claimed.event_id,
-                    exc,
-                    exc_info=True,
-                )
-                return None
+        try:
+            return await execute_claimed_razorpay_webhook_event(
+                session_factory=self.session_factory,
+                claimed=claimed,
+                handler=handler,
+                max_attempts=self.max_attempts,
+                now_fn=self._get_now,
+                expected_merchant_id=self.merchant_account_id,
+                expected_environment=self.environment,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Unexpected error during execute_claimed_razorpay_webhook_event for event %s: %s",
+                claimed.event_id,
+                sanitize_billing_error_message(str(exc)),
+            )
+            return None
 
     async def run_batch(self, max_count: int | None = None) -> list[ProcessResult]:
         """Claim and process a batch of eligible events up to max_count or batch_size.
@@ -307,33 +254,40 @@ class RazorpayWebhookWorker:
             self.lease_duration,
             self.max_attempts,
         )
-        while not self._stop_event.is_set():
-            try:
-                results = await self.run_batch()
-                if results:
-                    # If full batch was processed, immediately poll again without delay
-                    if len(results) >= self.batch_size:
-                        continue
-                else:
-                    # Queue is empty, back off for poll_interval
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    results = await self.run_batch()
+                    if results:
+                        # If full batch was processed, immediately poll again without delay
+                        if len(results) >= self.batch_size:
+                            continue
+                    else:
+                        # Queue is empty, back off for poll_interval
+                        try:
+                            await asyncio.wait_for(
+                                self._stop_event.wait(), timeout=self.poll_interval
+                            )
+                        except asyncio.TimeoutError:
+                            pass
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.error(
+                        "Error in RazorpayWebhookWorker polling loop: %s",
+                        sanitize_billing_error_message(str(exc)),
+                    )
                     try:
                         await asyncio.wait_for(
-                            self._stop_event.wait(), timeout=self.poll_interval
+                            self._stop_event.wait(), timeout=min(5.0, self.poll_interval)
                         )
                     except asyncio.TimeoutError:
                         pass
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.error("Error in RazorpayWebhookWorker polling loop: %s", exc, exc_info=True)
-                try:
-                    await asyncio.wait_for(
-                        self._stop_event.wait(), timeout=min(5.0, self.poll_interval)
-                    )
-                except asyncio.TimeoutError:
-                    pass
-
-        logger.info("RazorpayWebhookWorker %s stopped cleanly.", self.worker_id)
+        except asyncio.CancelledError:
+            logger.info("RazorpayWebhookWorker %s cancelled during execution.", self.worker_id)
+            raise
+        finally:
+            logger.info("RazorpayWebhookWorker %s stopped cleanly.", self.worker_id)
 
     def stop(self) -> None:
         """Signal the worker polling loop to stop gracefully."""
@@ -392,6 +346,7 @@ async def run_worker(
     session_factory: Callable[[], AsyncSession] | None = None,
     dispatcher: RazorpayWebhookDispatcher | None = None,
     environment: str | None = None,
+    merchant_account_id: str | None = None,
 ) -> int:
     """Run the Razorpay webhook worker as an async task with signal interception.
 
@@ -403,6 +358,7 @@ async def run_worker(
         session_factory: Optional custom AsyncSession factory (used for testing).
         dispatcher: Optional custom dispatcher instance.
         environment: Optional environment filter ("test" or "live").
+        merchant_account_id: Optional expected merchant account identifier.
 
     Returns:
         Exit code (0 on clean shutdown).
@@ -421,6 +377,7 @@ async def run_worker(
         batch_size=batch_size,
         max_attempts=max_attempts,
         environment=environment,
+        merchant_account_id=merchant_account_id,
     )
 
     setup_signal_handlers(worker)
@@ -433,6 +390,9 @@ async def run_worker(
 
         await worker.start()
         return 0
+    except asyncio.CancelledError:
+        logger.info("Worker task cancelled cleanly.")
+        raise
     finally:
         if session_factory is None:
             try:

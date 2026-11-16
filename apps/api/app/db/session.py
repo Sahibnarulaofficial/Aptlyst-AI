@@ -1,9 +1,12 @@
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
+from contextlib import AbstractAsyncContextManager
 
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import settings
+
+AsyncSessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
 connect_args = {}
 if "asyncpg" in settings.database_url:
@@ -33,3 +36,8 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         except Exception:
             await session.rollback()
             raise
+
+
+async def get_session_factory() -> AsyncSessionFactory:
+    """FastAPI dependency returning an independent AsyncSession context-manager factory."""
+    return AsyncSessionLocal

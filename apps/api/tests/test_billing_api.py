@@ -70,7 +70,7 @@ import app.models.payment  # noqa: F401
 from app.api.billing import validate_stripe_portal_url
 from app.auth.dependencies import CurrentUser, get_current_user
 from app.config import Settings, settings
-from app.db.session import get_db
+from app.db.session import get_db, get_session_factory
 from app.main import app
 from app.models.billing import OrganizationBillingPeriod
 from app.models.organization import MemberRole, Organization, OrganizationMember
@@ -258,6 +258,7 @@ def setup_api_overrides(
     db: BillingApiMockDbSession,
     user_id: uuid.UUID,
     email: str = "user@example.com",
+    session_factory_provider: Any = None,
 ) -> None:
     """Register FastAPI dependency overrides."""
     async def override_db():
@@ -268,11 +269,14 @@ def setup_api_overrides(
 
     app.dependency_overrides[get_db] = override_db
     app.dependency_overrides[get_current_user] = override_user
+    if session_factory_provider is not None:
+        app.dependency_overrides[get_session_factory] = session_factory_provider
 
 
 def clear_api_overrides() -> None:
     """Clear FastAPI dependency overrides."""
     app.dependency_overrides.pop(get_db, None)
+    app.dependency_overrides.pop(get_session_factory, None)
     app.dependency_overrides.pop(get_current_user, None)
 
 
@@ -1109,3 +1113,255 @@ def test_validate_stripe_portal_url_invalid(url: str, match: str):
     """Verify invalid portal URLs fail with descriptive ValueError."""
     with pytest.raises(ValueError, match=match):
         validate_stripe_portal_url(url)
+
+
+# =============================================================================
+# 4. D-2 Stage 1 Razorpay Checkout Session Factory DI Integration Tests
+# =============================================================================
+
+
+class _RazorpayCheckoutDiSessionDouble:
+    """Minimal AsyncSession double sharing committed tables across endpoint & provisioning sessions."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        organizations: dict[uuid.UUID, Organization],
+        members: dict[tuple[uuid.UUID, uuid.UUID], OrganizationMember],
+        provisions: list[BillingCustomerProvision],
+        subscriptions: list[Subscription],
+        attempts: list[Any],
+    ) -> None:
+        self.name = name
+        self.organizations = organizations
+        self.members = members
+        self.provisions = provisions
+        self.subscriptions = subscriptions
+        self.attempts = attempts
+        self._in_tx = False
+        self.uncommitted: list[Any] = []
+        self.commit_calls = 0
+        self.rollback_calls = 0
+        self.executed_tables: list[str] = []
+
+    def in_transaction(self) -> bool:
+        return self._in_tx
+
+    async def get(self, entity_cls: Any, pk: Any) -> Any:
+        self._in_tx = True
+        if entity_cls is Organization:
+            return self.organizations.get(pk)
+        return None
+
+    def add(self, obj: Any) -> None:
+        self._in_tx = True
+        self.uncommitted.append(obj)
+
+    async def flush(self) -> None:
+        self._in_tx = True
+
+    async def execute(self, stmt: Any, *args: Any, **kwargs: Any) -> MockScalarResult:
+        from app.models.payment import BillingCheckoutAttempt
+
+        self._in_tx = True
+        w_params: dict[str, Any] = {}
+        for w in getattr(stmt, "_where_criteria", ()):
+            if hasattr(w, "left") and hasattr(w, "right") and hasattr(w.left, "key"):
+                if hasattr(w.right, "value"):
+                    w_params[w.left.key] = w.right.value
+
+        from_table = ""
+        froms_list = stmt.get_final_froms() if hasattr(stmt, "get_final_froms") else getattr(stmt, "froms", ())
+        for f in froms_list:
+            tname = getattr(f, "name", None) or getattr(f, "__tablename__", "")
+            if tname:
+                from_table = tname
+                break
+        if from_table:
+            self.executed_tables.append(from_table)
+
+        org_id = w_params.get("organization_id")
+
+        if from_table == "organizations":
+            lookup_id = w_params.get("id") or org_id
+            return MockScalarResult(self.organizations.get(lookup_id))
+
+        if from_table == "organization_members":
+            user_id = w_params.get("user_id")
+            if org_id and user_id:
+                return MockScalarResult(self.members.get((org_id, user_id)))
+            return MockScalarResult(None)
+
+        if from_table == "billing_customer_provisions":
+            for p in reversed(self.provisions):
+                if org_id and p.organization_id != org_id:
+                    continue
+                if "provider" in w_params and p.provider != w_params["provider"]:
+                    continue
+                if "merchant_account_id" in w_params and p.merchant_account_id != w_params["merchant_account_id"]:
+                    continue
+                if "environment" in w_params and p.environment != w_params["environment"]:
+                    continue
+                return MockScalarResult(p)
+            return MockScalarResult(None)
+
+        if from_table == "subscriptions":
+            for s in reversed(self.subscriptions):
+                if org_id and s.organization_id != org_id:
+                    continue
+                return MockScalarResult(s)
+            return MockScalarResult(None)
+
+        if from_table == "billing_checkout_attempts":
+            aid = w_params.get("id")
+            for a in reversed(self.attempts):
+                if not isinstance(a, BillingCheckoutAttempt):
+                    continue
+                if aid and a.id != aid:
+                    continue
+                if org_id and a.organization_id != org_id:
+                    continue
+                if "status" in w_params:
+                    sf = w_params["status"]
+                    if isinstance(sf, (list, tuple, set)):
+                        if a.status not in sf:
+                            continue
+                    elif a.status != sf:
+                        continue
+                return MockScalarResult(a)
+            return MockScalarResult(None)
+
+        return MockScalarResult(None)
+
+    async def commit(self) -> None:
+        from app.models.payment import BillingCheckoutAttempt
+
+        self.commit_calls += 1
+        for obj in self.uncommitted:
+            if isinstance(obj, BillingCustomerProvision) and obj not in self.provisions:
+                self.provisions.append(obj)
+            elif isinstance(obj, BillingCheckoutAttempt) and obj not in self.attempts:
+                self.attempts.append(obj)
+        self.uncommitted.clear()
+        self._in_tx = False
+
+    async def rollback(self) -> None:
+        self.rollback_calls += 1
+        self.uncommitted.clear()
+        self._in_tx = False
+
+
+@pytest.mark.asyncio
+async def test_razorpay_checkout_endpoint_wires_get_session_factory_into_customer_provisioning(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """D-2 Stage 1 API DI: POST /razorpay/checkout-subscription uses FastAPI `get_session_factory`
+    dependency override exclusively for customer provisioning (separate from the request `get_db`
+    session and never falling back to `AsyncSessionLocal`).
+    """
+    from contextlib import asynccontextmanager
+    from app.services.billing.razorpay.client import reset_razorpay_client, set_razorpay_client_for_testing
+
+    user_id = uuid.uuid4()
+    org_id = uuid.uuid4()
+    org = Organization(id=org_id, name="DI Billing Endpoint Org")
+    member = OrganizationMember(organization_id=org_id, user_id=user_id, role=MemberRole.admin)
+
+    shared_orgs = {org_id: org}
+    shared_members = {(org_id, user_id): member}
+    shared_provisions: list[BillingCustomerProvision] = []
+    shared_subscriptions: list[Subscription] = []
+    shared_attempts: list[Any] = []
+
+    request_db = _RazorpayCheckoutDiSessionDouble(
+        name="request_db",
+        organizations=shared_orgs,
+        members=shared_members,
+        provisions=shared_provisions,
+        subscriptions=shared_subscriptions,
+        attempts=shared_attempts,
+    )
+    opened_factory_sessions: list[_RazorpayCheckoutDiSessionDouble] = []
+
+    def custom_factory():
+        @asynccontextmanager
+        async def _ctx():
+            sess = _RazorpayCheckoutDiSessionDouble(
+                name=f"customer_factory_{len(opened_factory_sessions) + 1}",
+                organizations=shared_orgs,
+                members=shared_members,
+                provisions=shared_provisions,
+                subscriptions=shared_subscriptions,
+                attempts=shared_attempts,
+            )
+            opened_factory_sessions.append(sess)
+            try:
+                yield sess
+            finally:
+                if sess.in_transaction():
+                    await sess.rollback()
+
+        return _ctx()
+
+    async def provide_custom_factory():
+        return custom_factory
+
+    def _forbidden_default_factory():
+        raise AssertionError("AsyncSessionLocal must not be called when get_session_factory is overridden")
+
+    monkeypatch.setattr(
+        "app.services.billing.razorpay.customer.AsyncSessionLocal",
+        _forbidden_default_factory,
+    )
+    monkeypatch.setattr(settings, "environment", "development")
+    monkeypatch.setattr(settings, "razorpay_enabled", True)
+    monkeypatch.setattr(settings, "razorpay_environment", "test")
+    monkeypatch.setattr(settings, "razorpay_merchant_account_id", "acc_test_123")
+    monkeypatch.setattr(settings, "razorpay_key_id", "rzp_test_di_key")
+    monkeypatch.setattr(settings, "razorpay_key_secret", SecretStr("secret_di_123"))
+    monkeypatch.setattr(settings, "razorpay_pro_plan_id", "plan_test_di")
+    monkeypatch.setattr(settings, "razorpay_plan_currency", "USD")
+
+    class _MockClient:
+        async def create_customer(self, **kwargs: Any) -> dict[str, Any]:
+            assert all(not s.in_transaction() for s in opened_factory_sessions)
+            assert not request_db.in_transaction()
+            return {"id": "cust_di_endpoint_123", "name": kwargs.get("name")}
+
+        async def create_subscription(self, **kwargs: Any) -> dict[str, Any]:
+            assert kwargs.get("customer_id") == "cust_di_endpoint_123"
+            return {
+                "id": "sub_di_endpoint_456",
+                "entity": "subscription",
+                "status": "created",
+                "short_url": "https://rzp.io/i/sub_di_endpoint_456",
+            }
+
+    set_razorpay_client_for_testing(_MockClient())
+    setup_api_overrides(
+        request_db,  # type: ignore[arg-type]
+        user_id,
+        email="di-admin@example.com",
+        session_factory_provider=provide_custom_factory,
+    )
+
+    try:
+        resp = await client.post(
+            f"/api/v1/organizations/{org_id}/billing/razorpay/checkout-subscription",
+            headers=AUTH_HEADERS,
+        )
+    finally:
+        reset_razorpay_client()
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["subscription_id"] == "sub_di_endpoint_456"
+    assert len(opened_factory_sessions) == 2  # TX_A1 (claim) + TX_A2 (resolved)
+    assert all(s.commit_calls == 1 for s in opened_factory_sessions)
+    assert all(not s.in_transaction() for s in opened_factory_sessions)
+    assert len(shared_provisions) == 1
+    assert shared_provisions[0].provider_customer_id == "cust_di_endpoint_123"
+    assert shared_provisions[0].status == CustomerProvisionStatus.resolved
+    assert not request_db.in_transaction()
