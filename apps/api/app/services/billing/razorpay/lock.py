@@ -1,5 +1,8 @@
 """PostgreSQL transaction-scoped advisory locking for Razorpay entities.
 
+Backward-compatible facade delegating canonical locking primitives to
+`app.services.billing.advisory_lock`.
+
 Guarantees & Invariants:
 1. Deterministic Key Derivation:
    - Derives a signed 64-bit integer from SHA-256("razorpay:<clean_type>:<clean_id>").
@@ -36,11 +39,16 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-logger = logging.getLogger(__name__)
+from app.services.billing.advisory_lock import (
+    PG_BIGINT_MAX,
+    PG_BIGINT_MIN,
+    acquire_advisory_lock,
+    acquire_multi_entity_advisory_locks,
+    derive_advisory_lock_key,
+    try_acquire_advisory_lock,
+)
 
-# Valid signed 64-bit integer range in PostgreSQL: [-2^63, 2^63 - 1]
-PG_BIGINT_MIN: int = -(2**63)
-PG_BIGINT_MAX: int = 2**63 - 1
+logger = logging.getLogger(__name__)
 
 # Explicit whitelist of allowed entity categories for advisory locking
 ALLOWED_ENTITY_TYPES: frozenset[str] = frozenset({
@@ -78,16 +86,7 @@ def derive_razorpay_advisory_lock_key(entity_type: str, entity_id: str) -> int:
         )
 
     clean_id = entity_id.strip()
-
-    raw = f"razorpay:{clean_type}:{clean_id}".encode("utf-8")
-    digest = hashlib.sha256(raw).digest()
-    key = int.from_bytes(digest[:8], byteorder="big", signed=True)
-
-    # Sanity bounds check
-    if not (PG_BIGINT_MIN <= key <= PG_BIGINT_MAX):
-        raise OverflowError(f"Derived key {key} is out of bounds for PostgreSQL 64-bit signed integer.")
-
-    return key
+    return derive_advisory_lock_key(f"razorpay:{clean_type}", clean_id)
 
 
 async def acquire_razorpay_advisory_lock(
