@@ -7,6 +7,127 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _env_path = Path(__file__).resolve().parent.parent / ".env"
 
+PRODUCTION_DEPLOYMENT_ENVIRONMENTS: frozenset[str] = frozenset({"production", "prod"})
+NON_PRODUCTION_DEPLOYMENT_ENVIRONMENTS: frozenset[str] = frozenset(
+    {"development", "dev", "staging", "stage", "test", "testing", "ci", "local"}
+)
+ALLOWED_RAZORPAY_ENVIRONMENTS: frozenset[str] = frozenset({"test", "live"})
+PROHIBITED_PRODUCTION_MERCHANT_IDS: frozenset[str] = frozenset(
+    {"default", "placeholder", "none", "null", "test", "dev", "stage", "staging", "ci", "legacy", ""}
+)
+
+
+def validate_deployment_environment(deployment_env: str | None = None) -> tuple[str, bool]:
+    """Validate and classify the deployment environment signal (fail-closed).
+
+    Returns:
+        tuple[str, bool]: (normalized_environment, is_production)
+
+    Raises:
+        ValueError: If deployment environment is empty, non-string, or unrecognized.
+    """
+    raw = settings.environment if deployment_env is None else deployment_env
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(
+            "ENVIRONMENT must be explicitly configured with a recognized deployment environment."
+        )
+    normalized = raw.strip().lower()
+    if normalized in PRODUCTION_DEPLOYMENT_ENVIRONMENTS:
+        return normalized, True
+    if normalized in NON_PRODUCTION_DEPLOYMENT_ENVIRONMENTS:
+        return normalized, False
+    raise ValueError(
+        f"Unrecognized deployment ENVIRONMENT '{raw}'. "
+        "Must be a recognized production ('production', 'prod') or non-production environment."
+    )
+
+
+def is_production_environment(deployment_env: str | None = None) -> bool:
+    """Return True if deployment environment is recognized production; fail closed if invalid."""
+    _, is_prod = validate_deployment_environment(deployment_env)
+    return is_prod
+
+
+def resolve_required_razorpay_environment(deployment_env: str | None = None) -> str:
+    """Return the strictly required Razorpay environment ('live' in prod, 'test' otherwise)."""
+    _, is_prod = validate_deployment_environment(deployment_env)
+    return "live" if is_prod else "test"
+
+
+def validate_razorpay_runtime_scope(
+    *,
+    deployment_env: str | None = None,
+    razorpay_env: str | None = None,
+    merchant_account_id: str | None = None,
+) -> tuple[str, str]:
+    """Validate Razorpay merchant account and environment against deployment policy (fail-closed).
+
+    Guarantees (Option A):
+    - Unrecognized or missing deployment ENVIRONMENT fails closed.
+    - RAZORPAY_ENVIRONMENT must be explicitly 'test' or 'live'.
+    - Production deployments ('production', 'prod') strictly require RAZORPAY_ENVIRONMENT='live'
+      and an explicit non-default merchant account identifier.
+    - Non-production deployments strictly require RAZORPAY_ENVIRONMENT='test'.
+
+    Returns:
+        tuple[str, str]: (merchant_account_id, razorpay_environment)
+    """
+    _, is_prod = validate_deployment_environment(deployment_env)
+
+    raw_rzp_env = settings.razorpay_environment if razorpay_env is None else razorpay_env
+    clean_rzp_env = (raw_rzp_env or "").strip().lower() if isinstance(raw_rzp_env, str) else ""
+    if clean_rzp_env not in ALLOWED_RAZORPAY_ENVIRONMENTS:
+        raise ValueError(
+            f"Invalid Razorpay environment '{raw_rzp_env}'. Must be 'test' or 'live'."
+        )
+
+    raw_merchant = (
+        settings.razorpay_merchant_account_id
+        if merchant_account_id is None
+        else merchant_account_id
+    )
+    clean_merchant = (raw_merchant or "").strip() if isinstance(raw_merchant, str) else ""
+    if not clean_merchant:
+        raise ValueError("Razorpay merchant account ID must be explicitly configured.")
+
+    if is_prod:
+        if clean_rzp_env != "live":
+            raise ValueError(
+                "Production RAZORPAY_ENVIRONMENT must be 'live'."
+            )
+        if clean_merchant.lower() in PROHIBITED_PRODUCTION_MERCHANT_IDS:
+            raise ValueError(
+                "Production RAZORPAY_MERCHANT_ACCOUNT_ID must be explicitly configured "
+                "with a non-default account identifier."
+            )
+    else:
+        if clean_rzp_env != "test":
+            raise ValueError(
+                "Non-production RAZORPAY_ENVIRONMENT must be 'test'."
+            )
+
+    return clean_merchant, clean_rzp_env
+
+
+def get_canonical_razorpay_merchant_account_id(
+    *,
+    deployment_env: str | None = None,
+    merchant_account_id: str | None = None,
+) -> str:
+    """Return the single authoritative Aptlyst AI Razorpay merchant account identifier.
+
+    Guarantees:
+    - Fails closed if deployment environment or merchant account ID is invalid.
+    - In production, strictly requires an explicit non-prohibited live merchant identity.
+    - In non-production, returns the canonical test merchant identity.
+    - Customer organization IDs must NEVER be used as merchant account IDs.
+    """
+    clean_merchant, _ = validate_razorpay_runtime_scope(
+        deployment_env=deployment_env,
+        merchant_account_id=merchant_account_id,
+    )
+    return clean_merchant
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -54,7 +175,7 @@ class Settings(BaseSettings):
 
     def model_post_init(self, __context: Any) -> None:
         """Validate critical production secrets on application startup."""
-        is_prod = self.environment.strip().lower() in ("production", "prod")
+        _, is_prod = validate_deployment_environment(self.environment)
         if is_prod:
             secret = self.visitor_session_secret.strip()
             if not secret or secret == "dev-insecure-visitor-session-secret-change-in-production":
@@ -205,79 +326,88 @@ class Settings(BaseSettings):
                         "Remote return URLs must use https://."
                     )
 
-        # Razorpay Billing Configuration Validation (Step 5.2B)
+        # Razorpay Billing Configuration Validation (Step 5.2B / Option A Stage 1)
         if self.razorpay_enabled:
-            rzp_env = self.razorpay_environment.strip().lower()
-            if rzp_env not in ("test", "live"):
-                raise ValueError("RAZORPAY_ENVIRONMENT must be either 'test' or 'live'.")
+            self.validate_razorpay_configuration()
 
-            key_id = self.razorpay_key_id.strip()
-            if not key_id:
+    def validate_razorpay_configuration(self) -> None:
+        """Validate Razorpay billing configuration against Option A deployment policy (fail-closed)."""
+        if not self.razorpay_enabled:
+            return
+
+        _, is_prod = validate_deployment_environment(self.environment)
+
+        rzp_env = (self.razorpay_environment or "").strip().lower()
+        if rzp_env not in ALLOWED_RAZORPAY_ENVIRONMENTS:
+            raise ValueError("RAZORPAY_ENVIRONMENT must be either 'test' or 'live'.")
+
+        key_id = self.razorpay_key_id.strip()
+        if not key_id:
+            raise ValueError(
+                "RAZORPAY_KEY_ID must be configured when Razorpay billing is enabled."
+            )
+
+        key_secret = self.razorpay_key_secret.get_secret_value().strip()
+        if not key_secret:
+            raise ValueError(
+                "RAZORPAY_KEY_SECRET must be configured when Razorpay billing is enabled."
+            )
+
+        webhook_secret = self.razorpay_webhook_secret.get_secret_value().strip()
+        if not webhook_secret:
+            raise ValueError(
+                "RAZORPAY_WEBHOOK_SECRET must be configured when Razorpay billing is enabled."
+            )
+
+        plan_id = self.razorpay_pro_plan_id.strip()
+        if not plan_id:
+            raise ValueError(
+                "RAZORPAY_PRO_PLAN_ID must be configured when Razorpay billing is enabled."
+            )
+        if not plan_id.startswith("plan_") or len(plan_id) < 8:
+            raise ValueError(
+                "RAZORPAY_PRO_PLAN_ID format is invalid. It must start with 'plan_'."
+            )
+
+        plan_currency = self.razorpay_plan_currency.strip().upper()
+        if len(plan_currency) != 3 or not plan_currency.isalpha():
+            raise ValueError(
+                "RAZORPAY_PLAN_CURRENCY must be a valid 3-letter ISO currency code (e.g., 'USD', 'INR')."
+            )
+
+        merchant_id = self.razorpay_merchant_account_id.strip()
+
+        if is_prod:
+            if rzp_env != "live":
                 raise ValueError(
-                    "RAZORPAY_KEY_ID must be configured when Razorpay billing is enabled."
+                    "RAZORPAY_ENVIRONMENT must be 'live' in production environments."
                 )
-
-            key_secret = self.razorpay_key_secret.get_secret_value().strip()
-            if not key_secret:
+            if key_id.startswith("rzp_test_"):
                 raise ValueError(
-                    "RAZORPAY_KEY_SECRET must be configured when Razorpay billing is enabled."
+                    "Test Razorpay key is prohibited in production environments."
                 )
-
-            webhook_secret = self.razorpay_webhook_secret.get_secret_value().strip()
-            if not webhook_secret:
+            if not key_id.startswith("rzp_live_"):
                 raise ValueError(
-                    "RAZORPAY_WEBHOOK_SECRET must be configured when Razorpay billing is enabled."
+                    "Production Razorpay key must start with 'rzp_live_'."
                 )
-
-            plan_id = self.razorpay_pro_plan_id.strip()
-            if not plan_id:
+            if not merchant_id or merchant_id.lower() in PROHIBITED_PRODUCTION_MERCHANT_IDS:
                 raise ValueError(
-                    "RAZORPAY_PRO_PLAN_ID must be configured when Razorpay billing is enabled."
+                    "Production RAZORPAY_MERCHANT_ACCOUNT_ID must be explicitly configured with a non-default account identifier."
                 )
-            if not plan_id.startswith("plan_") or len(plan_id) < 8:
+        else:
+            # Staging & Local development / testing
+            if rzp_env != "test":
                 raise ValueError(
-                    "RAZORPAY_PRO_PLAN_ID format is invalid. It must start with 'plan_'."
+                    "RAZORPAY_ENVIRONMENT must be 'test' in non-production environments."
                 )
-
-            plan_currency = self.razorpay_plan_currency.strip().upper()
-            if len(plan_currency) != 3 or not plan_currency.isalpha():
+            if key_id.startswith("rzp_live_"):
                 raise ValueError(
-                    "RAZORPAY_PLAN_CURRENCY must be a valid 3-letter ISO currency code (e.g., 'USD', 'INR')."
+                    "Live Razorpay key is prohibited in non-production environments."
                 )
-
-            merchant_id = self.razorpay_merchant_account_id.strip()
-
-            if is_prod:
-                if rzp_env != "live":
-                    raise ValueError(
-                        "RAZORPAY_ENVIRONMENT must be 'live' in production environments."
-                    )
-                if key_id.startswith("rzp_test_"):
-                    raise ValueError(
-                        "Test Razorpay key is prohibited in production environments."
-                    )
-                if not key_id.startswith("rzp_live_"):
-                    raise ValueError(
-                        "Production Razorpay key must start with 'rzp_live_'."
-                    )
-                if not merchant_id or merchant_id.lower() in ("default", "placeholder", "none", "null"):
-                    raise ValueError(
-                        "Production RAZORPAY_MERCHANT_ACCOUNT_ID must be explicitly configured with a non-default account identifier."
-                    )
-            else:
-                # Staging & Local development / testing
-                if rzp_env != "test":
-                    raise ValueError(
-                        "RAZORPAY_ENVIRONMENT must be 'test' in non-production environments."
-                    )
-                if key_id.startswith("rzp_live_"):
-                    raise ValueError(
-                        "Live Razorpay key is prohibited in non-production environments."
-                    )
-                if not key_id.startswith("rzp_test_"):
-                    raise ValueError(
-                        "Development/test Razorpay key must start with 'rzp_test_'."
-                    )
+            if not key_id.startswith("rzp_test_"):
+                raise ValueError(
+                    "Development/test Razorpay key must start with 'rzp_test_'."
+                )
 
     @property
     def resolved_visitor_session_secret(self) -> str:

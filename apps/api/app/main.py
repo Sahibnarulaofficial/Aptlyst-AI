@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application lifespan managing startup validation and resource cleanup."""
     validate_rate_limiter_configuration()
+    if settings.razorpay_enabled:
+        settings.validate_razorpay_configuration()
     if settings.default_free_monthly_token_quota <= 0:
         logger.warning(
             "DEFAULT_FREE_MONTHLY_TOKEN_QUOTA is configured to %d. "

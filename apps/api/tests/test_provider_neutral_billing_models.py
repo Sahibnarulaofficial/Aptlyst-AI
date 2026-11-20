@@ -304,18 +304,16 @@ def test_scoped_unique_constraints_and_indexes() -> None:
     webhook_uq = {c.name for c in webhook_table.constraints if c.__class__.__name__ == "UniqueConstraint"}
     assert "uq_billing_webhook_provider_event" in webhook_uq
 
-    # Checkout attempt uniqueness
+    # Checkout attempt uniqueness (ADR-006 Stage 2C: scoped to (organization_id, environment))
     checkout_table = Base.metadata.tables["billing_checkout_attempts"]
     checkout_uq = {c.name for c in checkout_table.constraints if c.__class__.__name__ == "UniqueConstraint"}
     assert "uq_billing_checkout_org_idempotency" in checkout_uq
     checkout_indexes = {idx.name: idx for idx in checkout_table.indexes}
-    assert "uq_org_scoped_active_billing_checkout_attempt" in checkout_indexes
-    scoped_attempt_idx = checkout_indexes["uq_org_scoped_active_billing_checkout_attempt"]
-    assert scoped_attempt_idx.unique is True
-    assert [c.name for c in scoped_attempt_idx.columns] == [
+    assert "uq_org_env_active_billing_checkout_attempt" in checkout_indexes
+    env_attempt_idx = checkout_indexes["uq_org_env_active_billing_checkout_attempt"]
+    assert env_attempt_idx.unique is True
+    assert [c.name for c in env_attempt_idx.columns] == [
         "organization_id",
-        "provider",
-        "merchant_account_id",
         "environment",
     ]
 

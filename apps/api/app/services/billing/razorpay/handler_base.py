@@ -41,10 +41,15 @@ import uuid
 
 from sqlalchemy import case, cast, func, select
 from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.dml import Insert
 
-from app.config import settings
+from app.config import (
+    ALLOWED_RAZORPAY_ENVIRONMENTS,
+    settings,
+    validate_deployment_environment,
+)
 from app.models.payment import (
     BillingCustomerProvision,
     BillingWebhookEvent,
@@ -514,13 +519,39 @@ def validate_razorpay_event_envelope(
     Returns:
         RazorpayEventContext: Validated context object with typed entities.
     """
-    configured_merchant = expected_merchant_id or (settings.razorpay_merchant_account_id or "").strip()
-    configured_env = expected_environment or (settings.razorpay_environment or "").strip().lower()
+    try:
+        _, is_prod = validate_deployment_environment(getattr(settings, "environment", None))
+    except ValueError as exc:
+        raise RazorpayScopeMismatchError(str(exc)) from exc
+
+    configured_merchant = (
+        expected_merchant_id.strip()
+        if isinstance(expected_merchant_id, str) and expected_merchant_id.strip()
+        else (getattr(settings, "razorpay_merchant_account_id", None) or "").strip()
+    )
+    raw_expected_env = (
+        expected_environment
+        if expected_environment is not None
+        else getattr(settings, "razorpay_environment", None)
+    )
+    configured_env = (
+        raw_expected_env.strip().lower() if isinstance(raw_expected_env, str) else ""
+    )
+    if configured_env not in ALLOWED_RAZORPAY_ENVIRONMENTS:
+        raise RazorpayScopeMismatchError(
+            f"Missing or invalid Razorpay environment configuration '{raw_expected_env}'. "
+            "Must be 'test' or 'live'."
+        )
+    if is_prod and configured_env != "live":
+        raise RazorpayScopeMismatchError(
+            f"Production deployments strictly require Razorpay 'live' environment; "
+            f"got '{configured_env}'."
+        )
 
     if isinstance(event_or_payload, (ClaimedWebhookEvent, BillingWebhookEvent)):
         event_model = event_or_payload
         # 1. Provider validation
-        if event_model.provider.strip().lower() != "razorpay":
+        if (event_model.provider or "").strip().lower() != "razorpay":
             raise RazorpayScopeMismatchError(
                 f"Invalid provider '{event_model.provider}'. Expected 'razorpay'."
             )
@@ -533,20 +564,30 @@ def validate_razorpay_event_envelope(
                 "Unverified webhook events must never be processed."
             )
 
-        # 3. Scope validation
+        # 3. Scope validation (Option A fail-closed provenance)
         if configured_merchant and configured_merchant != "default":
-            if event_model.merchant_account_id.strip() != configured_merchant:
+            if (event_model.merchant_account_id or "").strip() != configured_merchant:
                 raise RazorpayScopeMismatchError(
                     f"Merchant account mismatch: event merchant '{event_model.merchant_account_id}' "
                     f"does not match expected '{configured_merchant}'."
                 )
 
-        if configured_env:
-            if event_model.environment.strip().lower() != configured_env:
-                raise RazorpayScopeMismatchError(
-                    f"Environment mismatch: event environment '{event_model.environment}' "
-                    f"does not match expected '{configured_env}'."
-                )
+        raw_event_env = getattr(event_model, "environment", None)
+        event_env = raw_event_env.strip().lower() if isinstance(raw_event_env, str) else ""
+        if event_env not in ALLOWED_RAZORPAY_ENVIRONMENTS:
+            raise RazorpayScopeMismatchError(
+                f"Missing or invalid webhook event environment '{raw_event_env}'. "
+                "Must be 'test' or 'live'."
+            )
+        if is_prod and event_env != "live":
+            raise RazorpayScopeMismatchError(
+                f"Non-live webhook event environment '{event_env}' is prohibited in production."
+            )
+        if event_env != configured_env:
+            raise RazorpayScopeMismatchError(
+                f"Environment mismatch: event environment '{event_model.environment}' "
+                f"does not match expected '{configured_env}'."
+            )
 
         raw_payload = event_model.payload
         event_id = getattr(event_model, "event_id", getattr(event_model, "id", uuid.uuid4()))
@@ -573,15 +614,17 @@ def validate_razorpay_event_envelope(
         raise RazorpayPayloadValidationError("Webhook payload must be a JSON object dictionary.")
 
     # Validate mandatory envelope keys if payload is an outer envelope
+    payload_account_id: str | None = None
     if raw_payload.get("entity") == "event":
-        payload_account_id = raw_payload.get("account_id")
-        if not payload_account_id or not isinstance(payload_account_id, str):
+        raw_payload_account_id = raw_payload.get("account_id")
+        if not raw_payload_account_id or not isinstance(raw_payload_account_id, str):
             raise RazorpayPayloadValidationError("Missing or invalid 'account_id' in webhook envelope.")
+        payload_account_id = raw_payload_account_id.strip()
 
         if configured_merchant and configured_merchant != "default":
-            if payload_account_id.strip() != configured_merchant:
+            if payload_account_id != configured_merchant:
                 raise RazorpayScopeMismatchError(
-                    f"Payload account_id '{payload_account_id}' does not match expected merchant '{configured_merchant}'."
+                    f"Payload account_id '{raw_payload_account_id}' does not match expected merchant '{configured_merchant}'."
                 )
 
         inner_payload = raw_payload.get("payload")
@@ -624,11 +667,22 @@ def validate_razorpay_event_envelope(
 
     ctx_worker_now = worker_now or getattr(event_or_payload, "worker_now", None)
 
+    if configured_merchant and configured_merchant != "default":
+        effective_merchant = configured_merchant
+    elif isinstance(event_or_payload, (ClaimedWebhookEvent, BillingWebhookEvent)) and (
+        getattr(event_or_payload, "merchant_account_id", None) or ""
+    ).strip():
+        effective_merchant = event_or_payload.merchant_account_id.strip()
+    elif payload_account_id:
+        effective_merchant = payload_account_id
+    else:
+        effective_merchant = configured_merchant or "default"
+
     return RazorpayEventContext(
         event_id=event_id,
         provider="razorpay",
-        merchant_account_id=configured_merchant or "default",
-        environment=configured_env or "live",
+        merchant_account_id=effective_merchant,
+        environment=configured_env,
         provider_event_id=provider_event_id,
         event_type=event_type,
         event_created_at=event_created_at,
@@ -837,6 +891,7 @@ async def stage_or_update_payment_reconciliation(
 
         # Update diagnostic payload immutably
         existing.diagnostic_payload = {
+            **clean_data,
             **existing.diagnostic_payload,
             "history": existing_history,
             "latest": clean_data,
@@ -871,15 +926,52 @@ async def stage_or_update_payment_reconciliation(
         reason=reason,
         status=ReconciliationStatus.pending_review,
         diagnostic_payload={
+            **clean_data,
             "history": [new_history_entry],
             "latest": clean_data,
         },
         created_at=now_utc,
         updated_at=now_utc,
     )
-    db.add(new_case)
-    await db.flush()
-    return new_case
+
+    if hasattr(db, "begin_nested"):
+        try:
+            async with db.begin_nested():
+                db.add(new_case)
+                await db.flush()
+            return new_case
+        except IntegrityError:
+            # Concurrent insert race occurred on unique case_key constraint.
+            # Savepoint was cleanly rolled back. Re-query under row lock and update existing case.
+            res = await db.execute(stmt)
+            existing = res.scalar_one_or_none()
+            if existing is not None:
+                existing_history = list(existing.diagnostic_payload.get("history", []))
+                existing_history.append(new_history_entry)
+                existing.diagnostic_payload = {
+                    **clean_data,
+                    **existing.diagnostic_payload,
+                    "history": existing_history,
+                    "latest": clean_data,
+                }
+                existing.updated_at = now_utc
+                if organization_id and not existing.organization_id:
+                    existing.organization_id = organization_id
+                if subscription_id and not existing.subscription_id:
+                    existing.subscription_id = subscription_id
+                if invoice_id and not existing.invoice_id:
+                    existing.invoice_id = invoice_id
+                if payment_id and not existing.payment_id:
+                    existing.payment_id = payment_id
+                if raw_event_id and not existing.raw_event_id:
+                    existing.raw_event_id = raw_event_id
+                await db.flush()
+                return existing
+            raise
+    else:
+        db.add(new_case)
+        await db.flush()
+        return new_case
 
 
 def build_payment_reconciliation_upsert_stmt(

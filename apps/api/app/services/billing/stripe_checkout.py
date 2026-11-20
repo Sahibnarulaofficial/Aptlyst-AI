@@ -29,14 +29,16 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
+from app.config import resolve_required_razorpay_environment, settings
 from app.models.organization import Organization
+from app.models.payment import BillingCheckoutAttempt
 from app.models.subscription import (
     CheckoutAttemptStatus,
     StripeCheckoutAttempt,
     Subscription,
     SubscriptionStatus,
 )
+from app.services.billing.advisory_lock import acquire_advisory_lock
 from app.services.billing.stripe_client import (
     StripeBillingDisabledError,
     StripeConfigurationError,
@@ -606,6 +608,57 @@ async def _is_attempt_reconciled(
     return matching_sub is not None
 
 
+async def _assert_no_conflicting_razorpay_attempt(
+    db: AsyncSession,
+    organization_id: uuid.UUID,
+) -> None:
+    """Strictly read-only compatibility guard blocking Stripe checkout when a Razorpay attempt is active.
+
+    Must execute inside the Level 0A organization advisory lock transaction.
+    Fails closed if deployment environment provenance cannot be verified.
+    """
+    try:
+        target_env = resolve_required_razorpay_environment(getattr(settings, "environment", None))
+    except ValueError as exc:
+        await db.rollback()
+        raise CheckoutRecoveryRequiredError(
+            f"Unable to verify deployment environment provenance for cross-provider checkout check: {exc}"
+        ) from exc
+
+    stmt_rzp = (
+        select(BillingCheckoutAttempt)
+        .where(
+            BillingCheckoutAttempt.organization_id == organization_id,
+            BillingCheckoutAttempt.environment == target_env,
+            BillingCheckoutAttempt.status.in_(
+                (
+                    CheckoutAttemptStatus.creating,
+                    CheckoutAttemptStatus.recovery_required,
+                    CheckoutAttemptStatus.open,
+                    CheckoutAttemptStatus.payment_pending,
+                )
+            ),
+        )
+        .order_by(BillingCheckoutAttempt.created_at.desc(), BillingCheckoutAttempt.id.asc())
+        .limit(1)
+    )
+    res_rzp = await db.execute(stmt_rzp)
+    active_rzp = res_rzp.scalar_one_or_none()
+    if active_rzp is None:
+        return
+
+    await db.rollback()
+    if active_rzp.status == CheckoutAttemptStatus.recovery_required:
+        raise CheckoutRecoveryRequiredError(
+            f"A conflicting Razorpay checkout attempt ({active_rzp.id}) in '{target_env}' "
+            f"requires reconciliation before a Stripe checkout session can be initiated."
+        )
+    raise CheckoutInProgressError(
+        f"A conflicting Razorpay checkout attempt ({active_rzp.id}) is already active "
+        f"for organization {organization_id} in '{target_env}'."
+    )
+
+
 # =============================================================================
 # Core Domain Operations
 # =============================================================================
@@ -677,7 +730,9 @@ async def create_stripe_checkout_session(
     if db.in_transaction():
         await db.commit()
 
-    # 4. Lock parent organization row to serialize concurrent checkout attempts.
+    # 4. Acquire canonical Level 0A organization advisory lock (ADR-005) BEFORE row-level locks.
+    await acquire_advisory_lock(db, "organization", organization.id)
+
     org_stmt = (
         select(Organization.id)
         .where(Organization.id == organization.id)
@@ -700,6 +755,10 @@ async def create_stripe_checkout_session(
         raise ActiveSubscriptionExistsError(
             f"Organization {organization.id} already has an active or trialing subscription."
         )
+
+    # 5.25. Minimal Stage 2A cross-table compatibility guard: block if an active Razorpay
+    # checkout attempt exists in the resolved environment (read-only; never mutates Razorpay rows).
+    await _assert_no_conflicting_razorpay_attempt(db, organization.id)
 
     # 5.5. Check for completed checkout attempts that have not yet been reconciled into local subscription
     comp_stmt = (
@@ -748,8 +807,10 @@ async def create_stripe_checkout_session(
                 if result is not None:
                     # Stripe says session is still open — reuse it.
                     return result
-                # result is None → Stripe confirmed expired → re-lock and proceed to fresh attempt.
+                # result is None → Stripe confirmed expired → re-lock and re-verify before fresh attempt.
+                await acquire_advisory_lock(db, "organization", organization.id)
                 await db.execute(org_stmt)
+                await _assert_no_conflicting_razorpay_attempt(db, organization.id)
 
         elif active_attempt.status == CheckoutAttemptStatus.payment_pending:
             await db.rollback()

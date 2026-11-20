@@ -15,7 +15,11 @@ from typing import Any
 import httpx
 from pydantic import SecretStr
 
-from app.config import settings
+from app.config import (
+    PROHIBITED_PRODUCTION_MERCHANT_IDS,
+    settings,
+    validate_razorpay_runtime_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,14 +105,44 @@ class RazorpayClient:
         base_url: str = "https://api.razorpay.com/v1",
         timeout: float = 15.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        merchant_account_id: str | None = None,
+        environment: str | None = None,
     ) -> None:
         if not key_id or not key_id.strip():
             raise RazorpayConfigurationError("Razorpay key_id must be non-empty.")
         if not key_secret or not key_secret.strip():
             raise RazorpayConfigurationError("Razorpay key_secret must be non-empty.")
 
-        self.key_id = key_id.strip()
-        self._key_secret = key_secret.strip()
+        clean_key = key_id.strip()
+        clean_secret = key_secret.strip()
+
+        if environment is not None:
+            clean_env = environment.strip().lower()
+            if clean_env not in ("test", "live"):
+                raise RazorpayConfigurationError(
+                    f"Invalid Razorpay client environment '{environment}'. Must be 'test' or 'live'."
+                )
+            if clean_env == "live":
+                if not clean_key.startswith("rzp_live_"):
+                    raise RazorpayConfigurationError(
+                        "Live Razorpay client requires key starting with 'rzp_live_'."
+                    )
+                if merchant_account_id is not None:
+                    clean_merchant = merchant_account_id.strip().lower()
+                    if clean_merchant in PROHIBITED_PRODUCTION_MERCHANT_IDS or not clean_merchant:
+                        raise RazorpayConfigurationError(
+                            f"Live Razorpay client rejects prohibited merchant account '{merchant_account_id}'."
+                        )
+            else:
+                if not clean_key.startswith("rzp_test_"):
+                    raise RazorpayConfigurationError(
+                        "Test Razorpay client requires key starting with 'rzp_test_'."
+                    )
+
+        self.key_id = clean_key
+        self._key_secret = clean_secret
+        self.merchant_account_id = merchant_account_id.strip() if merchant_account_id else None
+        self.environment = environment.strip().lower() if environment else None
         self.base_url = base_url.rstrip("/")
         self.timeout = httpx.Timeout(timeout, connect=5.0)
         self._transport = transport
@@ -437,19 +471,59 @@ def is_razorpay_enabled() -> bool:
     )
 
 
-def get_razorpay_client() -> RazorpayClient:
+def get_razorpay_client(
+    *,
+    expected_merchant_account_id: str | None = None,
+    expected_environment: str | None = None,
+) -> RazorpayClient:
     """Retrieve or initialize the centralized RazorpayClient instance.
+
+    Guarantees:
+    - Sourced strictly from validated deployment configuration.
+    - Enforces agreement with expected_merchant_account_id and expected_environment.
+    - Fails closed on any mismatch before returning a client.
 
     Raises:
         RazorpayBillingDisabledError: If settings.razorpay_enabled is False.
-        RazorpayConfigurationError: If key_id or key_secret is missing.
+        RazorpayConfigurationError: If key_id or key_secret is missing, or scope mismatch occurs.
 
     Returns:
         RazorpayClient: Configured async client.
     """
     global _TEST_RAZORPAY_CLIENT, _CACHED_RAZORPAY_CLIENT
 
+    try:
+        canonical_merchant, canonical_env = validate_razorpay_runtime_scope()
+    except ValueError as exc:
+        raise RazorpayConfigurationError(str(exc)) from exc
+
+    if expected_merchant_account_id is not None:
+        clean_expected_merchant = expected_merchant_account_id.strip()
+        if clean_expected_merchant != canonical_merchant:
+            raise RazorpayConfigurationError(
+                f"Merchant account mismatch: expected canonical '{canonical_merchant}', "
+                f"got '{clean_expected_merchant}'."
+            )
+
+    if expected_environment is not None:
+        clean_expected_env = expected_environment.strip().lower()
+        if clean_expected_env != canonical_env:
+            raise RazorpayConfigurationError(
+                f"Environment mismatch: expected canonical '{canonical_env}', "
+                f"got '{clean_expected_env}'."
+            )
+
     if _TEST_RAZORPAY_CLIENT is not None:
+        client_merchant = getattr(_TEST_RAZORPAY_CLIENT, "merchant_account_id", None)
+        if client_merchant and str(client_merchant).strip() != canonical_merchant:
+            raise RazorpayConfigurationError(
+                f"Mock client merchant_account_id '{client_merchant}' conflicts with canonical '{canonical_merchant}'."
+            )
+        client_env = getattr(_TEST_RAZORPAY_CLIENT, "environment", None)
+        if client_env and str(client_env).strip().lower() != canonical_env:
+            raise RazorpayConfigurationError(
+                f"Mock client environment '{client_env}' conflicts with canonical '{canonical_env}'."
+            )
         return _TEST_RAZORPAY_CLIENT
 
     if not settings.razorpay_enabled:
@@ -465,10 +539,17 @@ def get_razorpay_client() -> RazorpayClient:
             "Razorpay credentials are incomplete. Check RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET."
         )
 
-    if _CACHED_RAZORPAY_CLIENT is None:
+    if (
+        _CACHED_RAZORPAY_CLIENT is None
+        or _CACHED_RAZORPAY_CLIENT.key_id != key_id
+        or _CACHED_RAZORPAY_CLIENT.merchant_account_id != canonical_merchant
+        or _CACHED_RAZORPAY_CLIENT.environment != canonical_env
+    ):
         _CACHED_RAZORPAY_CLIENT = RazorpayClient(
             key_id=key_id,
             key_secret=key_secret,
+            merchant_account_id=canonical_merchant,
+            environment=canonical_env,
         )
 
     return _CACHED_RAZORPAY_CLIENT

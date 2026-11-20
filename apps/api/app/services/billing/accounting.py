@@ -28,7 +28,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
+from app.config import settings, validate_deployment_environment
 
 logger = logging.getLogger(__name__)
 
@@ -257,21 +257,55 @@ async def reserve_usage(
     # Free billing periods bypass this check; they do not require a Subscription row.
     is_paid_period = bool(period.plan_tier and period.plan_tier.strip().lower() != "free")
     if is_paid_period:
+        # Validate deployment environment provenance (fail closed if missing or unrecognized)
+        try:
+            _, is_prod = validate_deployment_environment(getattr(settings, "environment", None))
+        except ValueError as exc:
+            logger.error(
+                "Invalid deployment environment provenance during Pro reservation for org %s: %s",
+                org_id,
+                exc,
+            )
+            return ReservationResult(
+                success=False,
+                error_code=AccountingErrorCode.RECONCILIATION_REQUIRED,
+                message="Deployment environment provenance is invalid or unverifiable; failing closed",
+            )
+
         # Select subscriptions for the organization that are eligible to authorize Pro usage.
         # Eligible statuses: active, past_due (subject to grace period evaluation).
-        # We query only eligible statuses to safely ignore historical canceled/incomplete rows
-        # while leveraging the partial unique index uq_org_active_subscription.
+        # Option A Production Accounting Isolation:
+        # - In production deployments ('production', 'prod'), ONLY subscriptions with explicit
+        #   environment == 'live' are eligible (test, legacy, and unknown environments are excluded).
+        # - In non-production deployments, test-environment subscriptions are still excluded so
+        #   test subscriptions can never authorize Pro usage or cause duplicate-subscription
+        #   reconciliation failures, while preserving existing non-production test compatibility.
         eligible_statuses = (SubscriptionStatus.active, SubscriptionStatus.past_due)
+        sub_where_clauses = [
+            Subscription.organization_id == org_id,
+            Subscription.status.in_(eligible_statuses),
+        ]
+        if is_prod:
+            sub_where_clauses.append(Subscription.environment == "live")
+        else:
+            sub_where_clauses.append(Subscription.environment != "test")
+
         stmt_sub = (
             select(Subscription)
-            .where(
-                Subscription.organization_id == org_id,
-                Subscription.status.in_(eligible_statuses),
-            )
+            .where(*sub_where_clauses)
             .with_for_update()
         )
         res_sub = await session.execute(stmt_sub)
-        eligible_subs = res_sub.scalars().all()
+        raw_eligible_subs = res_sub.scalars().all()
+
+        def _is_subscription_environment_eligible(sub_obj: Subscription) -> bool:
+            raw_env = getattr(sub_obj, "environment", None)
+            sub_env = raw_env.strip().lower() if isinstance(raw_env, str) else ""
+            if is_prod:
+                return sub_env == "live"
+            return bool(sub_env) and sub_env != "test"
+
+        eligible_subs = [s for s in raw_eligible_subs if _is_subscription_environment_eligible(s)]
 
         if len(eligible_subs) > 1:
             logger.warning(
@@ -291,16 +325,22 @@ async def reserve_usage(
 
         if len(eligible_subs) == 0:
             # Check if a non-entitled subscription row exists for diagnostic reporting
+            diag_where_clauses = [Subscription.organization_id == org_id]
+            if is_prod:
+                diag_where_clauses.append(Subscription.environment == "live")
+            else:
+                diag_where_clauses.append(Subscription.environment != "test")
+
             stmt_any = (
                 select(Subscription)
-                .where(Subscription.organization_id == org_id)
+                .where(*diag_where_clauses)
                 .order_by(Subscription.created_at.desc())
                 .limit(1)
             )
             res_any = await session.execute(stmt_any)
             latest_sub = res_any.scalar_one_or_none()
 
-            if latest_sub is not None:
+            if latest_sub is not None and _is_subscription_environment_eligible(latest_sub):
                 return ReservationResult(
                     success=False,
                     error_code=AccountingErrorCode.SUBSCRIPTION_INACTIVE,
@@ -311,7 +351,11 @@ async def reserve_usage(
             return ReservationResult(
                 success=False,
                 error_code=AccountingErrorCode.SUBSCRIPTION_NOT_FOUND,
-                message="Pro billing period requires an active Stripe subscription record, but none was found",
+                message=(
+                    "Pro billing period requires an active live subscription record, but none was found"
+                    if is_prod
+                    else "Pro billing period requires an active Stripe subscription record, but none was found"
+                ),
             )
 
         subscription = eligible_subs[0]

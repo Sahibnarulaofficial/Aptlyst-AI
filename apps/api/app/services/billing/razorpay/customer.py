@@ -41,7 +41,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
+from app.config import settings, validate_razorpay_runtime_scope
 from app.db.session import AsyncSessionFactory, AsyncSessionLocal
 from app.models.organization import Organization
 from app.models.payment import (
@@ -141,41 +141,23 @@ class RazorpayCustomerPersistenceError(RazorpayCustomerError):
 def _get_provisioning_scope() -> tuple[str, str]:
     """Retrieve and strictly validate the Razorpay provisioning scope.
 
-    Fails closed if merchant_account_id or environment is unconfigured or invalid.
+    Fails closed if deployment environment, merchant_account_id, or razorpay_environment
+    is unconfigured, invalid, or violates Option A production live-only isolation.
     Guarantees:
     - merchant_account_id is explicitly non-empty and non-default in production.
     - environment is strictly either 'test' or 'live'.
+    - Production deployments ('production', 'prod') strictly require 'live'.
+    - Non-production deployments strictly require 'test'.
     - Model server defaults ('default', 'live') can never override missing service configuration.
     """
-    env = (settings.razorpay_environment or "").strip().lower()
-    if env not in ("test", "live"):
-        raise RazorpayConfigurationError(
-            f"Invalid Razorpay environment '{settings.razorpay_environment}'. Must be 'test' or 'live'."
+    try:
+        return validate_razorpay_runtime_scope(
+            deployment_env=getattr(settings, "environment", None),
+            razorpay_env=getattr(settings, "razorpay_environment", None),
+            merchant_account_id=getattr(settings, "razorpay_merchant_account_id", None),
         )
-
-    merchant_id = (settings.razorpay_merchant_account_id or "").strip()
-    if not merchant_id:
-        raise RazorpayConfigurationError(
-            "Razorpay merchant account ID must be explicitly configured."
-        )
-
-    app_env = getattr(settings, "environment", "development").strip().lower()
-    if app_env == "production":
-        if merchant_id.lower() in ("default", "placeholder"):
-            raise RazorpayConfigurationError(
-                "Production RAZORPAY_MERCHANT_ACCOUNT_ID must be explicitly configured with a non-default account identifier."
-            )
-        if env != "live":
-            raise RazorpayConfigurationError(
-                "Production RAZORPAY_ENVIRONMENT must be 'live'."
-            )
-    else:
-        if env != "test":
-            raise RazorpayConfigurationError(
-                "Non-production RAZORPAY_ENVIRONMENT must be 'test'."
-            )
-
-    return merchant_id, env
+    except ValueError as exc:
+        raise RazorpayConfigurationError(str(exc)) from exc
 
 
 async def _safe_rollback(db: AsyncSession) -> None:

@@ -42,6 +42,11 @@ import uuid
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import (
+    ALLOWED_RAZORPAY_ENVIRONMENTS,
+    settings,
+    validate_deployment_environment,
+)
 from app.models.payment import BillingWebhookEvent
 from app.models.subscription import WebhookProcessingStatus
 from app.services.billing.webhook_errors import (
@@ -1059,27 +1064,69 @@ async def execute_claimed_razorpay_webhook_event(
                     failure_category="scope_mismatch",
                 )
 
-        if expected_environment:
-            if event.environment.strip().lower() != expected_environment.strip().lower():
-                event.attempts += 1
-                event.status = WebhookProcessingStatus.quarantined
-                event.quarantined_at = now
-                event.quarantine_reason = f"Environment mismatch: expected {expected_environment}, got {event.environment}"
-                event.error_message = sanitize_billing_error_message(event.quarantine_reason)
-                event.next_retry_at = None
-                event.lease_token = None
-                event.locked_by = None
-                event.lease_expires_at = None
-                await work_db.commit()
-                return ProcessResult(
-                    success=False,
-                    status=WebhookProcessingStatus.quarantined,
-                    event_id=claimed.event_id,
-                    provider_event_id=claimed.provider_event_id,
-                    attempts=event.attempts,
-                    message="Quarantined: environment mismatch",
-                    failure_category="scope_mismatch",
+        # 5C. Fail-closed environment provenance & Option A production live-only validation
+        env_quarantine_reason: str | None = None
+        try:
+            _, is_prod = validate_deployment_environment(getattr(settings, "environment", None))
+        except ValueError as exc:
+            is_prod = True
+            env_quarantine_reason = f"Invalid deployment environment provenance: {exc}"
+
+        raw_event_env = getattr(event, "environment", None)
+        event_env = raw_event_env.strip().lower() if isinstance(raw_event_env, str) else ""
+        if env_quarantine_reason is None and event_env not in ALLOWED_RAZORPAY_ENVIRONMENTS:
+            env_quarantine_reason = (
+                f"Missing or invalid webhook event environment: '{raw_event_env}'"
+            )
+
+        if env_quarantine_reason is None and is_prod and event_env != "live":
+            env_quarantine_reason = (
+                f"Non-live webhook event environment '{event_env}' is prohibited in production"
+            )
+
+        if env_quarantine_reason is None:
+            raw_expected_env = (
+                expected_environment
+                if expected_environment is not None
+                else getattr(settings, "razorpay_environment", None)
+            )
+            resolved_expected_env = (
+                raw_expected_env.strip().lower() if isinstance(raw_expected_env, str) else ""
+            )
+            if resolved_expected_env not in ALLOWED_RAZORPAY_ENVIRONMENTS:
+                env_quarantine_reason = (
+                    f"Missing or invalid expected Razorpay environment: '{raw_expected_env}'"
                 )
+            elif is_prod and resolved_expected_env != "live":
+                env_quarantine_reason = (
+                    f"Production worker strictly requires Razorpay 'live' environment; "
+                    f"got '{resolved_expected_env}'"
+                )
+            elif event_env != resolved_expected_env:
+                env_quarantine_reason = (
+                    f"Environment mismatch: expected {resolved_expected_env}, got {event.environment}"
+                )
+
+        if env_quarantine_reason is not None:
+            event.attempts += 1
+            event.status = WebhookProcessingStatus.quarantined
+            event.quarantined_at = now
+            event.quarantine_reason = env_quarantine_reason
+            event.error_message = sanitize_billing_error_message(event.quarantine_reason)
+            event.next_retry_at = None
+            event.lease_token = None
+            event.locked_by = None
+            event.lease_expires_at = None
+            await work_db.commit()
+            return ProcessResult(
+                success=False,
+                status=WebhookProcessingStatus.quarantined,
+                event_id=claimed.event_id,
+                provider_event_id=claimed.provider_event_id,
+                attempts=event.attempts,
+                message="Quarantined: environment mismatch",
+                failure_category="scope_mismatch",
+            )
 
         # 6. Dispatch lookup check
         if handler is None:

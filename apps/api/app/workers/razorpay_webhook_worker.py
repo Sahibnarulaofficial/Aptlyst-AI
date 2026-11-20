@@ -38,6 +38,11 @@ if _API_ROOT not in sys.path:
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import (
+    ALLOWED_RAZORPAY_ENVIRONMENTS,
+    settings,
+    validate_deployment_environment,
+)
 from app.db.session import AsyncSessionLocal
 from app.models.subscription import WebhookProcessingStatus
 from app.services.billing.razorpay.webhook_engine import (
@@ -117,7 +122,29 @@ class RazorpayWebhookWorker:
         self.max_attempts = (
             max_attempts if max_attempts is not None else MAX_WEBHOOK_ATTEMPTS
         )
-        self.environment = environment
+        _, is_prod = validate_deployment_environment(getattr(settings, "environment", None))
+        if environment is not None:
+            clean_env = environment.strip().lower() if isinstance(environment, str) else ""
+            if clean_env not in ALLOWED_RAZORPAY_ENVIRONMENTS:
+                raise ValueError(
+                    f"Invalid Razorpay worker environment '{environment}'. Must be 'test' or 'live'."
+                )
+            if is_prod and clean_env != "live":
+                raise ValueError(
+                    "Production RazorpayWebhookWorker strictly requires environment='live'; "
+                    "'test' is prohibited."
+                )
+            self.environment: str | None = clean_env
+        elif is_prod:
+            cfg_env = (getattr(settings, "razorpay_environment", None) or "").strip().lower()
+            if cfg_env != "live":
+                raise ValueError(
+                    "Production RazorpayWebhookWorker strictly requires RAZORPAY_ENVIRONMENT='live'; "
+                    f"got '{getattr(settings, 'razorpay_environment', None)}'."
+                )
+            self.environment = "live"
+        else:
+            self.environment = None
         self.clock = clock
         self.merchant_account_id = (
             merchant_account_id if merchant_account_id is not None else env_merchant
