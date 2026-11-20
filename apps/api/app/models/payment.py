@@ -156,11 +156,14 @@ class BillingCheckoutAttempt(Base):
     """Durable tenant-scoped checkout session attempt for provider-neutral billing.
 
     Guarantees:
-    1. Mutual Exclusion: At most one in-flight, pending, or open attempt per organization
-       per provider/account/environment scope via partial unique index uq_org_scoped_active_billing_checkout_attempt.
+    1. Mutual Exclusion: At most one in-flight, pending, or open attempt per
+       (organization_id, environment) across providers via partial unique index
+       uq_org_env_active_billing_checkout_attempt (ADR-006 Decision A).
     2. Deterministic Idempotency: UniqueConstraint on (organization_id, idempotency_key).
-    3. Crash Safety: Leased creating state protects tenant reservation while external gateway
-       call is in flight.
+    3. Crash Safety & Recovery Scheduling: Leased creating state protects tenant
+       reservation while external gateway call is in flight; dedicated recovery fields
+       (next_recovery_retry_at, recovery_claim_expires_at, recovery_claim_id,
+       recovery_attempts) govern ADR-006 Decision C worker claiming and stale-worker fencing.
     """
 
     __tablename__ = "billing_checkout_attempts"
@@ -222,6 +225,18 @@ class BillingCheckoutAttempt(Base):
     attempt_lease_expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+    next_recovery_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    recovery_claim_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    recovery_claim_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    recovery_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     session_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -260,10 +275,8 @@ class BillingCheckoutAttempt(Base):
             name="uq_bca_composite_identity",
         ),
         Index(
-            "uq_org_scoped_active_billing_checkout_attempt",
+            "uq_org_env_active_billing_checkout_attempt",
             "organization_id",
-            "provider",
-            "merchant_account_id",
             "environment",
             unique=True,
             postgresql_where=text(
@@ -301,6 +314,15 @@ class BillingCheckoutAttempt(Base):
             "status",
             "attempt_lease_expires_at",
             postgresql_where=text("status = 'creating'"),
+        ),
+        Index(
+            "ix_billing_checkout_attempts_recovery_claim",
+            "status",
+            "next_recovery_retry_at",
+            "recovery_claim_expires_at",
+            postgresql_where=text(
+                "status = 'recovery_required' AND next_recovery_retry_at IS NOT NULL"
+            ),
         ),
     )
 
@@ -643,7 +665,9 @@ class BillingPayment(Base):
             "reconciliation_state",
             "lease_expires_at",
             "attempt_count",
-            postgresql_where=text("reconciliation_state IN ('unreconciled', 'reconciling')"),
+            postgresql_where=text(
+                "reconciliation_state IN ('unreconciled', 'reconciling', 'pending_attempt_binding')"
+            ),
         ),
     )
 
