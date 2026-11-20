@@ -64,9 +64,12 @@ We are currently executing **D-2 Stage 2: Preparatory Phase (TASK-D2-S2-PREP-01)
 | **BLK-03** | Concurrency / Locks | Advisory lock primitive unification (`advisory_lock.py`, facade in `razorpay/lock.py`, transitional dual-lock in `organizations.py`, strictly ascending multi-entity sort order) | **RESOLVED** (PREP-01) |
 | **BLK-08** | Documentation | Canonical roadmap and ADR-005 synchronization reflecting D-04A closure and D-2 Stage 2 status | **RESOLVED** (PREP-01) |
 | **BLK-04** | Data Integrity | Payment binding sweeper schema & query design for timed-out attempts | **PENDING** |
-| **BLK-05** | State Machine | Settlement idempotency & transition state machine verification | **PENDING** |
+| **BLK-05** | State Machine | Checkout exclusivity, recovery lifecycle & settlement state machine policy | **DESIGN FINALIZED (ADR-006 Option A Authorized)** — *Implementation Pending* |
 | **BLK-06** | Resilience | Reconciliation quarantine & out-of-order webhook isolation | **PENDING** |
 | **BLK-07** | Test Harness | Live PostgreSQL multi-tenant fixture harness for parallel webhook/checkout concurrency | **PENDING** |
+
+> [!NOTE]
+> **BLK-05 Status Note**: The Product Owner has authorized **Option A** (production billing databases are live-only; test-mode billing runs in isolated development, staging, and CI databases), and **ADR-006 documentation is finalized** (supporting rationale preserved in `docs/decisions/ADR-006-TEST-LIVE-SUBSCRIPTION-DECISION-BRIEF.md`). Decisions include defensive `(organization_id, environment)` attempt exclusivity, preserved global active-subscription uniqueness, live-only production entitlements, read-only Stripe archive, NULL-safe recovery worker leases with `recovery_claim_id` fencing, and platform-staff authorization with two-person approval. **Implementation remains strictly pending and NOT complete**: production safety safeguards (Stripe `livemode` enforcement, `accounting.py` test-environment exclusion, Razorpay pre-activation conflict reconciliation), schema migrations, recovery worker, staff auth boundaries, and settlement reconciliation are **not yet implemented** and remain gated behind separate implementation authorization and BLK-04, BLK-06, and BLK-07.
 
 ---
 

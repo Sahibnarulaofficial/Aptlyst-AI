@@ -42,10 +42,10 @@ We are currently at **D-2 Stage 2: Preparatory Phase (TASK-D2-S2-PREP-01)** in i
 
 ### 2.2 Outstanding Stage 2 Blockers
 - **BLK-04**: Payment binding sweeper schema & query design for timed-out attempts (PENDING).
-- **BLK-05**: Settlement idempotency & transition state machine verification (PENDING).
+- **BLK-05**: Checkout exclusivity, recovery lifecycle & settlement state machine policy (Option A authorized by Product Owner; ADR-006 and supporting decision brief finalized at documentation level; implementation PENDING — production safety safeguards including Stripe `livemode` enforcement and accounting test-environment exclusion, recovery worker, schema migrations, staff security, and settlement reconciliation are **not yet implemented**).
 - **BLK-06**: Reconciliation quarantine & out-of-order webhook isolation (PENDING).
 - **BLK-07**: Live PostgreSQL multi-tenant test harness for parallel webhook/checkout concurrency (PENDING).
-- **Verification Gate**: Full Stage 2 settlement handlers (`subscription.authenticated`, `subscription.charged`) remain strictly blocked until BLK-04 through BLK-07 are completed.
+- **Verification Gate**: Full Stage 2 payment settlement handlers (`subscription.charged`, `payment.captured`, `payment.failed`) remain strictly blocked until BLK-04 through BLK-07 are completed and separate implementation authorization is granted. *(Agreement handlers — `subscription.authenticated`, `subscription.activated`, `subscription.updated`, and `subscription.completed` — are already implemented in `apps/api/app/services/billing/razorpay/agreement_handlers.py`.)*
 
 ---
 
