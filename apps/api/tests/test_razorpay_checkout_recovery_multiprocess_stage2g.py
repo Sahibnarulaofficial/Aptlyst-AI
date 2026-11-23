@@ -390,7 +390,7 @@ async def test_pg16_mp_01_competing_worker_processes() -> None:
 
             for i in range(6):
                 o_id = org_ids[i]
-                org = Organization(id=o_id, name=f"MP Test Org {i}", slug=f"mp-org-{o_id.hex[:8]}")
+                org = Organization(id=o_id, name=f"MP Test Org {i}")
                 db.add(org)
 
                 att = BillingCheckoutAttempt(
@@ -482,7 +482,7 @@ async def test_pg16_mp_02_process_termination_and_lease_reclamation() -> None:
         async with session_factory() as db:
             await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
             await db.execute(delete(Organization).where(Organization.id == org_id))
-            db.add(Organization(id=org_id, name="MP Term Org", slug=f"mp-term-{org_id.hex[:8]}"))
+            db.add(Organization(id=org_id, name="MP Term Org"))
             db.add(
                 BillingCheckoutAttempt(
                     id=attempt_id,
@@ -586,7 +586,7 @@ async def test_pg16_mp_03_stale_process_fencing_and_superseded_rejection() -> No
         async with session_factory() as db:
             await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
             await db.execute(delete(Organization).where(Organization.id == org_id))
-            db.add(Organization(id=org_id, name="MP Fence Org", slug=f"mp-fence-{org_id.hex[:8]}"))
+            db.add(Organization(id=org_id, name="MP Fence Org"))
             db.add(
                 BillingCheckoutAttempt(
                     id=attempt_id,
@@ -730,7 +730,7 @@ async def test_pg16_mp_05_concurrent_jsonb_retry_accounting_multiprocess() -> No
         async with session_factory() as db:
             await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
             await db.execute(delete(Organization).where(Organization.id == org_id))
-            db.add(Organization(id=org_id, name="MP JSONB Org", slug=f"mp-jsonb-{org_id.hex[:8]}"))
+            db.add(Organization(id=org_id, name="MP JSONB Org"))
             db.add(
                 BillingCheckoutAttempt(
                     id=attempt_id,
@@ -860,8 +860,8 @@ async def test_pg16_mp_07_environment_and_merchant_multiprocess_isolation() -> N
         async with session_factory() as db:
             await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id.in_([canonical_test_merchant, foreign_merchant])))
             await db.execute(delete(Organization).where(Organization.id.in_([org_canonical, org_foreign])))
-            db.add(Organization(id=org_canonical, name="MP Canonical Org", slug=f"mp-canon-{org_canonical.hex[:8]}"))
-            db.add(Organization(id=org_foreign, name="MP Foreign Org", slug=f"mp-foreign-{org_foreign.hex[:8]}"))
+            db.add(Organization(id=org_canonical, name="MP Canonical Org"))
+            db.add(Organization(id=org_foreign, name="MP Foreign Org"))
 
             db.add(
                 BillingCheckoutAttempt(
