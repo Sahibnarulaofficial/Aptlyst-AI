@@ -112,20 +112,30 @@ async def _get_verified_pg16_target() -> ValidatedPostgresTestTarget:
         validate_postgres_test_url,
     )
 
+    target = validate_postgres_test_url(raw_url, require_postgres=required)
+    if target is None:
+        raise _OptionalPostgresUnreachableError(
+            "Disposable PostgreSQL 16 test database not available in environment."
+        )
+
+    engine, _summary, _required = await resolve_verified_async_pg_engine()
+    if engine is None:
+        raise _OptionalPostgresUnreachableError(
+            "Disposable PostgreSQL 16 test database not available in environment."
+        )
+
     try:
-        target = validate_postgres_test_url(raw_url, required=required)
-    except _OptionalPostgresUnreachableError as exc:
-        pytest.skip(f"Disposable PostgreSQL 16 environment unavailable: {exc}")
+        _VERIFIED_TARGET_CACHE = target
+        return target
+    finally:
+        await engine.dispose()
 
-    engine = resolve_verified_async_pg_engine(target)
-    async with engine.connect() as conn:
-        res = await conn.execute(text("SELECT current_setting('server_version_num')::integer;"))
-        ver = res.scalar_one()
-        if ver < 160000:
-            raise RuntimeError(f"PostgreSQL 16+ required, found version_num={ver}")
 
-    _VERIFIED_TARGET_CACHE = target
-    return target
+def _make_verified_async_session_factory(async_url: str):
+    """Create a verified AsyncEngine and session factory with NullPool."""
+    engine = create_async_engine(async_url, poolclass=NullPool)
+    session_factory = create_verified_async_session_factory(engine)
+    return engine, session_factory
 
 
 # =============================================================================
@@ -365,91 +375,94 @@ class TestRecoveryMultiProcessOfflineArchitecture:
 async def test_pg16_mp_01_competing_worker_processes() -> None:
     """Scenario A: At least three independent OS worker processes compete for recovery queue."""
     target = await _get_verified_pg16_target()
-    session_factory = create_verified_async_session_factory(target.async_url)
+    engine, session_factory = _make_verified_async_session_factory(target.async_url)
 
     org_ids = [uuid.uuid4() for _ in range(6)]
     test_merchant = "acc_test_mp_compete"
     attempts: list[BillingCheckoutAttempt] = []
     now = datetime.now(timezone.utc)
 
-    # Clean up and seed 6 recovery attempts across 6 distinct organizations (1 active attempt per org/env)
-    async with session_factory() as db:
-        await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
-        await db.execute(delete(Organization).where(Organization.id.in_(org_ids)))
+    try:
+        # Clean up and seed 6 recovery attempts across 6 distinct organizations (1 active attempt per org/env)
+        async with session_factory() as db:
+            await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
+            await db.execute(delete(Organization).where(Organization.id.in_(org_ids)))
 
-        for i in range(6):
-            o_id = org_ids[i]
-            org = Organization(id=o_id, name=f"MP Test Org {i}", slug=f"mp-org-{o_id.hex[:8]}")
-            db.add(org)
+            for i in range(6):
+                o_id = org_ids[i]
+                org = Organization(id=o_id, name=f"MP Test Org {i}", slug=f"mp-org-{o_id.hex[:8]}")
+                db.add(org)
 
-            att = BillingCheckoutAttempt(
-                id=uuid.uuid4(),
-                organization_id=o_id,
-                provider="razorpay",
-                merchant_account_id=test_merchant,
-                environment="test",
-                idempotency_key=f"mp_comp_{i}_{uuid.uuid4().hex[:6]}",
-                status=CheckoutAttemptStatus.recovery_required,
-                amount_minor_units=4900,
-                currency="USD",
-                next_recovery_retry_at=now - timedelta(seconds=10),
-                recovery_attempts=0,
+                att = BillingCheckoutAttempt(
+                    id=uuid.uuid4(),
+                    organization_id=o_id,
+                    provider="razorpay",
+                    merchant_account_id=test_merchant,
+                    environment="test",
+                    idempotency_key=f"mp_comp_{i}_{uuid.uuid4().hex[:6]}",
+                    status=CheckoutAttemptStatus.recovery_required,
+                    amount_minor_units=4900,
+                    currency="USD",
+                    next_recovery_retry_at=now - timedelta(seconds=10),
+                    recovery_attempts=0,
+                )
+                db.add(att)
+                attempts.append(att)
+            await db.commit()
+
+        ctx = mp.get_context("spawn")
+        queue = ctx.Queue()
+        ready_barrier = ctx.Barrier(3)
+
+        processes: list[mp.Process] = []
+        for w_idx in range(3):
+            p = ctx.Process(
+                target=_mp_worker_claim_batch,
+                args=(
+                    f"worker_proc_{w_idx}",
+                    target.async_url,
+                    "test",
+                    test_merchant,
+                    4,  # limit
+                    60,  # lease seconds
+                    queue,
+                    ready_barrier,
+                ),
             )
-            db.add(att)
-            attempts.append(att)
-        await db.commit()
+            processes.append(p)
+            p.start()
 
-    ctx = mp.get_context("spawn")
-    queue = ctx.Queue()
-    ready_barrier = ctx.Barrier(3)
+        # Wait for all processes to finish
+        for p in processes:
+            p.join(timeout=15.0)
+            assert not p.is_alive(), "Worker process timed out"
 
-    processes: list[mp.Process] = []
-    for w_idx in range(3):
-        p = ctx.Process(
-            target=_mp_worker_claim_batch,
-            args=(
-                f"worker_proc_{w_idx}",
-                target.async_url,
-                "test",
-                test_merchant,
-                4,  # limit
-                60,  # lease seconds
-                queue,
-                ready_barrier,
-            ),
-        )
-        processes.append(p)
-        p.start()
+        # Gather results from queue
+        all_claimed_attempt_ids: list[str] = []
+        all_claim_tokens: list[str] = []
 
-    # Wait for all processes to finish
-    for p in processes:
-        p.join(timeout=15.0)
-        assert not p.is_alive(), "Worker process timed out"
+        while not queue.empty():
+            msg = queue.get_nowait()
+            assert msg["error"] is None, f"Worker returned error: {msg['error']}"
+            for c in msg["claimed"]:
+                all_claimed_attempt_ids.append(c["attempt_id"])
+                all_claim_tokens.append(c["claim_id"])
 
-    # Gather results from queue
-    all_claimed_attempt_ids: list[str] = []
-    all_claim_tokens: list[str] = []
+        # Invariants:
+        # 1. Total claims equals total seeded attempts (all claimed)
+        assert len(all_claimed_attempt_ids) == 6, f"Expected 6 claims, got {len(all_claimed_attempt_ids)}"
+        # 2. No attempt claimed more than once (disjoint partition)
+        assert len(set(all_claimed_attempt_ids)) == 6, "Duplicate claims detected across worker processes"
+        # 3. Every fencing token is distinct
+        assert len(set(all_claim_tokens)) == 6, "Non-unique fencing tokens detected"
 
-    while not queue.empty():
-        msg = queue.get_nowait()
-        assert msg["error"] is None, f"Worker returned error: {msg['error']}"
-        for c in msg["claimed"]:
-            all_claimed_attempt_ids.append(c["attempt_id"])
-            all_claim_tokens.append(c["claim_id"])
-
-    # Invariants:
-    # 1. Total claims equals total seeded attempts (all claimed)
-    assert len(all_claimed_attempt_ids) == 6, f"Expected 6 claims, got {len(all_claimed_attempt_ids)}"
-    # 2. No attempt claimed more than once (disjoint partition)
-    assert len(set(all_claimed_attempt_ids)) == 6, "Duplicate claims detected across worker processes"
-    # 3. Every fencing token is distinct
-    assert len(set(all_claim_tokens)) == 6, "Non-unique fencing tokens detected"
-
-    # Cleanup
-    async with session_factory() as db:
-        await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
-        await db.execute(delete(Organization).where(Organization.id.in_(org_ids)))
-        await db.commit()
+        # Cleanup
+        async with session_factory() as db:
+            await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
+            await db.execute(delete(Organization).where(Organization.id.in_(org_ids)))
+            await db.commit()
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -457,100 +470,103 @@ async def test_pg16_mp_01_competing_worker_processes() -> None:
 async def test_pg16_mp_02_process_termination_and_lease_reclamation() -> None:
     """Scenario B: Process termination drops connection, lease expires, and Worker B reclaims."""
     target = await _get_verified_pg16_target()
-    session_factory = create_verified_async_session_factory(target.async_url)
+    engine, session_factory = _make_verified_async_session_factory(target.async_url)
 
     org_id = uuid.uuid4()
     test_merchant = "acc_test_mp_term"
     attempt_id = uuid.uuid4()
     now = datetime.now(timezone.utc)
 
-    # Seed 1 attempt
-    async with session_factory() as db:
-        await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
-        await db.execute(delete(Organization).where(Organization.id == org_id))
-        db.add(Organization(id=org_id, name="MP Term Org", slug=f"mp-term-{org_id.hex[:8]}"))
-        db.add(
-            BillingCheckoutAttempt(
-                id=attempt_id,
-                organization_id=org_id,
-                provider="razorpay",
-                merchant_account_id=test_merchant,
-                environment="test",
-                idempotency_key=f"mp_term_{uuid.uuid4().hex[:6]}",
-                status=CheckoutAttemptStatus.recovery_required,
-                amount_minor_units=4900,
-                currency="USD",
-                next_recovery_retry_at=now - timedelta(seconds=10),
-                recovery_attempts=0,
+    try:
+        # Seed 1 attempt
+        async with session_factory() as db:
+            await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
+            await db.execute(delete(Organization).where(Organization.id == org_id))
+            db.add(Organization(id=org_id, name="MP Term Org", slug=f"mp-term-{org_id.hex[:8]}"))
+            db.add(
+                BillingCheckoutAttempt(
+                    id=attempt_id,
+                    organization_id=org_id,
+                    provider="razorpay",
+                    merchant_account_id=test_merchant,
+                    environment="test",
+                    idempotency_key=f"mp_term_{uuid.uuid4().hex[:6]}",
+                    status=CheckoutAttemptStatus.recovery_required,
+                    amount_minor_units=4900,
+                    currency="USD",
+                    next_recovery_retry_at=now - timedelta(seconds=10),
+                    recovery_attempts=0,
+                )
             )
+            await db.commit()
+
+        ctx = mp.get_context("spawn")
+        queue = ctx.Queue()
+        claimed_event = ctx.Event()
+
+        # Start Worker A with a 2-second lease
+        worker_a = ctx.Process(
+            target=_mp_worker_claim_and_hold,
+            args=(
+                "worker_a_crash",
+                target.async_url,
+                "test",
+                test_merchant,
+                2,  # 2-second short lease
+                queue,
+                claimed_event,
+            ),
         )
-        await db.commit()
+        worker_a.start()
 
-    ctx = mp.get_context("spawn")
-    queue = ctx.Queue()
-    claimed_event = ctx.Event()
+        assert claimed_event.wait(timeout=10.0), "Worker A failed to claim within timeout"
+        claim_msg = queue.get_nowait()
+        claim_id_a = claim_msg["claim_id"]
+        assert claim_id_a is not None
 
-    # Start Worker A with a 2-second lease
-    worker_a = ctx.Process(
-        target=_mp_worker_claim_and_hold,
-        args=(
-            "worker_a_crash",
-            target.async_url,
-            "test",
-            test_merchant,
-            2,  # 2-second short lease
-            queue,
-            claimed_event,
-        ),
-    )
-    worker_a.start()
+        # Simulate process crash / kill
+        worker_a.terminate()
+        worker_a.join(timeout=5.0)
+        assert not worker_a.is_alive()
 
-    assert claimed_event.wait(timeout=10.0), "Worker A failed to claim within timeout"
-    claim_msg = queue.get_nowait()
-    claim_id_a = claim_msg["claim_id"]
-    assert claim_id_a is not None
+        # Immediately attempt claim with Worker B while lease is still unexpired
+        async with session_factory() as db:
+            early_claim = await claim_next_recovery_attempt(
+                db=db,
+                worker_id="worker_b",
+                environment="test",
+                merchant_account_id=test_merchant,
+                now=datetime.now(timezone.utc),
+            )
+            # Authoritative unexpired lease prevents premature claim
+            assert early_claim is None, "Worker B prematurely claimed an unexpired lease"
 
-    # Simulate process crash / kill
-    worker_a.terminate()
-    worker_a.join(timeout=5.0)
-    assert not worker_a.is_alive()
+        # Wait for the 2-second lease to expire
+        await asyncio.sleep(2.5)
 
-    # Immediately attempt claim with Worker B while lease is still unexpired
-    async with session_factory() as db:
-        early_claim = await claim_next_recovery_attempt(
-            db=db,
-            worker_id="worker_b",
-            environment="test",
-            merchant_account_id=test_merchant,
-            now=datetime.now(timezone.utc),
-        )
-        # Authoritative unexpired lease prevents premature claim
-        assert early_claim is None, "Worker B prematurely claimed an unexpired lease"
+        # Worker B now claims after lease expiration
+        async with session_factory() as db:
+            reclaimed = await claim_next_recovery_attempt(
+                db=db,
+                worker_id="worker_b",
+                environment="test",
+                merchant_account_id=test_merchant,
+                now=datetime.now(timezone.utc),
+            )
+            await db.commit()
 
-    # Wait for the 2-second lease to expire
-    await asyncio.sleep(2.5)
+            assert reclaimed is not None, "Worker B failed to reclaim expired lease"
+            assert reclaimed.attempt_id == attempt_id
+            # New fencing token issued
+            assert str(reclaimed.recovery_claim_id) != claim_id_a
 
-    # Worker B now claims after lease expiration
-    async with session_factory() as db:
-        reclaimed = await claim_next_recovery_attempt(
-            db=db,
-            worker_id="worker_b",
-            environment="test",
-            merchant_account_id=test_merchant,
-            now=datetime.now(timezone.utc),
-        )
-        await db.commit()
-
-        assert reclaimed is not None, "Worker B failed to reclaim expired lease"
-        assert reclaimed.attempt_id == attempt_id
-        # New fencing token issued
-        assert str(reclaimed.recovery_claim_id) != claim_id_a
-
-    # Cleanup
-    async with session_factory() as db:
-        await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
-        await db.execute(delete(Organization).where(Organization.id == org_id))
-        await db.commit()
+        # Cleanup
+        async with session_factory() as db:
+            await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
+            await db.execute(delete(Organization).where(Organization.id == org_id))
+            await db.commit()
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -558,82 +574,85 @@ async def test_pg16_mp_02_process_termination_and_lease_reclamation() -> None:
 async def test_pg16_mp_03_stale_process_fencing_and_superseded_rejection() -> None:
     """Scenario C: Superseded process with old claim token is strictly fenced from completing recovery."""
     target = await _get_verified_pg16_target()
-    session_factory = create_verified_async_session_factory(target.async_url)
+    engine, session_factory = _make_verified_async_session_factory(target.async_url)
 
     org_id = uuid.uuid4()
     test_merchant = "acc_test_mp_fence"
     attempt_id = uuid.uuid4()
     now = datetime.now(timezone.utc)
 
-    # Seed attempt
-    async with session_factory() as db:
-        await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
-        await db.execute(delete(Organization).where(Organization.id == org_id))
-        db.add(Organization(id=org_id, name="MP Fence Org", slug=f"mp-fence-{org_id.hex[:8]}"))
-        db.add(
-            BillingCheckoutAttempt(
-                id=attempt_id,
-                organization_id=org_id,
-                provider="razorpay",
-                merchant_account_id=test_merchant,
-                environment="test",
-                idempotency_key=f"mp_fence_{uuid.uuid4().hex[:6]}",
-                status=CheckoutAttemptStatus.recovery_required,
-                amount_minor_units=4900,
-                currency="USD",
-                next_recovery_retry_at=now - timedelta(seconds=10),
-                recovery_attempts=0,
-            )
-        )
-        await db.commit()
-
-    # Worker A claims with 1-second lease
-    async with session_factory() as db:
-        claim_a = await claim_next_recovery_attempt(
-            db=db,
-            worker_id="worker_a",
-            lease_duration_seconds=1,
-            environment="test",
-            merchant_account_id=test_merchant,
-            now=now,
-        )
-        await db.commit()
-        assert claim_a is not None
-
-    # Wait for lease to expire
-    await asyncio.sleep(1.2)
-
-    # Worker B reclaims and advances attempt state
-    async with session_factory() as db:
-        claim_b = await claim_next_recovery_attempt(
-            db=db,
-            worker_id="worker_b",
-            lease_duration_seconds=60,
-            environment="test",
-            merchant_account_id=test_merchant,
-            now=datetime.now(timezone.utc),
-        )
-        await db.commit()
-        assert claim_b is not None
-        assert claim_b.recovery_claim_id != claim_a.recovery_claim_id
-
-    # Worker A now attempts execution with its superseded claim_a token
-    # execute_claimed_recovery_attempt must reject Worker A with StaleRecoveryClaimError
-    mock_client = AsyncMock()
-    with pytest.raises(StaleRecoveryClaimError):
-        # Direct execution with stale fencing token
+    try:
+        # Seed attempt
         async with session_factory() as db:
-            # Query row to verify token mismatch
-            res = await db.execute(select(BillingCheckoutAttempt).where(BillingCheckoutAttempt.id == attempt_id))
-            att = res.scalar_one()
-            if att.recovery_claim_id != claim_a.recovery_claim_id:
-                raise StaleRecoveryClaimError(f"Attempt claim superseded: {att.recovery_claim_id} != {claim_a.recovery_claim_id}")
+            await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
+            await db.execute(delete(Organization).where(Organization.id == org_id))
+            db.add(Organization(id=org_id, name="MP Fence Org", slug=f"mp-fence-{org_id.hex[:8]}"))
+            db.add(
+                BillingCheckoutAttempt(
+                    id=attempt_id,
+                    organization_id=org_id,
+                    provider="razorpay",
+                    merchant_account_id=test_merchant,
+                    environment="test",
+                    idempotency_key=f"mp_fence_{uuid.uuid4().hex[:6]}",
+                    status=CheckoutAttemptStatus.recovery_required,
+                    amount_minor_units=4900,
+                    currency="USD",
+                    next_recovery_retry_at=now - timedelta(seconds=10),
+                    recovery_attempts=0,
+                )
+            )
+            await db.commit()
 
-    # Cleanup
-    async with session_factory() as db:
-        await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
-        await db.execute(delete(Organization).where(Organization.id == org_id))
-        await db.commit()
+        # Worker A claims with 1-second lease
+        async with session_factory() as db:
+            claim_a = await claim_next_recovery_attempt(
+                db=db,
+                worker_id="worker_a",
+                lease_duration_seconds=1,
+                environment="test",
+                merchant_account_id=test_merchant,
+                now=now,
+            )
+            await db.commit()
+            assert claim_a is not None
+
+        # Wait for lease to expire
+        await asyncio.sleep(1.2)
+
+        # Worker B reclaims and advances attempt state
+        async with session_factory() as db:
+            claim_b = await claim_next_recovery_attempt(
+                db=db,
+                worker_id="worker_b",
+                lease_duration_seconds=60,
+                environment="test",
+                merchant_account_id=test_merchant,
+                now=datetime.now(timezone.utc),
+            )
+            await db.commit()
+            assert claim_b is not None
+            assert claim_b.recovery_claim_id != claim_a.recovery_claim_id
+
+        # Worker A now attempts execution with its superseded claim_a token
+        # execute_claimed_recovery_attempt must reject Worker A with StaleRecoveryClaimError
+        mock_client = AsyncMock()
+        with pytest.raises(StaleRecoveryClaimError):
+            # Direct execution with stale fencing token
+            async with session_factory() as db:
+                # Query row to verify token mismatch
+                res = await db.execute(select(BillingCheckoutAttempt).where(BillingCheckoutAttempt.id == attempt_id))
+                att = res.scalar_one()
+                if att.recovery_claim_id != claim_a.recovery_claim_id:
+                    raise StaleRecoveryClaimError(f"Attempt claim superseded: {att.recovery_claim_id} != {claim_a.recovery_claim_id}")
+
+        # Cleanup
+        async with session_factory() as db:
+            await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
+            await db.execute(delete(Organization).where(Organization.id == org_id))
+            await db.commit()
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -700,66 +719,69 @@ async def test_pg16_mp_04_shared_org_advisory_lock_multiprocess_serialization() 
 async def test_pg16_mp_05_concurrent_jsonb_retry_accounting_multiprocess() -> None:
     """Scenario E: Multiple OS processes concurrently update retry accounting under row locks without lost increments."""
     target = await _get_verified_pg16_target()
-    session_factory = create_verified_async_session_factory(target.async_url)
+    engine, session_factory = _make_verified_async_session_factory(target.async_url)
 
     org_id = uuid.uuid4()
     test_merchant = "acc_test_mp_jsonb"
     attempt_id = uuid.uuid4()
     now = datetime.now(timezone.utc)
 
-    async with session_factory() as db:
-        await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
-        await db.execute(delete(Organization).where(Organization.id == org_id))
-        db.add(Organization(id=org_id, name="MP JSONB Org", slug=f"mp-jsonb-{org_id.hex[:8]}"))
-        db.add(
-            BillingCheckoutAttempt(
-                id=attempt_id,
-                organization_id=org_id,
-                provider="razorpay",
-                merchant_account_id=test_merchant,
-                environment="test",
-                idempotency_key=f"mp_jsonb_{uuid.uuid4().hex[:6]}",
-                status=CheckoutAttemptStatus.recovery_required,
-                amount_minor_units=4900,
-                currency="USD",
-                next_recovery_retry_at=now,
-                recovery_attempts=0,
-                request_payload={"initial_key": "preserved_value", "transient_failures": 0},
+    try:
+        async with session_factory() as db:
+            await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
+            await db.execute(delete(Organization).where(Organization.id == org_id))
+            db.add(Organization(id=org_id, name="MP JSONB Org", slug=f"mp-jsonb-{org_id.hex[:8]}"))
+            db.add(
+                BillingCheckoutAttempt(
+                    id=attempt_id,
+                    organization_id=org_id,
+                    provider="razorpay",
+                    merchant_account_id=test_merchant,
+                    environment="test",
+                    idempotency_key=f"mp_jsonb_{uuid.uuid4().hex[:6]}",
+                    status=CheckoutAttemptStatus.recovery_required,
+                    amount_minor_units=4900,
+                    currency="USD",
+                    next_recovery_retry_at=now,
+                    recovery_attempts=0,
+                    request_payload={"initial_key": "preserved_value", "transient_failures": 0},
+                )
             )
-        )
-        await db.commit()
+            await db.commit()
 
-    # Run serial transactions across multiple worker connections simulating independent processes
-    async with session_factory() as db1, session_factory() as db2:
-        for _ in range(3):
-            # Process 1 update
-            async with db1.begin():
-                res1 = await db1.execute(select(BillingCheckoutAttempt).where(BillingCheckoutAttempt.id == attempt_id).with_for_update())
-                a1 = res1.scalar_one()
-                p1 = dict(a1.request_payload or {})
-                p1["transient_failures"] = int(p1.get("transient_failures", 0)) + 1
-                a1.request_payload = p1
+        # Run serial transactions across multiple worker connections simulating independent processes
+        async with session_factory() as db1, session_factory() as db2:
+            for _ in range(3):
+                # Process 1 update
+                async with db1.begin():
+                    res1 = await db1.execute(select(BillingCheckoutAttempt).where(BillingCheckoutAttempt.id == attempt_id).with_for_update())
+                    a1 = res1.scalar_one()
+                    p1 = dict(a1.request_payload or {})
+                    p1["transient_failures"] = int(p1.get("transient_failures", 0)) + 1
+                    a1.request_payload = p1
 
-            # Process 2 update
-            async with db2.begin():
-                res2 = await db2.execute(select(BillingCheckoutAttempt).where(BillingCheckoutAttempt.id == attempt_id).with_for_update())
-                a2 = res2.scalar_one()
-                p2 = dict(a2.request_payload or {})
-                p2["transient_failures"] = int(p2.get("transient_failures", 0)) + 1
-                a2.request_payload = p2
+                # Process 2 update
+                async with db2.begin():
+                    res2 = await db2.execute(select(BillingCheckoutAttempt).where(BillingCheckoutAttempt.id == attempt_id).with_for_update())
+                    a2 = res2.scalar_one()
+                    p2 = dict(a2.request_payload or {})
+                    p2["transient_failures"] = int(p2.get("transient_failures", 0)) + 1
+                    a2.request_payload = p2
 
-    # Verify atomic tally and preservation of unrelated keys
-    async with session_factory() as db:
-        final_res = await db.execute(select(BillingCheckoutAttempt).where(BillingCheckoutAttempt.id == attempt_id))
-        final_att = final_res.scalar_one()
-        payload = final_att.request_payload or {}
+        # Verify atomic tally and preservation of unrelated keys
+        async with session_factory() as db:
+            final_res = await db.execute(select(BillingCheckoutAttempt).where(BillingCheckoutAttempt.id == attempt_id))
+            final_att = final_res.scalar_one()
+            payload = final_att.request_payload or {}
 
-        assert payload["transient_failures"] == 6, f"Expected 6 transient failures, got {payload.get('transient_failures')}"
-        assert payload["initial_key"] == "preserved_value", "Unrelated JSONB key was corrupted"
+            assert payload["transient_failures"] == 6, f"Expected 6 transient failures, got {payload.get('transient_failures')}"
+            assert payload["initial_key"] == "preserved_value", "Unrelated JSONB key was corrupted"
 
-        await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
-        await db.execute(delete(Organization).where(Organization.id == org_id))
-        await db.commit()
+            await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
+            await db.execute(delete(Organization).where(Organization.id == org_id))
+            await db.commit()
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -767,51 +789,54 @@ async def test_pg16_mp_05_concurrent_jsonb_retry_accounting_multiprocess() -> No
 async def test_pg16_mp_06_reconciliation_insert_race_multiprocess() -> None:
     """Scenario F: Multiple OS processes race on stage_or_update_payment_reconciliation for the same case_key."""
     target = await _get_verified_pg16_target()
-    session_factory = create_verified_async_session_factory(target.async_url)
+    engine, session_factory = _make_verified_async_session_factory(target.async_url)
 
     test_merchant = "acc_test_mp_recon"
     case_key = f"mp_recon_race_{uuid.uuid4().hex[:10]}"
 
-    # Clean up
-    async with session_factory() as db:
-        await db.execute(delete(PaymentReconciliation).where(PaymentReconciliation.case_key == case_key))
-        await db.commit()
+    try:
+        # Clean up
+        async with session_factory() as db:
+            await db.execute(delete(PaymentReconciliation).where(PaymentReconciliation.case_key == case_key))
+            await db.commit()
 
-    ctx = mp.get_context("spawn")
-    queue = ctx.Queue()
-    start_barrier = ctx.Barrier(2)
+        ctx = mp.get_context("spawn")
+        queue = ctx.Queue()
+        start_barrier = ctx.Barrier(2)
 
-    p1 = ctx.Process(
-        target=_mp_worker_reconciliation_upsert,
-        args=("recon_worker_1", target.async_url, case_key, test_merchant, "test", queue, start_barrier),
-    )
-    p2 = ctx.Process(
-        target=_mp_worker_reconciliation_upsert,
-        args=("recon_worker_2", target.async_url, case_key, test_merchant, "test", queue, start_barrier),
-    )
+        p1 = ctx.Process(
+            target=_mp_worker_reconciliation_upsert,
+            args=("recon_worker_1", target.async_url, case_key, test_merchant, "test", queue, start_barrier),
+        )
+        p2 = ctx.Process(
+            target=_mp_worker_reconciliation_upsert,
+            args=("recon_worker_2", target.async_url, case_key, test_merchant, "test", queue, start_barrier),
+        )
 
-    p1.start()
-    p2.start()
+        p1.start()
+        p2.start()
 
-    p1.join(timeout=10.0)
-    p2.join(timeout=10.0)
+        p1.join(timeout=10.0)
+        p2.join(timeout=10.0)
 
-    assert not p1.is_alive()
-    assert not p2.is_alive()
+        assert not p1.is_alive()
+        assert not p2.is_alive()
 
-    # Query exactly one record exists in PostgreSQL
-    async with session_factory() as db:
-        res = await db.execute(select(PaymentReconciliation).where(PaymentReconciliation.case_key == case_key))
-        reconciliations = list(res.scalars().all())
+        # Query exactly one record exists in PostgreSQL
+        async with session_factory() as db:
+            res = await db.execute(select(PaymentReconciliation).where(PaymentReconciliation.case_key == case_key))
+            reconciliations = list(res.scalars().all())
 
-        assert len(reconciliations) == 1, f"Expected exactly 1 reconciliation record, found {len(reconciliations)}"
-        rec = reconciliations[0]
-        history = list((rec.diagnostic_payload or {}).get("history", []))
-        # Both workers' evidence recorded in diagnostic history
-        assert len(history) >= 1
+            assert len(reconciliations) == 1, f"Expected exactly 1 reconciliation record, found {len(reconciliations)}"
+            rec = reconciliations[0]
+            history = list((rec.diagnostic_payload or {}).get("history", []))
+            # Both workers' evidence recorded in diagnostic history
+            assert len(history) >= 1
 
-        await db.execute(delete(PaymentReconciliation).where(PaymentReconciliation.case_key == case_key))
-        await db.commit()
+            await db.execute(delete(PaymentReconciliation).where(PaymentReconciliation.case_key == case_key))
+            await db.commit()
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -819,9 +844,8 @@ async def test_pg16_mp_06_reconciliation_insert_race_multiprocess() -> None:
 async def test_pg16_mp_07_environment_and_merchant_multiprocess_isolation() -> None:
     """Scenario G: Workers with different environments/merchants only claim matching attempts."""
     target = await _get_verified_pg16_target()
-    session_factory = create_verified_async_session_factory(target.async_url)
+    engine, session_factory = _make_verified_async_session_factory(target.async_url)
 
-    org_id = uuid.uuid4()
     canonical_test_merchant = "acc_canonical_test_mp"
     foreign_merchant = "acc_foreign_merchant_mp"
     now = datetime.now(timezone.utc)
@@ -832,62 +856,65 @@ async def test_pg16_mp_07_environment_and_merchant_multiprocess_isolation() -> N
     att_canonical_id = uuid.uuid4()
     att_foreign_id = uuid.uuid4()
 
-    async with session_factory() as db:
-        await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id.in_([canonical_test_merchant, foreign_merchant])))
-        await db.execute(delete(Organization).where(Organization.id.in_([org_canonical, org_foreign])))
-        db.add(Organization(id=org_canonical, name="MP Canonical Org", slug=f"mp-canon-{org_canonical.hex[:8]}"))
-        db.add(Organization(id=org_foreign, name="MP Foreign Org", slug=f"mp-foreign-{org_foreign.hex[:8]}"))
+    try:
+        async with session_factory() as db:
+            await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id.in_([canonical_test_merchant, foreign_merchant])))
+            await db.execute(delete(Organization).where(Organization.id.in_([org_canonical, org_foreign])))
+            db.add(Organization(id=org_canonical, name="MP Canonical Org", slug=f"mp-canon-{org_canonical.hex[:8]}"))
+            db.add(Organization(id=org_foreign, name="MP Foreign Org", slug=f"mp-foreign-{org_foreign.hex[:8]}"))
 
-        db.add(
-            BillingCheckoutAttempt(
-                id=att_canonical_id,
-                organization_id=org_canonical,
-                provider="razorpay",
+            db.add(
+                BillingCheckoutAttempt(
+                    id=att_canonical_id,
+                    organization_id=org_canonical,
+                    provider="razorpay",
+                    merchant_account_id=canonical_test_merchant,
+                    environment="test",
+                    idempotency_key=f"mp_canon_{uuid.uuid4().hex[:6]}",
+                    status=CheckoutAttemptStatus.recovery_required,
+                    amount_minor_units=4900,
+                    currency="USD",
+                    next_recovery_retry_at=now - timedelta(seconds=10),
+                    recovery_attempts=0,
+                )
+            )
+            db.add(
+                BillingCheckoutAttempt(
+                    id=att_foreign_id,
+                    organization_id=org_foreign,
+                    provider="razorpay",
+                    merchant_account_id=foreign_merchant,
+                    environment="test",
+                    idempotency_key=f"mp_foreign_{uuid.uuid4().hex[:6]}",
+                    status=CheckoutAttemptStatus.recovery_required,
+                    amount_minor_units=4900,
+                    currency="USD",
+                    next_recovery_retry_at=now - timedelta(seconds=10),
+                    recovery_attempts=0,
+                )
+            )
+            await db.commit()
+
+        # Worker configured for canonical test merchant
+        async with session_factory() as db:
+            claimed = await claim_recovery_batch(
+                db=db,
+                worker_id="canonical_worker",
+                limit=10,
+                now=now,
+                environment="test",
                 merchant_account_id=canonical_test_merchant,
-                environment="test",
-                idempotency_key=f"mp_canon_{uuid.uuid4().hex[:6]}",
-                status=CheckoutAttemptStatus.recovery_required,
-                amount_minor_units=4900,
-                currency="USD",
-                next_recovery_retry_at=now - timedelta(seconds=10),
-                recovery_attempts=0,
             )
-        )
-        db.add(
-            BillingCheckoutAttempt(
-                id=att_foreign_id,
-                organization_id=org_foreign,
-                provider="razorpay",
-                merchant_account_id=foreign_merchant,
-                environment="test",
-                idempotency_key=f"mp_foreign_{uuid.uuid4().hex[:6]}",
-                status=CheckoutAttemptStatus.recovery_required,
-                amount_minor_units=4900,
-                currency="USD",
-                next_recovery_retry_at=now - timedelta(seconds=10),
-                recovery_attempts=0,
-            )
-        )
-        await db.commit()
+            await db.commit()
 
-    # Worker configured for canonical test merchant
-    async with session_factory() as db:
-        claimed = await claim_recovery_batch(
-            db=db,
-            worker_id="canonical_worker",
-            limit=10,
-            now=now,
-            environment="test",
-            merchant_account_id=canonical_test_merchant,
-        )
-        await db.commit()
+            claimed_ids = [c.attempt_id for c in claimed]
+            assert att_canonical_id in claimed_ids
+            assert att_foreign_id not in claimed_ids, "Worker claimed foreign merchant attempt!"
 
-        claimed_ids = [c.attempt_id for c in claimed]
-        assert att_canonical_id in claimed_ids
-        assert att_foreign_id not in claimed_ids, "Worker claimed foreign merchant attempt!"
-
-    # Cleanup
-    async with session_factory() as db:
-        await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id.in_([canonical_test_merchant, foreign_merchant])))
-        await db.execute(delete(Organization).where(Organization.id.in_([org_canonical, org_foreign])))
-        await db.commit()
+        # Cleanup
+        async with session_factory() as db:
+            await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id.in_([canonical_test_merchant, foreign_merchant])))
+            await db.execute(delete(Organization).where(Organization.id.in_([org_canonical, org_foreign])))
+            await db.commit()
+    finally:
+        await engine.dispose()
