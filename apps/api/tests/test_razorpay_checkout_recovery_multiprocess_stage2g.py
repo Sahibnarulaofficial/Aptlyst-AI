@@ -367,22 +367,24 @@ async def test_pg16_mp_01_competing_worker_processes() -> None:
     target = await _get_verified_pg16_target()
     session_factory = create_verified_async_session_factory(target.async_url)
 
-    org_id = uuid.uuid4()
+    org_ids = [uuid.uuid4() for _ in range(6)]
     test_merchant = "acc_test_mp_compete"
     attempts: list[BillingCheckoutAttempt] = []
     now = datetime.now(timezone.utc)
 
-    # Clean up and seed 6 recovery attempts
+    # Clean up and seed 6 recovery attempts across 6 distinct organizations (1 active attempt per org/env)
     async with session_factory() as db:
         await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
-        await db.execute(delete(Organization).where(Organization.id == org_id))
-        org = Organization(id=org_id, name="MP Test Org", slug=f"mp-org-{org_id.hex[:8]}")
-        db.add(org)
+        await db.execute(delete(Organization).where(Organization.id.in_(org_ids)))
 
         for i in range(6):
+            o_id = org_ids[i]
+            org = Organization(id=o_id, name=f"MP Test Org {i}", slug=f"mp-org-{o_id.hex[:8]}")
+            db.add(org)
+
             att = BillingCheckoutAttempt(
                 id=uuid.uuid4(),
-                organization_id=org_id,
+                organization_id=o_id,
                 provider="razorpay",
                 merchant_account_id=test_merchant,
                 environment="test",
@@ -446,7 +448,7 @@ async def test_pg16_mp_01_competing_worker_processes() -> None:
     # Cleanup
     async with session_factory() as db:
         await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id == test_merchant))
-        await db.execute(delete(Organization).where(Organization.id == org_id))
+        await db.execute(delete(Organization).where(Organization.id.in_(org_ids)))
         await db.commit()
 
 
@@ -825,18 +827,21 @@ async def test_pg16_mp_07_environment_and_merchant_multiprocess_isolation() -> N
     now = datetime.now(timezone.utc)
 
     # Seed 1 canonical test attempt and 1 foreign merchant attempt
+    org_canonical = uuid.uuid4()
+    org_foreign = uuid.uuid4()
     att_canonical_id = uuid.uuid4()
     att_foreign_id = uuid.uuid4()
 
     async with session_factory() as db:
         await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id.in_([canonical_test_merchant, foreign_merchant])))
-        await db.execute(delete(Organization).where(Organization.id == org_id))
-        db.add(Organization(id=org_id, name="MP Scope Org", slug=f"mp-scope-{org_id.hex[:8]}"))
+        await db.execute(delete(Organization).where(Organization.id.in_([org_canonical, org_foreign])))
+        db.add(Organization(id=org_canonical, name="MP Canonical Org", slug=f"mp-canon-{org_canonical.hex[:8]}"))
+        db.add(Organization(id=org_foreign, name="MP Foreign Org", slug=f"mp-foreign-{org_foreign.hex[:8]}"))
 
         db.add(
             BillingCheckoutAttempt(
                 id=att_canonical_id,
-                organization_id=org_id,
+                organization_id=org_canonical,
                 provider="razorpay",
                 merchant_account_id=canonical_test_merchant,
                 environment="test",
@@ -851,7 +856,7 @@ async def test_pg16_mp_07_environment_and_merchant_multiprocess_isolation() -> N
         db.add(
             BillingCheckoutAttempt(
                 id=att_foreign_id,
-                organization_id=org_id,
+                organization_id=org_foreign,
                 provider="razorpay",
                 merchant_account_id=foreign_merchant,
                 environment="test",
@@ -884,5 +889,5 @@ async def test_pg16_mp_07_environment_and_merchant_multiprocess_isolation() -> N
     # Cleanup
     async with session_factory() as db:
         await db.execute(delete(BillingCheckoutAttempt).where(BillingCheckoutAttempt.merchant_account_id.in_([canonical_test_merchant, foreign_merchant])))
-        await db.execute(delete(Organization).where(Organization.id == org_id))
+        await db.execute(delete(Organization).where(Organization.id.in_([org_canonical, org_foreign])))
         await db.commit()

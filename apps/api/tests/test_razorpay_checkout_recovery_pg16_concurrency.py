@@ -500,18 +500,31 @@ async def test_pg16_recovery_01_schema_baseline_and_partial_indexes(pg: Pg16Chec
         assert cols_map["recovery_claim_id"].lower() in ("uuid", "character varying")
         assert cols_map["recovery_attempts"].lower() in ("integer", "smallint", "bigint")
 
-        # 3. Inspect partial indexes on billing_checkout_attempts
+        # 3. Inspect partial indexes and unique constraint on billing_checkout_attempts
         idx_res = await db.execute(
             text(
                 "SELECT indexname, indexdef FROM pg_indexes "
                 "WHERE tablename = 'billing_checkout_attempts' "
-                "AND indexname IN ('ix_bca_recovery_pending', 'ix_bca_stale_creating')"
+                "AND indexname IN ("
+                "    'ix_billing_checkout_attempts_recovery_claim',"
+                "    'ix_billing_checkout_attempts_lease',"
+                "    'uq_org_env_active_billing_checkout_attempt'"
+                ")"
             )
         )
         idx_defs = {row[0]: row[1] for row in idx_res.all()}
-        assert "ix_bca_recovery_pending" in idx_defs
-        assert "ix_bca_stale_creating" in idx_defs
-        assert "WHERE" in idx_defs["ix_bca_recovery_pending"].upper()
+        assert "ix_billing_checkout_attempts_recovery_claim" in idx_defs
+        rec_idx_def = idx_defs["ix_billing_checkout_attempts_recovery_claim"]
+        assert "WHERE" in rec_idx_def.upper()
+        assert "recovery_required" in rec_idx_def.lower()
+        assert "next_recovery_retry_at" in rec_idx_def
+        assert "recovery_claim_expires_at" in rec_idx_def
+
+        assert "ix_billing_checkout_attempts_lease" in idx_defs
+        assert "WHERE" in idx_defs["ix_billing_checkout_attempts_lease"].upper()
+
+        assert "uq_org_env_active_billing_checkout_attempt" in idx_defs
+        assert "UNIQUE" in idx_defs["uq_org_env_active_billing_checkout_attempt"].upper()
 
         # 4. Inspect unique constraint on payment_reconciliations
         cons_res = await db.execute(
@@ -531,14 +544,15 @@ async def test_pg16_recovery_02_competing_worker_claims_skip_locked_partition(
     pg: Pg16CheckoutRecoveryHarness,
 ) -> None:
     """PG16-REC-02: 5 concurrent workers race under FOR UPDATE SKIP LOCKED to partition 10 eligible attempts."""
-    org = await pg.create_org()
     now_utc = datetime.now(timezone.utc)
 
-    # Seed 10 recovery-eligible attempts
+    # Seed 10 recovery-eligible attempts across 10 distinct organizations
+    # to preserve uq_org_env_active_billing_checkout_attempt (1 active attempt per org/env)
     created_attempts: list[BillingCheckoutAttempt] = []
     for i in range(10):
+        org_i = await pg.create_org(name=f"PG16 Competing Org {i}")
         att = await pg.create_recovery_attempt(
-            org_id=org.id,
+            org_id=org_i.id,
             status=CheckoutAttemptStatus.recovery_required,
             next_recovery_retry_at=now_utc - timedelta(seconds=10 + i),
         )
@@ -586,16 +600,17 @@ async def test_pg16_recovery_03_for_update_skip_locked_non_blocking_concurrency(
     pg: Pg16CheckoutRecoveryHarness,
 ) -> None:
     """PG16-REC-03: Session holding row lock is skipped by concurrent worker without blocking."""
-    org = await pg.create_org()
+    org1 = await pg.create_org(name="PG16 Lock Holding Org 1")
+    org2 = await pg.create_org(name="PG16 Lock Skipping Org 2")
     now_utc = datetime.now(timezone.utc)
 
     att1 = await pg.create_recovery_attempt(
-        org_id=org.id,
+        org_id=org1.id,
         status=CheckoutAttemptStatus.recovery_required,
         next_recovery_retry_at=now_utc - timedelta(seconds=20),
     )
     att2 = await pg.create_recovery_attempt(
-        org_id=org.id,
+        org_id=org2.id,
         status=CheckoutAttemptStatus.recovery_required,
         next_recovery_retry_at=now_utc - timedelta(seconds=10),
     )
