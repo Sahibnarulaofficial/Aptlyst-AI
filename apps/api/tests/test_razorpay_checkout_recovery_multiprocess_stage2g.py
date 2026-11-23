@@ -639,7 +639,6 @@ async def test_pg16_mp_03_stale_process_fencing_and_superseded_rejection() -> No
 
         # Worker A now attempts execution with its superseded claim_a token
         # execute_claimed_recovery_attempt must reject Worker A with StaleRecoveryClaimError
-        mock_client = AsyncMock()
         with pytest.raises(StaleRecoveryClaimError):
             # Direct execution with stale fencing token
             async with session_factory() as db:
@@ -754,23 +753,24 @@ async def test_pg16_mp_05_concurrent_jsonb_retry_accounting_multiprocess() -> No
             await db.commit()
 
         # Run serial transactions across multiple worker connections simulating independent processes
-        async with session_factory() as db1, session_factory() as db2:
-            for _ in range(3):
-                # Process 1 update
-                async with db1.begin():
-                    res1 = await db1.execute(select(BillingCheckoutAttempt).where(BillingCheckoutAttempt.id == attempt_id).with_for_update())
-                    a1 = res1.scalar_one()
-                    p1 = dict(a1.request_payload or {})
-                    p1["transient_failures"] = int(p1.get("transient_failures", 0)) + 1
-                    a1.request_payload = p1
+        for _ in range(3):
+            # Process 1 update
+            async with session_factory() as db1:
+                res1 = await db1.execute(select(BillingCheckoutAttempt).where(BillingCheckoutAttempt.id == attempt_id).with_for_update())
+                a1 = res1.scalar_one()
+                p1 = dict(a1.request_payload or {})
+                p1["transient_failures"] = int(p1.get("transient_failures", 0)) + 1
+                a1.request_payload = p1
+                await db1.commit()
 
-                # Process 2 update
-                async with db2.begin():
-                    res2 = await db2.execute(select(BillingCheckoutAttempt).where(BillingCheckoutAttempt.id == attempt_id).with_for_update())
-                    a2 = res2.scalar_one()
-                    p2 = dict(a2.request_payload or {})
-                    p2["transient_failures"] = int(p2.get("transient_failures", 0)) + 1
-                    a2.request_payload = p2
+            # Process 2 update
+            async with session_factory() as db2:
+                res2 = await db2.execute(select(BillingCheckoutAttempt).where(BillingCheckoutAttempt.id == attempt_id).with_for_update())
+                a2 = res2.scalar_one()
+                p2 = dict(a2.request_payload or {})
+                p2["transient_failures"] = int(p2.get("transient_failures", 0)) + 1
+                a2.request_payload = p2
+                await db2.commit()
 
         # Verify atomic tally and preservation of unrelated keys
         async with session_factory() as db:
