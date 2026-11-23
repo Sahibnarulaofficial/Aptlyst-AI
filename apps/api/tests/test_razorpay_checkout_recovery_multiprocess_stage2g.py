@@ -403,6 +403,7 @@ async def test_pg16_mp_01_competing_worker_processes() -> None:
                     status=CheckoutAttemptStatus.recovery_required,
                     amount_minor_units=4900,
                     currency="USD",
+                    attempt_lease_expires_at=now + timedelta(seconds=300),
                     next_recovery_retry_at=now - timedelta(seconds=10),
                     recovery_attempts=0,
                 )
@@ -494,6 +495,7 @@ async def test_pg16_mp_02_process_termination_and_lease_reclamation() -> None:
                     status=CheckoutAttemptStatus.recovery_required,
                     amount_minor_units=4900,
                     currency="USD",
+                    attempt_lease_expires_at=now + timedelta(seconds=300),
                     next_recovery_retry_at=now - timedelta(seconds=10),
                     recovery_attempts=0,
                 )
@@ -598,6 +600,7 @@ async def test_pg16_mp_03_stale_process_fencing_and_superseded_rejection() -> No
                     status=CheckoutAttemptStatus.recovery_required,
                     amount_minor_units=4900,
                     currency="USD",
+                    attempt_lease_expires_at=now + timedelta(seconds=300),
                     next_recovery_retry_at=now - timedelta(seconds=10),
                     recovery_attempts=0,
                 )
@@ -742,6 +745,7 @@ async def test_pg16_mp_05_concurrent_jsonb_retry_accounting_multiprocess() -> No
                     status=CheckoutAttemptStatus.recovery_required,
                     amount_minor_units=4900,
                     currency="USD",
+                    attempt_lease_expires_at=now + timedelta(seconds=300),
                     next_recovery_retry_at=now,
                     recovery_attempts=0,
                     request_payload={"initial_key": "preserved_value", "transient_failures": 0},
@@ -874,6 +878,7 @@ async def test_pg16_mp_07_environment_and_merchant_multiprocess_isolation() -> N
                     status=CheckoutAttemptStatus.recovery_required,
                     amount_minor_units=4900,
                     currency="USD",
+                    attempt_lease_expires_at=now + timedelta(seconds=300),
                     next_recovery_retry_at=now - timedelta(seconds=10),
                     recovery_attempts=0,
                 )
@@ -889,6 +894,7 @@ async def test_pg16_mp_07_environment_and_merchant_multiprocess_isolation() -> N
                     status=CheckoutAttemptStatus.recovery_required,
                     amount_minor_units=4900,
                     currency="USD",
+                    attempt_lease_expires_at=now + timedelta(seconds=300),
                     next_recovery_retry_at=now - timedelta(seconds=10),
                     recovery_attempts=0,
                 )
