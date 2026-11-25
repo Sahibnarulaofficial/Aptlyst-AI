@@ -118,7 +118,7 @@ async def test_pg16_stage2kb_01_list_inspect_and_isolation(pg16_urls) -> None:
 
     try:
         async with session_factory() as db:
-            db.add(Organization(id=org_id, name="PG16 Ops Org", slug=f"pg16-ops-{uuid.uuid4().hex[:8]}"))
+            db.add(Organization(id=org_id, name="PG16 Ops Org"))
             db.add(
                 PaymentReconciliation(
                     id=rec_ids[0],
@@ -240,7 +240,7 @@ async def test_pg16_stage2kb_02_concurrent_resolution_and_idempotency(pg16_urls)
 
     try:
         async with session_factory() as db:
-            db.add(Organization(id=org_id, name="PG16 Lock Org", slug=f"pg16-lck-{uuid.uuid4().hex[:8]}"))
+            db.add(Organization(id=org_id, name="PG16 Lock Org"))
             db.add(
                 PaymentReconciliation(
                     id=case_id,
@@ -345,7 +345,7 @@ async def test_pg16_stage2kb_03_read_only_quarantined_webhooks_and_exhausted_rec
 
     try:
         async with session_factory() as db:
-            db.add(Organization(id=org_id, name="PG16 Inspect Org", slug=f"pg16-ins-{uuid.uuid4().hex[:8]}"))
+            db.add(Organization(id=org_id, name="PG16 Inspect Org"))
             db.add(
                 BillingWebhookEvent(
                     id=wh_id,
