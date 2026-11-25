@@ -2,7 +2,7 @@ import ipaddress
 from pathlib import Path
 from typing import Any
 import urllib.parse
-from pydantic import Field, SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -12,9 +12,64 @@ NON_PRODUCTION_DEPLOYMENT_ENVIRONMENTS: frozenset[str] = frozenset(
     {"development", "dev", "staging", "stage", "test", "testing", "ci", "local"}
 )
 ALLOWED_RAZORPAY_ENVIRONMENTS: frozenset[str] = frozenset({"test", "live"})
+ALLOWED_PROCESS_ROLES: frozenset[str] = frozenset(
+    {"api", "webhook_worker", "recovery_worker", "migration"}
+)
 PROHIBITED_PRODUCTION_MERCHANT_IDS: frozenset[str] = frozenset(
     {"default", "placeholder", "none", "null", "test", "dev", "stage", "staging", "ci", "legacy", ""}
 )
+LOCALHOST_ORIGIN_HOSTS: frozenset[str] = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def parse_and_validate_cors_origins(
+    raw_origins: str,
+    *,
+    is_production: bool = False,
+) -> list[str]:
+    """Parse and validate comma-separated CORS allowed origins (fail-closed).
+
+    Rejects wildcards ('*', '*.example.com'), non-HTTP(S) schemes, paths/queries/fragments,
+    userinfo, whitespace, and non-localhost HTTP origins in production.
+    """
+    if not isinstance(raw_origins, str):
+        raise ValueError("CORS_ALLOWED_ORIGINS must be a comma-separated string of origins.")
+
+    origins: list[str] = []
+    seen: set[str] = set()
+    for part in raw_origins.split(","):
+        origin = part.strip()
+        if not origin:
+            continue
+        if "*" in origin:
+            raise ValueError(
+                "Wildcard CORS origins ('*') are prohibited when credentialed requests are enabled."
+            )
+        if any(ch.isspace() for ch in origin):
+            raise ValueError(f"Invalid CORS origin '{origin}': whitespace is not permitted.")
+
+        parsed = urllib.parse.urlsplit(origin)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(
+                f"Invalid CORS origin '{origin}': scheme must be 'http' or 'https'."
+            )
+        if not parsed.netloc or not parsed.hostname:
+            raise ValueError(f"Invalid CORS origin '{origin}': missing valid host.")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError(f"Invalid CORS origin '{origin}': userinfo is prohibited.")
+        if parsed.path not in ("",) or parsed.query or parsed.fragment:
+            raise ValueError(
+                f"Invalid CORS origin '{origin}': must be a pure origin without path, query, or fragment."
+            )
+        if is_production and parsed.scheme == "http" and parsed.hostname.lower() not in LOCALHOST_ORIGIN_HOSTS:
+            raise ValueError(
+                f"Invalid production CORS origin '{origin}': non-localhost origins must use https://."
+            )
+
+        if origin not in seen:
+            seen.add(origin)
+            origins.append(origin)
+
+    return origins
 
 
 def validate_deployment_environment(deployment_env: str | None = None) -> tuple[str, bool]:
@@ -134,6 +189,7 @@ class Settings(BaseSettings):
         env_file=(_env_path, ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/aptlyst"
@@ -164,7 +220,38 @@ class Settings(BaseSettings):
                 return v.replace("postgresql://", "postgresql+asyncpg://", 1)
         return v
 
+    process_role: str = Field(
+        default="api",
+        validation_alias=AliasChoices("process_role", "APTLYST_PROCESS_ROLE"),
+        description="Runtime process profile controlling least-privilege startup validation.",
+    )
+
+    @field_validator("process_role")
+    @classmethod
+    def validate_process_role(cls, v: str) -> str:
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError(
+                f"APTLYST_PROCESS_ROLE must be one of {sorted(ALLOWED_PROCESS_ROLES)}."
+            )
+        normalized = v.strip().lower()
+        if normalized not in ALLOWED_PROCESS_ROLES:
+            raise ValueError(
+                f"Unsupported APTLYST_PROCESS_ROLE '{v}'. "
+                f"Must be one of {sorted(ALLOWED_PROCESS_ROLES)}."
+            )
+        return normalized
+
     environment: str = "development"
+    cors_allowed_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+
+    @property
+    def parsed_cors_allowed_origins(self) -> list[str]:
+        """Return validated list of configured CORS allowed origins."""
+        _, is_prod = validate_deployment_environment(self.environment)
+        return parse_and_validate_cors_origins(
+            self.cors_allowed_origins,
+            is_production=is_prod,
+        )
 
     # Secret used to sign anonymous visitor session tokens (HMAC-SHA256).
     # In production, VISITOR_SESSION_SECRET must be explicitly set and >= 32 characters.
@@ -174,8 +261,26 @@ class Settings(BaseSettings):
     visitor_session_ttl_seconds: int = 604800  # 7 days (60 * 60 * 24 * 7)
 
     def model_post_init(self, __context: Any) -> None:
-        """Validate critical production secrets on application startup."""
+        """Validate configuration based on the active runtime process role."""
+        validate_deployment_environment(self.environment)
+        if not isinstance(self.database_url, str) or not self.database_url.strip():
+            raise ValueError("DATABASE_URL must be explicitly configured.")
+
+        role = self.process_role
+        if role == "api":
+            self.validate_api_configuration()
+        elif role == "webhook_worker":
+            self.validate_webhook_worker_configuration()
+        elif role == "recovery_worker":
+            self.validate_recovery_worker_configuration()
+        elif role == "migration":
+            self.validate_migration_configuration()
+
+    def validate_api_configuration(self) -> None:
+        """Validate full API server configuration (auth, visitor sessions, CORS, LLM, billing)."""
         _, is_prod = validate_deployment_environment(self.environment)
+        parse_and_validate_cors_origins(self.cors_allowed_origins, is_production=is_prod)
+
         if is_prod:
             secret = self.visitor_session_secret.strip()
             if not secret or secret == "dev-insecure-visitor-session-secret-change-in-production":
@@ -193,7 +298,57 @@ class Settings(BaseSettings):
                     "It is prohibited in production environments."
                 )
 
-        # Stripe Billing Configuration Validation
+        if self.stripe_enabled:
+            self.validate_stripe_configuration()
+
+        if self.razorpay_enabled:
+            self.validate_razorpay_configuration(
+                require_ingress_secret=True,
+                require_api_credentials=True,
+                require_plan=True,
+            )
+
+    def validate_webhook_worker_configuration(self) -> None:
+        """Validate configuration required by the Razorpay webhook worker process.
+
+        Does NOT require API-only secrets (VISITOR_SESSION_SECRET, RAZORPAY_WEBHOOK_SECRET,
+        RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, or RAZORPAY_PRO_PLAN_ID).
+        """
+        validate_deployment_environment(self.environment)
+        if not isinstance(self.database_url, str) or not self.database_url.strip():
+            raise ValueError("DATABASE_URL must be explicitly configured.")
+        if self.razorpay_enabled:
+            self.validate_razorpay_configuration(
+                require_ingress_secret=False,
+                require_api_credentials=False,
+                require_plan=False,
+            )
+
+    def validate_recovery_worker_configuration(self) -> None:
+        """Validate configuration required by the Razorpay checkout recovery worker process.
+
+        Requires Razorpay API credentials, canonical merchant scope, and plan configuration,
+        but does NOT require API-only secrets (VISITOR_SESSION_SECRET or RAZORPAY_WEBHOOK_SECRET).
+        """
+        validate_deployment_environment(self.environment)
+        if not isinstance(self.database_url, str) or not self.database_url.strip():
+            raise ValueError("DATABASE_URL must be explicitly configured.")
+        if self.razorpay_enabled:
+            self.validate_razorpay_configuration(
+                require_ingress_secret=False,
+                require_api_credentials=True,
+                require_plan=True,
+            )
+
+    def validate_migration_configuration(self) -> None:
+        """Validate minimal configuration required by Alembic migrations (DB & environment)."""
+        validate_deployment_environment(self.environment)
+        if not isinstance(self.database_url, str) or not self.database_url.strip():
+            raise ValueError("DATABASE_URL must be explicitly configured for migrations.")
+
+    def validate_stripe_configuration(self) -> None:
+        """Validate legacy Stripe billing configuration when enabled."""
+        _, is_prod = validate_deployment_environment(self.environment)
         if self.stripe_enabled:
             secret = self.stripe_secret_key.get_secret_value().strip()
             if not secret:
@@ -326,11 +481,13 @@ class Settings(BaseSettings):
                         "Remote return URLs must use https://."
                     )
 
-        # Razorpay Billing Configuration Validation (Step 5.2B / Option A Stage 1)
-        if self.razorpay_enabled:
-            self.validate_razorpay_configuration()
-
-    def validate_razorpay_configuration(self) -> None:
+    def validate_razorpay_configuration(
+        self,
+        *,
+        require_ingress_secret: bool = True,
+        require_api_credentials: bool = True,
+        require_plan: bool = True,
+    ) -> None:
         """Validate Razorpay billing configuration against Option A deployment policy (fail-closed)."""
         if not self.razorpay_enabled:
             return
@@ -342,54 +499,59 @@ class Settings(BaseSettings):
             raise ValueError("RAZORPAY_ENVIRONMENT must be either 'test' or 'live'.")
 
         key_id = self.razorpay_key_id.strip()
-        if not key_id:
-            raise ValueError(
-                "RAZORPAY_KEY_ID must be configured when Razorpay billing is enabled."
-            )
-
         key_secret = self.razorpay_key_secret.get_secret_value().strip()
-        if not key_secret:
-            raise ValueError(
-                "RAZORPAY_KEY_SECRET must be configured when Razorpay billing is enabled."
-            )
-
         webhook_secret = self.razorpay_webhook_secret.get_secret_value().strip()
-        if not webhook_secret:
+        plan_id = self.razorpay_pro_plan_id.strip()
+        plan_currency = self.razorpay_plan_currency.strip().upper()
+        merchant_id = self.razorpay_merchant_account_id.strip()
+
+        if require_api_credentials:
+            if not key_id:
+                raise ValueError(
+                    "RAZORPAY_KEY_ID must be configured when Razorpay billing is enabled."
+                )
+            if not key_secret:
+                raise ValueError(
+                    "RAZORPAY_KEY_SECRET must be configured when Razorpay billing is enabled."
+                )
+
+        if require_ingress_secret and not webhook_secret:
             raise ValueError(
                 "RAZORPAY_WEBHOOK_SECRET must be configured when Razorpay billing is enabled."
             )
 
-        plan_id = self.razorpay_pro_plan_id.strip()
-        if not plan_id:
-            raise ValueError(
-                "RAZORPAY_PRO_PLAN_ID must be configured when Razorpay billing is enabled."
-            )
-        if not plan_id.startswith("plan_") or len(plan_id) < 8:
+        if require_plan:
+            if not plan_id:
+                raise ValueError(
+                    "RAZORPAY_PRO_PLAN_ID must be configured when Razorpay billing is enabled."
+                )
+            if not plan_id.startswith("plan_") or len(plan_id) < 8:
+                raise ValueError(
+                    "RAZORPAY_PRO_PLAN_ID format is invalid. It must start with 'plan_'."
+                )
+            if len(plan_currency) != 3 or not plan_currency.isalpha():
+                raise ValueError(
+                    "RAZORPAY_PLAN_CURRENCY must be a valid 3-letter ISO currency code (e.g., 'USD', 'INR')."
+                )
+        elif plan_id and (not plan_id.startswith("plan_") or len(plan_id) < 8):
             raise ValueError(
                 "RAZORPAY_PRO_PLAN_ID format is invalid. It must start with 'plan_'."
             )
-
-        plan_currency = self.razorpay_plan_currency.strip().upper()
-        if len(plan_currency) != 3 or not plan_currency.isalpha():
-            raise ValueError(
-                "RAZORPAY_PLAN_CURRENCY must be a valid 3-letter ISO currency code (e.g., 'USD', 'INR')."
-            )
-
-        merchant_id = self.razorpay_merchant_account_id.strip()
 
         if is_prod:
             if rzp_env != "live":
                 raise ValueError(
                     "RAZORPAY_ENVIRONMENT must be 'live' in production environments."
                 )
-            if key_id.startswith("rzp_test_"):
-                raise ValueError(
-                    "Test Razorpay key is prohibited in production environments."
-                )
-            if not key_id.startswith("rzp_live_"):
-                raise ValueError(
-                    "Production Razorpay key must start with 'rzp_live_'."
-                )
+            if key_id:
+                if key_id.startswith("rzp_test_"):
+                    raise ValueError(
+                        "Test Razorpay key is prohibited in production environments."
+                    )
+                if not key_id.startswith("rzp_live_"):
+                    raise ValueError(
+                        "Production Razorpay key must start with 'rzp_live_'."
+                    )
             if not merchant_id or merchant_id.lower() in PROHIBITED_PRODUCTION_MERCHANT_IDS:
                 raise ValueError(
                     "Production RAZORPAY_MERCHANT_ACCOUNT_ID must be explicitly configured with a non-default account identifier."
@@ -400,14 +562,15 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "RAZORPAY_ENVIRONMENT must be 'test' in non-production environments."
                 )
-            if key_id.startswith("rzp_live_"):
-                raise ValueError(
-                    "Live Razorpay key is prohibited in non-production environments."
-                )
-            if not key_id.startswith("rzp_test_"):
-                raise ValueError(
-                    "Development/test Razorpay key must start with 'rzp_test_'."
-                )
+            if key_id:
+                if key_id.startswith("rzp_live_"):
+                    raise ValueError(
+                        "Live Razorpay key is prohibited in non-production environments."
+                    )
+                if not key_id.startswith("rzp_test_"):
+                    raise ValueError(
+                        "Development/test Razorpay key must start with 'rzp_test_'."
+                    )
 
     @property
     def resolved_visitor_session_secret(self) -> str:
@@ -547,6 +710,14 @@ class Settings(BaseSettings):
     razorpay_webhook_secret: SecretStr = Field(default=SecretStr(""))
     razorpay_pro_plan_id: str = ""
     razorpay_plan_currency: str = "USD"
+
+    # Worker Heartbeat & Queue Monitoring Thresholds (Stage 2J.4)
+    worker_heartbeat_interval_seconds: float = Field(default=30.0, gt=0.0)
+    billing_health_heartbeat_stale_seconds: int = Field(default=90, ge=1)
+    billing_health_webhook_backlog_age_seconds: int = Field(default=300, ge=1)
+    billing_health_recovery_overdue_age_seconds: int = Field(default=300, ge=1)
+    billing_health_reconciliation_backlog_age_seconds: int = Field(default=3600, ge=1)
+    billing_health_repeated_lease_expiry_threshold: int = Field(default=2, ge=1)
 
     def get_public_razorpay_config(self) -> dict[str, Any]:
         """Return safe, non-sensitive Razorpay configuration for client-side consumption.

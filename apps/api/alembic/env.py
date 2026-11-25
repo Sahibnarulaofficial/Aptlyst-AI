@@ -2,12 +2,23 @@
 
 import asyncio
 from logging.config import fileConfig
+import os
+import sys
 
 from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.config import settings
+_HAD_PROCESS_ROLE_ENV = "APTLYST_PROCESS_ROLE" in os.environ
+if not _HAD_PROCESS_ROLE_ENV and "app.config" not in sys.modules:
+    os.environ["APTLYST_PROCESS_ROLE"] = "migration"
+try:
+    from app.config import settings
+finally:
+    if not _HAD_PROCESS_ROLE_ENV:
+        os.environ.pop("APTLYST_PROCESS_ROLE", None)
+
+settings.validate_migration_configuration()
 from app.db.base import Base
 
 # Import all models here so Alembic can detect them.
@@ -31,6 +42,7 @@ from app.models.payment import (  # noqa: F401
     BillingInvoice,
     BillingPayment,
     BillingWebhookEvent,
+    BillingWorkerHeartbeat,
     CustomerProvisionStatus,
     PaymentReconciliation,
 )

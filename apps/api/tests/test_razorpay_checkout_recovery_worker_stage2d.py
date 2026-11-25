@@ -1558,6 +1558,7 @@ async def test_30_environment_mismatch_before_provider_api_invocation(monkeypatc
         status=CheckoutAttemptStatus.recovery_required,
         environment="live",  # Attempt in DB says live, but deployment is development (requires test)
         recovery_claim_id=claim_id,
+        recovery_claim_expires_at=now + timedelta(seconds=60),
         next_recovery_retry_at=now,
     )
     repo = SharedRecoveryAttemptRepository([att])
@@ -1611,6 +1612,7 @@ async def test_31_repeated_transient_5xx_capped_and_quarantined(monkeypatch: pyt
         status=CheckoutAttemptStatus.recovery_required,
         environment="test",
         recovery_claim_id=claim_id,
+        recovery_claim_expires_at=now + timedelta(seconds=60),
         next_recovery_retry_at=now,
         request_payload={"transient_failures": 9},  # 9 previous transient failures
     )
@@ -1984,10 +1986,12 @@ async def test_39_rejected_configurations_make_zero_provider_api_calls(monkeypat
 
     # Direct execution with mismatch also makes 0 calls
     claim_id = uuid.uuid4()
+    now_mismatch = datetime.now(timezone.utc)
     att_mismatch = _create_attempt(
         environment="live",
         status=CheckoutAttemptStatus.recovery_required,
         recovery_claim_id=claim_id,
+        recovery_claim_expires_at=now_mismatch + timedelta(seconds=60),
     )
     repo = SharedRecoveryAttemptRepository([att_mismatch])
     session_factory = lambda: RecoveryWorkerMockDbSession(repo)

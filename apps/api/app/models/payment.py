@@ -887,3 +887,86 @@ class BillingCustomerProvision(Base):
         ),
     )
 
+
+class BillingWorkerHeartbeat(Base):
+    """Lightweight durable liveness & progress record for background billing workers.
+
+    Guarantees:
+    1. Process-Level Identity: Each worker incarnation generates a unique instance_token
+       and default UUID-backed worker_id so restarts never inherit prior liveness silently.
+    2. Liveness vs. Progress: Tracks last_heartbeat_at separately from last_processed_at
+       and last_error_at so hung or error-looping processes are distinguishable from idle ones.
+    3. Zero Customer/Secret Data: Stores operational identifiers and sanitized error summaries only.
+    """
+
+    __tablename__ = "billing_worker_heartbeats"
+
+    worker_id: Mapped[str] = mapped_column(
+        String(128), primary_key=True
+    )
+    instance_token: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False
+    )
+    worker_type: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )
+    deployment_environment: Mapped[str] = mapped_column(
+        String(32), nullable=False
+    )
+    environment: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    merchant_account_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="starting", server_default="starting"
+    )
+    pid: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    hostname: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    last_heartbeat_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    last_processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error_message: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    processed_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    error_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_billing_worker_heartbeats_type_env_hb",
+            "worker_type",
+            "environment",
+            "last_heartbeat_at",
+        ),
+        Index(
+            "ix_billing_worker_heartbeats_status_hb",
+            "status",
+            "last_heartbeat_at",
+        ),
+    )
+

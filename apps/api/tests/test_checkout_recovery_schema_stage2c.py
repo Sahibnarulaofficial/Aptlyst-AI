@@ -393,7 +393,7 @@ def test_s2c_billing_payment_sweeper_index_aligned_and_lease_fields_preserved() 
 
 
 def test_s2c_migration_metadata_and_single_linear_head() -> None:
-    """Migration f3a4b5c6d7e2 points to e2f3a4b5c6d1 and is the sole Alembic head."""
+    """Migration f3a4b5c6d7e2 points to e2f3a4b5c6d1 and feeds the sole linear Alembic head."""
     assert MIGRATION_FILE.exists(), f"Migration file missing: {MIGRATION_FILE}"
 
     spec = importlib.util.spec_from_file_location("migration_f3a4b5c6d7e2", MIGRATION_FILE)
@@ -412,7 +412,7 @@ def test_s2c_migration_metadata_and_single_linear_head() -> None:
     )
     assert res.returncode == 0, f"alembic heads failed:\n{res.stderr}"
     heads = [line.strip() for line in res.stdout.splitlines() if line.strip()]
-    assert heads == ["f3a4b5c6d7e2 (head)"]
+    assert heads == ["a4b5c6d7e8f3 (head)"]
 
 
 def test_s2c_offline_upgrade_ddl_generation() -> None:
@@ -521,7 +521,7 @@ def test_s2c_offline_downgrade_ddl_generation() -> None:
 
 
 def test_s2c_full_chain_offline_upgrade_base_to_head() -> None:
-    """Entire Alembic revision graph from base to head (f3a4b5c6d7e2) compiles cleanly offline."""
+    """Entire Alembic revision graph from base to head compiles cleanly offline."""
     res = subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "head", "--sql"],
         cwd=str(API_DIR),
@@ -534,4 +534,8 @@ def test_s2c_full_chain_offline_upgrade_base_to_head() -> None:
     assert (
         "UPDATE alembic_version SET version_num='f3a4b5c6d7e2' "
         "WHERE alembic_version.version_num = 'e2f3a4b5c6d1';"
+    ) in res.stdout
+    assert (
+        "UPDATE alembic_version SET version_num='a4b5c6d7e8f3' "
+        "WHERE alembic_version.version_num = 'f3a4b5c6d7e2';"
     ) in res.stdout

@@ -410,6 +410,7 @@ class TestRecoveryEngineSingleMerchantIsolation:
             amount_minor_units=1000,
             currency="USD",
             recovery_claim_id=claimed.recovery_claim_id,
+            recovery_claim_expires_at=claimed.recovery_claim_expires_at,
             request_payload=claimed.request_payload,
         )
         mock_db.attempts.append(attempt_row)

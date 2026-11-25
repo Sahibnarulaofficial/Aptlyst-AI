@@ -35,6 +35,7 @@ from scripts.check_staging_migration_gate import (
     ALLOWLISTED_HOST_DIRECT,
     ALLOWLISTED_HOST_POOLER,
     EXPECTED_HEAD_REV,
+    EXPECTED_PENDING_CHAIN,
     EXPECTED_REF,
     EXPECTED_ROLE,
     EXPECTED_START_REV,
@@ -260,13 +261,16 @@ def test_validate_required_tables_present_missing() -> None:
 
 
 def test_validate_alembic_graph_offline_success() -> None:
-    """Verifies real repository migration graph has exactly one head and two pending revisions."""
+    """Verifies real repository migration graph has exactly one head and the full pending chain."""
     api_dir = repo_root / "apps" / "api"
     ini_path = api_dir / "alembic.ini"
     script_loc = api_dir / "alembic"
 
     pending = validate_alembic_graph(ini_path, script_loc)
-    assert pending == ["b2c3d4e5f6a1", "c3d4e5f6a1b2"]
+    assert EXPECTED_HEAD_REV == "a4b5c6d7e8f3"
+    assert pending == EXPECTED_PENDING_CHAIN
+    assert pending[0] == "b2c3d4e5f6a1"
+    assert pending[-1] == "a4b5c6d7e8f3"
 
 
 def test_validate_alembic_graph_offline_missing_file() -> None:
@@ -283,7 +287,7 @@ def test_validate_alembic_graph_offline_head_mismatch() -> None:
     script_loc = api_dir / "alembic"
 
     with pytest.raises(PreflightGateError) as exc_info:
-        validate_alembic_graph(ini_path, script_loc, expected_head="b2c3d4e5f6a1")
+        validate_alembic_graph(ini_path, script_loc, expected_head="c3d4e5f6a1b2")
     assert "Alembic head revision mismatch" in str(exc_info.value)
 
 

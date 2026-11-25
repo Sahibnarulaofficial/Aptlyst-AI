@@ -31,8 +31,21 @@ except ImportError:
 EXPECTED_REF = "ewrpmunvqdtkucyojohe"
 EXPECTED_ROLE = "postgres"
 EXPECTED_START_REV = "a1b2c3d4e5f6"
-EXPECTED_HEAD_REV = "c3d4e5f6a1b2"
-EXPECTED_PENDING_CHAIN = ["b2c3d4e5f6a1", "c3d4e5f6a1b2"]
+EXPECTED_HEAD_REV = "a4b5c6d7e8f3"
+EXPECTED_PENDING_CHAIN = [
+    "b2c3d4e5f6a1",
+    "c3d4e5f6a1b2",
+    "d4e5f6a1b2c3",
+    "e5f6a1b2c3d4",
+    "f6a1b2c3d4e5",
+    "a1b2c3d4e5f7",
+    "b1c2d3e4f5a6",
+    "c1d2e3f4a5b7",
+    "d1e2f3a4b5c6",
+    "e2f3a4b5c6d1",
+    "f3a4b5c6d7e2",
+    "a4b5c6d7e8f3",
+]
 
 ALLOWLISTED_HOST_POOLER = "aws-0-ap-southeast-2.pooler.supabase.com"
 ALLOWLISTED_HOST_DIRECT = f"db.{EXPECTED_REF}.supabase.co"
@@ -410,7 +423,14 @@ def main() -> int:
             fail("Could not locate 'apps/api' directory.")
 
         sys.path.insert(0, str(api_dir))
-        from app.config import settings
+        _had_role_env = "APTLYST_PROCESS_ROLE" in os.environ
+        if not _had_role_env and "app.config" not in sys.modules:
+            os.environ["APTLYST_PROCESS_ROLE"] = "migration"
+        try:
+            from app.config import settings
+        finally:
+            if not _had_role_env:
+                os.environ.pop("APTLYST_PROCESS_ROLE", None)
 
         # Gate 1: Environment check
         log("[1/4] Verifying environment mode...")

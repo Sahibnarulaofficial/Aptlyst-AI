@@ -566,3 +566,13 @@ def reset_razorpay_client() -> None:
     global _TEST_RAZORPAY_CLIENT, _CACHED_RAZORPAY_CLIENT
     _TEST_RAZORPAY_CLIENT = None
     _CACHED_RAZORPAY_CLIENT = None
+
+
+async def close_cached_razorpay_client() -> None:
+    """Close and clear the cached RazorpayClient HTTP session during worker shutdown."""
+    global _CACHED_RAZORPAY_CLIENT
+    if _CACHED_RAZORPAY_CLIENT is not None:
+        try:
+            await _CACHED_RAZORPAY_CLIENT.close()
+        finally:
+            _CACHED_RAZORPAY_CLIENT = None

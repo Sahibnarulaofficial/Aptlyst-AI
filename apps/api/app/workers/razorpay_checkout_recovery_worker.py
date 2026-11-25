@@ -35,17 +35,25 @@ _API_ROOT = os.path.abspath(os.path.join(_CURRENT_DIR, "..", ".."))
 if _API_ROOT not in sys.path:
     sys.path.insert(0, _API_ROOT)
 
-from sqlalchemy.ext.asyncio import AsyncSession
+_HAD_PROCESS_ROLE_ENV = "APTLYST_PROCESS_ROLE" in os.environ
+if not _HAD_PROCESS_ROLE_ENV and "app.config" not in sys.modules:
+    os.environ["APTLYST_PROCESS_ROLE"] = "recovery_worker"
 
-from app.config import (
-    ALLOWED_RAZORPAY_ENVIRONMENTS,
-    PROHIBITED_PRODUCTION_MERCHANT_IDS,
-    get_canonical_razorpay_merchant_account_id,
-    resolve_required_razorpay_environment,
-    settings,
-    validate_deployment_environment,
-    validate_razorpay_runtime_scope,
-)
+try:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from app.config import (
+        ALLOWED_RAZORPAY_ENVIRONMENTS,
+        PROHIBITED_PRODUCTION_MERCHANT_IDS,
+        get_canonical_razorpay_merchant_account_id,
+        resolve_required_razorpay_environment,
+        settings,
+        validate_deployment_environment,
+        validate_razorpay_runtime_scope,
+    )
+finally:
+    if not _HAD_PROCESS_ROLE_ENV:
+        os.environ.pop("APTLYST_PROCESS_ROLE", None)
 
 PROHIBITED_PRODUCTION_MERCHANT_NAMES: frozenset[str] = PROHIBITED_PRODUCTION_MERCHANT_IDS | {
     "test",
@@ -57,7 +65,12 @@ PROHIBITED_PRODUCTION_MERCHANT_NAMES: frozenset[str] = PROHIBITED_PRODUCTION_MER
 from app.db.session import AsyncSessionLocal
 from app.services.billing.razorpay.client import (
     RazorpayClient,
+    close_cached_razorpay_client,
     is_razorpay_enabled,
+)
+from app.services.billing.razorpay.monitoring import (
+    WORKER_TYPE_RECOVERY,
+    WorkerHeartbeatTracker,
 )
 from app.services.billing.razorpay.recovery_engine import (
     DEFAULT_RECOVERY_LEASE_DURATION_SECONDS,
@@ -112,7 +125,14 @@ class RazorpayCheckoutRecoveryWorker:
             jitter_fn: Optional callable for deterministic test jitter injection.
         """
         self.session_factory = session_factory or AsyncSessionLocal
-        self.worker_id = worker_id or f"worker_rec_{uuid.uuid4().hex[:12]}"
+        env_worker_id = (
+            os.getenv("RAZORPAY_RECOVERY_WORKER_ID") or os.getenv("APTLYST_WORKER_ID") or ""
+        ).strip()
+        self.worker_id = (
+            worker_id.strip()
+            if isinstance(worker_id, str) and worker_id.strip()
+            else (env_worker_id or f"worker_rec_{uuid.uuid4().hex[:12]}")
+        )
         self.lease_duration = (
             lease_duration if lease_duration is not None else DEFAULT_RECOVERY_LEASE_DURATION_SECONDS
         )
@@ -137,6 +157,8 @@ class RazorpayCheckoutRecoveryWorker:
 
         required_env = resolve_required_razorpay_environment(getattr(settings, "environment", None))
         _, is_prod = validate_deployment_environment(getattr(settings, "environment", None))
+        if client is None and getattr(settings, "razorpay_enabled", False):
+            settings.validate_recovery_worker_configuration()
         if environment is not None:
             clean_env = environment.strip().lower() if isinstance(environment, str) else ""
             if clean_env not in ALLOWED_RAZORPAY_ENVIRONMENTS:
@@ -214,6 +236,13 @@ class RazorpayCheckoutRecoveryWorker:
 
         self._stop_event = asyncio.Event()
         self._signal_handlers_registered = False
+        self.heartbeat_tracker = WorkerHeartbeatTracker(
+            worker_id=self.worker_id,
+            worker_type=WORKER_TYPE_RECOVERY,
+            deployment_environment=str(getattr(settings, "environment", "development")).strip().lower(),
+            environment=self.environment,
+            merchant_account_id=self.merchant_account_id,
+        )
 
     def _get_now(self) -> datetime:
         """Get current UTC timestamp, using clock callable if configured."""
@@ -331,8 +360,33 @@ class RazorpayCheckoutRecoveryWorker:
         Returns:
             Number of attempts processed.
         """
-        results = await self.run_batch()
-        return len(results)
+        await self.heartbeat_tracker.record_heartbeat(
+            self.session_factory,
+            status="running",
+            now=self._get_now(),
+            force=True,
+        )
+        try:
+            results = await self.run_batch()
+            await self.heartbeat_tracker.record_heartbeat(
+                self.session_factory,
+                status="stopped",
+                now=self._get_now(),
+                force=True,
+                processed_delta=len(results),
+            )
+            return len(results)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self.heartbeat_tracker.record_heartbeat(
+                self.session_factory,
+                status="error",
+                now=self._get_now(),
+                force=True,
+                error_message=str(exc),
+            )
+            raise
 
     async def run_forever(self) -> None:
         """Continuously poll and process recovery attempts until stop() is invoked."""
@@ -348,9 +402,21 @@ class RazorpayCheckoutRecoveryWorker:
             self.lease_duration,
             self.max_attempts,
         )
+        cancelled = False
+        await self.heartbeat_tracker.record_heartbeat(
+            self.session_factory,
+            status="running",
+            now=self._get_now(),
+            force=True,
+        )
         try:
             while not self._stop_event.is_set():
                 if not is_razorpay_enabled():
+                    await self.heartbeat_tracker.record_heartbeat(
+                        self.session_factory,
+                        status="running",
+                        now=self._get_now(),
+                    )
                     try:
                         await asyncio.wait_for(
                             self._stop_event.wait(), timeout=min(5.0, self.poll_interval)
@@ -361,6 +427,12 @@ class RazorpayCheckoutRecoveryWorker:
 
                 try:
                     results = await self.run_batch()
+                    await self.heartbeat_tracker.record_heartbeat(
+                        self.session_factory,
+                        status="running",
+                        now=self._get_now(),
+                        processed_delta=len(results),
+                    )
                     if results:
                         if len(results) >= self.batch_size:
                             # Full batch claimed, immediately loop for more without delay
@@ -374,11 +446,19 @@ class RazorpayCheckoutRecoveryWorker:
                         except asyncio.TimeoutError:
                             pass
                 except asyncio.CancelledError:
+                    cancelled = True
                     raise
                 except Exception as exc:
                     logger.error(
                         "Error in RazorpayCheckoutRecoveryWorker polling loop: %s",
                         sanitize_billing_error_message(str(exc)),
+                    )
+                    await self.heartbeat_tracker.record_heartbeat(
+                        self.session_factory,
+                        status="error",
+                        now=self._get_now(),
+                        force=True,
+                        error_message=str(exc),
                     )
                     try:
                         await asyncio.wait_for(
@@ -387,9 +467,17 @@ class RazorpayCheckoutRecoveryWorker:
                     except asyncio.TimeoutError:
                         pass
         except asyncio.CancelledError:
+            cancelled = True
             logger.info("RazorpayCheckoutRecoveryWorker %s cancelled during execution.", self.worker_id)
             raise
         finally:
+            if not cancelled:
+                await self.heartbeat_tracker.record_heartbeat(
+                    self.session_factory,
+                    status="stopped",
+                    now=self._get_now(),
+                    force=True,
+                )
             logger.info("RazorpayCheckoutRecoveryWorker %s stopped cleanly.", self.worker_id)
 
     def stop(self) -> None:
@@ -480,6 +568,17 @@ async def run_recovery_worker(
         logger.info("Recovery worker task cancelled cleanly.")
         raise
     finally:
+        if client is None:
+            try:
+                await close_cached_razorpay_client()
+            except Exception as exc:
+                logger.debug("Error closing cached Razorpay client: %s", exc)
+        elif hasattr(client, "close"):
+            try:
+                await client.close()
+            except Exception as exc:
+                logger.debug("Error closing injected Razorpay client: %s", exc)
+
         if session_factory is None:
             try:
                 from app.db.session import engine

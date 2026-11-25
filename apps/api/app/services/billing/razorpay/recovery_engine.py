@@ -1111,17 +1111,27 @@ async def _record_recovery_outcome(
 
         claimed_id = claimed.recovery_claim_id
         is_valid_owner = (
-            (current_claim_col == claimed_id or str(current_claim_col) == str(claimed_id))
-            or (current_claim_col is None and str(current_claim_payload) == str(claimed_id))
+            current_claim_col is not None
+            and (current_claim_col == claimed_id or str(current_claim_col) == str(claimed_id))
+        )
+        is_unexpired = (
+            attempt.recovery_claim_expires_at is not None
+            and attempt.recovery_claim_expires_at >= now
         )
 
-        if not is_valid_owner or attempt.status != CheckoutAttemptStatus.recovery_required:
+        if (
+            not is_valid_owner
+            or not is_unexpired
+            or attempt.status != CheckoutAttemptStatus.recovery_required
+        ):
             logger.warning(
-                "Stale recovery worker detected on attempt %s: claim %s was superseded by col=%s payload=%s (status=%s)",
+                "Stale recovery worker detected on attempt %s: claim=%s db_col=%s payload=%s expires_at=%s now=%s status=%s",
                 claimed.attempt_id,
                 claimed_id,
                 current_claim_col,
                 current_claim_payload,
+                attempt.recovery_claim_expires_at,
+                now,
                 attempt.status,
             )
             if target_sub_id:

@@ -220,7 +220,7 @@ def test_generation_task_relationship_wiring_and_cascade_safeguards() -> None:
 
 
 def test_alembic_heads_single_head() -> None:
-    """Verify Alembic reports exactly one linear head: f3a4b5c6d7e2."""
+    """Verify Alembic reports exactly one linear head: a4b5c6d7e8f3."""
     api_dir = Path(__file__).resolve().parent.parent
 
     res = subprocess.run(
@@ -232,7 +232,7 @@ def test_alembic_heads_single_head() -> None:
     assert res.returncode == 0, f"Alembic heads failed:\n{res.stderr}"
     lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
     assert len(lines) == 1, f"Expected exactly one head, got: {lines}"
-    assert "f3a4b5c6d7e2" in lines[0]
+    assert "a4b5c6d7e8f3" in lines[0]
     assert "(head)" in lines[0]
 
 
