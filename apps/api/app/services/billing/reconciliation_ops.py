@@ -1021,9 +1021,10 @@ async def resolve_payment_reconciliation(
                     "with different resolution notes."
                 )
 
+            summary = _to_reconciliation_summary(rec)
             await db.rollback()
             return ReconciliationResolutionResult(
-                case=_to_reconciliation_summary(rec),
+                case=summary,
                 resolution_notes=existing_notes,
                 changed=False,
                 idempotent_replay=True,
