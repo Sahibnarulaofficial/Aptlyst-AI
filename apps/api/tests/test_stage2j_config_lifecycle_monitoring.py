@@ -1125,3 +1125,161 @@ async def test_2jv_replacement_worker_reclaims_expired_attempt_and_rejects_old_w
     assert final_att is not None
     assert final_att.status == CheckoutAttemptStatus.open
     assert final_att.provider_subscription_id == "sub_winner_2jv"
+
+
+
+# =============================================================================
+# 7. Stage 2J-R Standalone ORM Model Registration Regression Tests
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    "entrypoint_module, extra_env",
+    [
+        ("app.workers.billing_health", {}),
+        (
+            "app.workers.razorpay_webhook_worker",
+            {
+                "RAZORPAY_ENABLED": "true",
+                "RAZORPAY_ENVIRONMENT": "live",
+                "RAZORPAY_MERCHANT_ACCOUNT_ID": "acc_live_canonical",
+            },
+        ),
+        (
+            "app.workers.razorpay_checkout_recovery_worker",
+            {
+                "RAZORPAY_ENABLED": "true",
+                "RAZORPAY_ENVIRONMENT": "live",
+                "RAZORPAY_MERCHANT_ACCOUNT_ID": "acc_live_canonical",
+                "RAZORPAY_KEY_ID": "rzp_live_1234567890",
+                "RAZORPAY_KEY_SECRET": "sec_live_123456",
+                "RAZORPAY_PRO_PLAN_ID": "plan_live_123456",
+                "RAZORPAY_PLAN_CURRENCY": "USD",
+            },
+        ),
+    ],
+)
+def test_2jr_standalone_entrypoints_register_all_models_in_fresh_subprocesses(
+    entrypoint_module: str,
+    extra_env: dict[str, str],
+) -> None:
+    """Standalone worker and CLI entrypoints must configure all SQLAlchemy mappers in fresh processes."""
+    clean_env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("RAZORPAY_", "STRIPE_", "VISITOR_", "APTLYST_"))
+    }
+    clean_env.update(
+        {
+            "ENVIRONMENT": "production",
+            "DATABASE_URL": "postgresql+asyncpg://user:pass@localhost:5432/db",
+            **extra_env,
+        }
+    )
+
+    res = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-c",
+            (
+                f"import {entrypoint_module}; "
+                "from sqlalchemy.orm import configure_mappers; "
+                "configure_mappers(); "
+                "from app.models import register_all_models, MODEL_MODULE_NAMES; "
+                "assert register_all_models() == MODEL_MODULE_NAMES"
+            ),
+        ],
+        cwd=str(API_DIR),
+        env=clean_env,
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, (
+        f"Standalone mapper initialization failed for {entrypoint_module}:\n"
+        f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
+    )
+
+
+@pytest.mark.parametrize(
+    "first_submodule",
+    [
+        "app.models.payment",
+        "app.models.subscription",
+        "app.models.billing",
+        "app.models.chatbot",
+        "app.models.organization",
+    ],
+)
+def test_2jr_model_submodule_import_orders_have_no_circular_import_or_missing_mapper(
+    first_submodule: str,
+) -> None:
+    """Importing any model submodule first registers every ORM mapper without circular imports."""
+    res = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-c",
+            (
+                f"import {first_submodule}; "
+                "from sqlalchemy.orm import configure_mappers; "
+                "configure_mappers(); "
+                "from app.db.base import Base; "
+                "assert {'billing_worker_heartbeats', 'llm_usage_logs', 'chatbots', 'organizations'}.issubset(Base.metadata.tables)"
+            ),
+        ],
+        cwd=str(API_DIR),
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, (
+        f"Submodule import order failed starting from {first_submodule}:\n{res.stderr}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_2jr_heartbeat_and_monitoring_work_with_configured_mappers() -> None:
+    """Heartbeat upsert SQL and monitoring snapshot work cleanly once mappers are configured."""
+    from sqlalchemy.orm import configure_mappers
+
+    from app.models import register_all_models
+
+    register_all_models()
+    configure_mappers()
+
+    now = datetime(2026, 11, 25, 3, 0, 0, tzinfo=timezone.utc)
+    tracker = WorkerHeartbeatTracker(
+        worker_id="worker_2jr_mapper_ok",
+        worker_type=WORKER_TYPE_WEBHOOK,
+        deployment_environment="staging",
+        environment="test",
+        merchant_account_id="acc_test_1",
+        started_at=now,
+    )
+
+    class OkResult:
+        def __init__(self, token):
+            self._token = token
+
+        def scalar_one_or_none(self):
+            return self._token
+
+    class OkSession:
+        def __init__(self) -> None:
+            self._step = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def execute(self, stmt):
+            self._step += 1
+            return OkResult(tracker.instance_token)
+
+        async def commit(self):
+            return None
+
+    assert await tracker.record_heartbeat(lambda: OkSession(), status="running", now=now, force=True) is True
+    assert tracker.ownership_lost is False

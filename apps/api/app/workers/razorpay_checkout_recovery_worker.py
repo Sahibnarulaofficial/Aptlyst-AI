@@ -63,11 +63,14 @@ PROHIBITED_PRODUCTION_MERCHANT_NAMES: frozenset[str] = PROHIBITED_PRODUCTION_MER
     "ci",
 }
 from app.db.session import AsyncSessionLocal
+from app.models import register_all_models
 from app.services.billing.razorpay.client import (
     RazorpayClient,
     close_cached_razorpay_client,
     is_razorpay_enabled,
 )
+
+register_all_models()
 from app.services.billing.razorpay.monitoring import (
     WORKER_TYPE_RECOVERY,
     WorkerHeartbeatTracker,

@@ -34,6 +34,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.models import register_all_models
 from app.models.payment import (
     BillingCheckoutAttempt,
     BillingWebhookEvent,
@@ -42,6 +43,8 @@ from app.models.payment import (
     PaymentReconciliation,
 )
 from app.models.subscription import ReconciliationStatus, WebhookProcessingStatus
+
+register_all_models()
 from app.services.billing.webhook_errors import sanitize_billing_error_message
 
 logger = logging.getLogger("app.services.billing.razorpay.monitoring")

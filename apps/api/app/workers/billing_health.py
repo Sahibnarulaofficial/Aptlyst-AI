@@ -39,11 +39,14 @@ finally:
     if not _HAD_PROCESS_ROLE_ENV:
         os.environ.pop("APTLYST_PROCESS_ROLE", None)
 from app.db.session import AsyncSessionLocal
+from app.models import register_all_models
 from app.services.billing.razorpay.monitoring import (
     BillingHealthReport,
     BillingHealthThresholds,
     collect_billing_health_snapshot,
 )
+
+register_all_models()
 
 logger = logging.getLogger("app.workers.billing_health")
 

@@ -52,7 +52,10 @@ finally:
     if not _HAD_PROCESS_ROLE_ENV:
         os.environ.pop("APTLYST_PROCESS_ROLE", None)
 from app.db.session import AsyncSessionLocal
+from app.models import register_all_models
 from app.models.subscription import WebhookProcessingStatus
+
+register_all_models()
 from app.services.billing.razorpay.webhook_engine import (
     DEFAULT_LEASE_DURATION_SECONDS,
     MAX_WEBHOOK_ATTEMPTS,
