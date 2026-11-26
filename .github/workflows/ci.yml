@@ -418,6 +418,22 @@ jobs:
             tests/test_billing_api.py \
             tests/test_billing_webhook_errors.py \
             tests/test_billing_rollover.py \
+            tests/test_accounting.py \
+            tests/test_accounting_subscription_auth.py \
+            tests/test_auth.py \
+            tests/test_infrastructure.py \
+            tests/test_orchestrator.py \
+            tests/test_phase2a_models.py \
+            tests/test_pricing.py \
+            tests/test_public_chat_orchestration.py \
+            tests/test_rate_limits.py \
+            tests/test_razorpay_agreement_handlers.py \
+            tests/test_razorpay_checkout_exclusivity_stage2a.py \
+            tests/test_razorpay_client.py \
+            tests/test_razorpay_handler_foundation.py \
+            tests/test_razorpay_webhook_exceptions.py \
+            tests/test_razorpay_webhook_ingestion.py \
+            tests/test_razorpay_webhook_reconciliation_stage2b.py \
             tests/test_stage2j_config_lifecycle_monitoring.py \
             tests/test_stage2kb_reconciliation_ops.py \
             tests/test_stage2kc_alerting_health_hardening.py \
@@ -440,7 +456,7 @@ jobs:
 
           tests, skipped, failures, errors = assert_junit_zero_skips(
               "test-results-models.xml",
-              expected_exact_tests=805,
+              expected_exact_tests=1169,
               max_age_seconds=1800,
               require_testcase_elements=True,
           )
