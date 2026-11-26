@@ -29,7 +29,7 @@ import socket
 from typing import Any
 import uuid
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -140,6 +140,13 @@ class WorkerHeartbeatTracker:
             self.last_error_message = sanitize_billing_error_message(error_message)
 
         if session_factory is None:
+            return False
+
+        if status == "stopped" and self.ownership_lost:
+            logger.info(
+                "Skipping shutdown heartbeat for worker %s because ownership was already lost.",
+                self.worker_id,
+            )
             return False
 
         # Avoid hammering an unreachable DB on rapid error loops; always flush clean shutdown ("stopped")
@@ -255,6 +262,8 @@ class BillingHealthThresholds:
 
     heartbeat_stale_seconds: int = 90
     webhook_backlog_age_seconds: int = 300
+    webhook_backlog_count_threshold: int = 50
+    webhook_failed_count_threshold: int = 5
     recovery_overdue_age_seconds: int = 300
     reconciliation_backlog_age_seconds: int = 3600
     repeated_lease_expiry_threshold: int = 2
@@ -267,6 +276,12 @@ class BillingHealthThresholds:
             ),
             webhook_backlog_age_seconds=int(
                 getattr(settings, "billing_health_webhook_backlog_age_seconds", 300)
+            ),
+            webhook_backlog_count_threshold=int(
+                getattr(settings, "billing_health_webhook_backlog_count_threshold", 50)
+            ),
+            webhook_failed_count_threshold=int(
+                getattr(settings, "billing_health_webhook_failed_count_threshold", 5)
             ),
             recovery_overdue_age_seconds=int(
                 getattr(settings, "billing_health_recovery_overdue_age_seconds", 300)
@@ -554,6 +569,49 @@ def evaluate_billing_health_alerts(
                 )
             )
 
+    unprocessed_webhook_count = webhook_queue.pending_count + webhook_queue.failed_count
+    if unprocessed_webhook_count >= thresholds.webhook_backlog_count_threshold:
+        alerts.append(
+            AlertCondition(
+                code="WEBHOOK_BACKLOG_COUNT_EXCEEDED",
+                severity="critical" if unprocessed_webhook_count >= thresholds.webhook_backlog_count_threshold * 2 else "warning",
+                message=(
+                    f"Unprocessed webhook backlog count is {unprocessed_webhook_count} "
+                    f"(>= {thresholds.webhook_backlog_count_threshold})."
+                ),
+                metric_value=unprocessed_webhook_count,
+                threshold=thresholds.webhook_backlog_count_threshold,
+            )
+        )
+
+    if webhook_queue.failed_count >= thresholds.webhook_failed_count_threshold:
+        alerts.append(
+            AlertCondition(
+                code="REPEATED_WEBHOOK_FAILURES",
+                severity="warning",
+                message=(
+                    f"{webhook_queue.failed_count} Razorpay webhook event(s) are in retrying 'failed' state "
+                    f"(>= {thresholds.webhook_failed_count_threshold})."
+                ),
+                metric_value=webhook_queue.failed_count,
+                threshold=thresholds.webhook_failed_count_threshold,
+            )
+        )
+
+    if webhook_queue.expired_lease_count >= thresholds.repeated_lease_expiry_threshold:
+        alerts.append(
+            AlertCondition(
+                code="WEBHOOK_EXPIRED_LEASES",
+                severity="warning",
+                message=(
+                    f"{webhook_queue.expired_lease_count} webhook event(s) hold expired worker leases "
+                    f"(>= {thresholds.repeated_lease_expiry_threshold})."
+                ),
+                metric_value=webhook_queue.expired_lease_count,
+                threshold=thresholds.repeated_lease_expiry_threshold,
+            )
+        )
+
     if webhook_queue.quarantined_count > 0:
         alerts.append(
             AlertCondition(
@@ -562,6 +620,20 @@ def evaluate_billing_health_alerts(
                 message=f"{webhook_queue.quarantined_count} Razorpay webhook event(s) are quarantined.",
                 metric_value=webhook_queue.quarantined_count,
                 threshold=0,
+            )
+        )
+
+    if recovery_queue.expired_claim_count >= thresholds.repeated_lease_expiry_threshold:
+        alerts.append(
+            AlertCondition(
+                code="RECOVERY_EXPIRED_CLAIMS",
+                severity="warning",
+                message=(
+                    f"{recovery_queue.expired_claim_count} checkout recovery attempt(s) hold expired claims "
+                    f"(>= {thresholds.repeated_lease_expiry_threshold})."
+                ),
+                metric_value=recovery_queue.expired_claim_count,
+                threshold=thresholds.repeated_lease_expiry_threshold,
             )
         )
 
@@ -688,7 +760,9 @@ async def collect_billing_health_snapshot(
         await db.execute(
             select(func.count(BillingWebhookEvent.id), func.min(BillingWebhookEvent.received_at)).where(
                 *wh_base,
-                BillingWebhookEvent.status == WebhookProcessingStatus.pending,
+                BillingWebhookEvent.status.in_(
+                    [WebhookProcessingStatus.pending, WebhookProcessingStatus.failed]
+                ),
             )
         )
     ).one()
@@ -903,3 +977,91 @@ async def collect_billing_health_snapshot(
         reconciliation=reconciliation,
         alerts=alerts,
     )
+
+
+async def cleanup_stale_worker_heartbeats(
+    db: AsyncSession,
+    *,
+    now: datetime | None = None,
+    stopped_retention_seconds: int | None = None,
+    abandoned_retention_seconds: int | None = None,
+    stale_takeover_seconds: int | None = None,
+    exclude_worker_id: str | None = None,
+    batch_size: int = 500,
+) -> int:
+    """Safely prune expired historical worker heartbeat rows in bounded, lock-safe batches.
+
+    Invariants:
+    - Never deletes active worker heartbeats: enforces a hard safety floor of at least
+      max(stale_takeover_seconds * 2, 300) seconds before deletion.
+    - Retains cleanly stopped rows for ``stopped_retention_seconds`` (default 7 days) and
+      ungraceful non-stopped rows for ``abandoned_retention_seconds`` (default 30 days) so
+      incident evidence remains available for investigation.
+    - Uses ``SELECT ... FOR UPDATE SKIP LOCKED`` over primary keys before ``DELETE`` so
+      concurrent cleanup invocations never deadlock or double-delete, making execution
+      idempotent.
+    """
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be at least 1, got {batch_size}")
+
+    now_utc = _ensure_utc(now) or datetime.now(timezone.utc)
+    stale_sec = int(
+        stale_takeover_seconds
+        if stale_takeover_seconds is not None
+        else getattr(settings, "billing_health_heartbeat_stale_seconds", 90)
+    )
+    min_safe_floor = max(stale_sec * 2, 300)
+
+    stopped_ret = int(
+        stopped_retention_seconds
+        if stopped_retention_seconds is not None
+        else getattr(settings, "worker_heartbeat_stopped_retention_seconds", 604800)
+    )
+    abandoned_ret = int(
+        abandoned_retention_seconds
+        if abandoned_retention_seconds is not None
+        else getattr(settings, "worker_heartbeat_abandoned_retention_seconds", 2592000)
+    )
+
+    if stopped_ret < min_safe_floor:
+        raise ValueError(
+            f"stopped_retention_seconds ({stopped_ret}) must be >= {min_safe_floor}s "
+            "to avoid deleting active or recently stale worker heartbeats."
+        )
+    if abandoned_ret < min_safe_floor:
+        raise ValueError(
+            f"abandoned_retention_seconds ({abandoned_ret}) must be >= {min_safe_floor}s "
+            "to preserve incident investigation evidence."
+        )
+
+    stopped_cutoff = now_utc - timedelta(seconds=stopped_ret)
+    abandoned_cutoff = now_utc - timedelta(seconds=abandoned_ret)
+
+    eligibility = or_(
+        (BillingWorkerHeartbeat.status == "stopped")
+        & (BillingWorkerHeartbeat.last_heartbeat_at <= stopped_cutoff),
+        (BillingWorkerHeartbeat.status != "stopped")
+        & (BillingWorkerHeartbeat.last_heartbeat_at <= abandoned_cutoff),
+    )
+
+    claim_stmt = (
+        select(BillingWorkerHeartbeat.worker_id)
+        .where(eligibility)
+        .order_by(BillingWorkerHeartbeat.last_heartbeat_at.asc())
+        .limit(batch_size)
+        .with_for_update(skip_locked=True)
+    )
+    if exclude_worker_id:
+        claim_stmt = claim_stmt.where(BillingWorkerHeartbeat.worker_id != exclude_worker_id)
+
+    candidate_ids = list((await db.execute(claim_stmt)).scalars().all())
+    if not candidate_ids:
+        await db.rollback()
+        return 0
+
+    del_stmt = delete(BillingWorkerHeartbeat).where(
+        BillingWorkerHeartbeat.worker_id.in_(candidate_ids)
+    )
+    res = await db.execute(del_stmt)
+    await db.commit()
+    return int(res.rowcount or len(candidate_ids))

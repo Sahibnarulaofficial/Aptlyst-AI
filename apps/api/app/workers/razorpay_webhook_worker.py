@@ -74,6 +74,7 @@ from app.services.billing.razorpay.webhook_engine import (
 from app.services.billing.razorpay.monitoring import (
     WORKER_TYPE_WEBHOOK,
     WorkerHeartbeatTracker,
+    cleanup_stale_worker_heartbeats,
 )
 from app.services.billing.webhook_errors import sanitize_billing_error_message
 
@@ -277,7 +278,7 @@ class RazorpayWebhookWorker:
         results: list[ProcessResult] = []
 
         for _ in range(limit):
-            if self._stop_event.is_set():
+            if self._stop_event.is_set() or self.heartbeat_tracker.ownership_lost:
                 break
 
             result = await self.process_one()
@@ -343,8 +344,28 @@ class RazorpayWebhookWorker:
             now=self._get_now(),
             force=True,
         )
+        if not self.heartbeat_tracker.ownership_lost and self.session_factory is not None:
+            try:
+                async def _cleanup() -> None:
+                    async with self.session_factory() as cleanup_db:  # type: ignore[misc]
+                        await cleanup_stale_worker_heartbeats(
+                            cleanup_db,
+                            now=self._get_now(),
+                            exclude_worker_id=self.worker_id,
+                        )
+
+                await asyncio.wait_for(_cleanup(), timeout=3.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(
+                    "Non-fatal heartbeat cleanup error for worker %s: %s",
+                    self.worker_id,
+                    sanitize_billing_error_message(str(exc)),
+                )
+
         try:
-            while not self._stop_event.is_set():
+            while not self._stop_event.is_set() and not self.heartbeat_tracker.ownership_lost:
                 try:
                     results = await self.run_batch()
                     await self.heartbeat_tracker.record_heartbeat(
@@ -353,6 +374,13 @@ class RazorpayWebhookWorker:
                         now=self._get_now(),
                         processed_delta=len(results),
                     )
+                    if self.heartbeat_tracker.ownership_lost:
+                        logger.error(
+                            "Worker %s lost heartbeat ownership; halting claim loop safely.",
+                            self.worker_id,
+                        )
+                        self._stop_event.set()
+                        break
                     if results:
                         # If full batch was processed, immediately poll again without delay
                         if len(results) >= self.batch_size:
@@ -380,6 +408,13 @@ class RazorpayWebhookWorker:
                         force=True,
                         error_message=str(exc),
                     )
+                    if self.heartbeat_tracker.ownership_lost:
+                        logger.error(
+                            "Worker %s lost heartbeat ownership during error recovery; halting claim loop safely.",
+                            self.worker_id,
+                        )
+                        self._stop_event.set()
+                        break
                     try:
                         await asyncio.wait_for(
                             self._stop_event.wait(), timeout=min(5.0, self.poll_interval)
@@ -391,7 +426,7 @@ class RazorpayWebhookWorker:
             logger.info("RazorpayWebhookWorker %s cancelled during execution.", self.worker_id)
             raise
         finally:
-            if not cancelled:
+            if not cancelled and not self.heartbeat_tracker.ownership_lost:
                 await self.heartbeat_tracker.record_heartbeat(
                     self.session_factory,
                     status="stopped",
@@ -509,7 +544,7 @@ async def run_worker(
             try:
                 from app.db.session import engine
 
-                await engine.dispose()
+                await asyncio.wait_for(engine.dispose(), timeout=5.0)
                 logger.debug("Disposed default database engine successfully.")
             except Exception as exc:
                 logger.debug("Error disposing database engine: %s", exc)

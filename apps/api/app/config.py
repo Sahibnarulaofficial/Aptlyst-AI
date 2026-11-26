@@ -711,13 +711,25 @@ class Settings(BaseSettings):
     razorpay_pro_plan_id: str = ""
     razorpay_plan_currency: str = "USD"
 
-    # Worker Heartbeat & Queue Monitoring Thresholds (Stage 2J.4)
+    # Worker Heartbeat & Queue Monitoring Thresholds (Stage 2J.4 / Stage 2K-C)
     worker_heartbeat_interval_seconds: float = Field(default=30.0, gt=0.0)
+    worker_heartbeat_stopped_retention_seconds: int = Field(default=604800, ge=3600)
+    worker_heartbeat_abandoned_retention_seconds: int = Field(default=2592000, ge=3600)
     billing_health_heartbeat_stale_seconds: int = Field(default=90, ge=1)
     billing_health_webhook_backlog_age_seconds: int = Field(default=300, ge=1)
+    billing_health_webhook_backlog_count_threshold: int = Field(default=50, ge=1)
+    billing_health_webhook_failed_count_threshold: int = Field(default=5, ge=1)
     billing_health_recovery_overdue_age_seconds: int = Field(default=300, ge=1)
     billing_health_reconciliation_backlog_age_seconds: int = Field(default=3600, ge=1)
     billing_health_repeated_lease_expiry_threshold: int = Field(default=2, ge=1)
+
+    # Operational Alert Delivery & Deduplication (Stage 2K-C, strictly opt-in)
+    billing_health_alert_webhook_enabled: bool = False
+    billing_health_alert_webhook_url: str = ""
+    billing_health_alert_webhook_bearer_token: SecretStr = Field(default=SecretStr(""))
+    billing_health_alert_webhook_timeout_seconds: float = Field(default=5.0, gt=0.0, le=30.0)
+    billing_health_alert_state_file: str = ""
+    billing_health_alert_renotify_seconds: int = Field(default=0, ge=0)
 
     def get_public_razorpay_config(self) -> dict[str, Any]:
         """Return safe, non-sensitive Razorpay configuration for client-side consumption.

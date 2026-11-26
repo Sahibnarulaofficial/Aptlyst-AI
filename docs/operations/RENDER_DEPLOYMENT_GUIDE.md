@@ -141,33 +141,61 @@ Execute migrations as a **single controlled release step** before rolling new We
 
 ---
 
-## 5. Worker Heartbeats, Queue Monitoring & Operational Inspection
+## 5. Worker Heartbeats, Queue Monitoring, Alerting & Operational Hardening
 
-Both workers persist throttled liveness and progress heartbeats to `billing_worker_heartbeats` (`last_heartbeat_at`, `last_processed_at`, `last_error_at`, `processed_count`, `error_count`). Heartbeat writes use an isolated `2.0s` timeout session so transient DB issues never block or fail billing transactions.
+### API Database Health Endpoint (`GET /health/db`)
+- Executes `SELECT 1` against PostgreSQL.
+- On success: returns HTTP `200` with `{"status": "ok", "database": "connected"}`.
+- On database failure: returns HTTP `503` with a **generic, redacted response** (`{"status": "error", "database": "unavailable"}`). Never exposes SQLAlchemy tracebacks, connection strings, credentials, or internal hostnames to HTTP clients; sanitized error details are emitted only to server-side logs.
 
-### Inspection CLI Command
-Run read-only operational checks from Render Shell (within `apps/api` root directory, requiring only `ENVIRONMENT`, `DATABASE_URL`, and `RAZORPAY_*` scope):
+### Worker Ownership-Loss & Heartbeat Retention
+Both `razorpay_webhook_worker` and `razorpay_checkout_recovery_worker` persist throttled liveness and progress heartbeats to `billing_worker_heartbeats` (`last_heartbeat_at`, `last_processed_at`, `last_error_at`, `processed_count`, `error_count`) with an isolated `2.0s` write timeout:
+- **Ownership-Loss Claim Halt:** If a worker's `instance_token` fencing check fails (`ownership_lost=True`, e.g., another instance superseded its stale heartbeat or shared the same `worker_id`), the worker immediately stops claiming new queue items, exits its polling loop, and skips writing a `"stopped"` heartbeat so it cannot overwrite the active replacement's row. Already in-flight item processing continues to be guarded by UUID lease fencing.
+- **Heartbeat Retention Cleanup:** On startup (with a `3.0s` non-fatal timeout), workers prune historical rows via `cleanup_stale_worker_heartbeats` using `SELECT ... FOR UPDATE SKIP LOCKED` in bounded batches:
+  - Cleanly `stopped` rows older than `WORKER_HEARTBEAT_STOPPED_RETENTION_SECONDS` (default `604800`s / 7 days).
+  - Non-stopped abandoned rows older than `WORKER_HEARTBEAT_ABANDONED_RETENTION_SECONDS` (default `2592000`s / 30 days).
+  - Active/recent rows are protected by a mandatory safety floor (`>= max(stale_takeover_seconds * 2, 300)` seconds) and exclusion of the caller's own `worker_id`.
+
+### Inspection & Scheduled Alerting CLI (`billing_health`)
+Run read-only operational checks and optional edge-triggered alerting from an external scheduler or Render Shell (`apps/api` root directory, requiring only `ENVIRONMENT` and `DATABASE_URL`):
 
 ```bash
 # Human-readable health report
 python -m app.workers.billing_health --environment test
 
-# JSON output for monitoring pipelines, exiting non-zero if alerts trigger
+# Structured JSON output exiting non-zero when alerts trigger
 python -m app.workers.billing_health --environment live --json --fail-on-alert
+
+# Scheduled alert evaluation + opt-in sink delivery with private local deduplication file
+python -m app.workers.billing_health --environment live --json --fail-on-alert --notify --state-file /var/lib/aptlyst/alert-state.json
 ```
+
+**CLI Exit Codes for External Schedulers:**
+- `0`: System healthy, OR alerts active without `--fail-on-alert` (and delivery succeeded if `--notify`).
+- `1`: One or more alert conditions active under `--fail-on-alert`, **or** database connectivity / monitoring evaluation failed (`MONITORING_EVALUATION_FAILED`).
+- `2`: `--notify` delivery failed (timeout, network error, non-2xx webhook response) or notification configuration was invalid.
+
+**Alert Notification & Deduplication Configuration:**
+- **Opt-In Webhook Sink:** Disabled by default (`BILLING_HEALTH_ALERT_WEBHOOK_ENABLED=false`). To enable external HTTP JSON alerts, set `BILLING_HEALTH_ALERT_WEBHOOK_ENABLED=true`, `BILLING_HEALTH_ALERT_WEBHOOK_URL=https://...`, optional `BILLING_HEALTH_ALERT_WEBHOOK_BEARER_TOKEN`, and `BILLING_HEALTH_ALERT_WEBHOOK_TIMEOUT_SECONDS` (default `5.0`, max `30.0`). Never pass tokens on CLI flags or commit URLs/secrets.
+- **Deduplication Strategy (Single Non-Overlapping Scheduler & At-Least-Once Delivery):** With `--state-file` / `BILLING_HEALTH_ALERT_STATE_FILE`, alerts trigger on edge transitions (`firing` on newly active alert code, `escalated` on `warning -> critical`, and `resolved` when cleared). Resolved incidents are removed from active state so any future recurrence immediately re-alerts. Notification state updates **only after** HTTP `2xx` delivery succeeds (at-least-once delivery semantics: request timeouts or `5xx` responses after receiver acceptance trigger retry on the next run and may produce duplicate notifications). `FileAlertStateStore` uses atomic single-process file replacement without cross-process file locking; initial deployment MUST run a single non-overlapping scheduler and store the state file in a private dedicated directory (`chmod 0700`, e.g. `/var/lib/aptlyst/alert-state.json`), never in shared `/var/tmp` or `/tmp`.
+- **Persistence Limitation (Proposed Future Configuration):** Local state files provide durable deduplication only when a single scheduler retains private local/persistent disk. Ephemeral stateless runners or concurrent multi-runner schedules (such as a future Render Cron Job without persistent disk, not yet configured) either discard local files or risk duplicate alerts; cross-runner stateless deduplication would require a future separately approved database schema migration (`billing_alert_states`). Never assume a Render Cron service is already provisioned in the Render Dashboard until explicitly created and verified.
 
 ### Monitored Alert Conditions & Default Thresholds
 1. **`STALE_WORKER_HEARTBEAT` (`BILLING_HEALTH_HEARTBEAT_STALE_SECONDS=90`):** Active worker row has not reported a heartbeat in `> 90s`.
 2. **`NO_ACTIVE_WEBHOOK_WORKER` / `NO_ACTIVE_RECOVERY_WORKER`:** Zero non-stale running workers registered for the target environment.
-3. **`WORKER_ERRORING_NO_PROGRESS` / `WEBHOOK_WORKER_STALLED_OR_BACKLOGGED` / `RECOVERY_WORKER_STALLED_OR_BACKLOGGED`:** Distinguishes process liveness from queue progress — flags workers whose heartbeats are fresh while queue backlog age exceeds threshold or errors outpace progress.
-4. **`WEBHOOK_BACKLOG_AGE_EXCEEDED` (`BILLING_HEALTH_WEBHOOK_BACKLOG_AGE_SECONDS=300`):** Oldest pending webhook older than 5 minutes.
-5. **`QUARANTINED_WEBHOOK_EVENTS`:** Any `billing_webhook_events` row in `status = 'quarantined'`.
-6. **`RECOVERY_OVERDUE_BACKLOG` (`BILLING_HEALTH_RECOVERY_OVERDUE_AGE_SECONDS=300`):** Overdue `recovery_required` attempt older than 5 minutes past `next_recovery_retry_at`.
-7. **`REPEATED_EXPIRED_LEASES_OR_QUARANTINE` (`BILLING_HEALTH_REPEATED_LEASE_EXPIRY_THRESHOLD=2`):** Repeated lease crashes or exhausted recovery attempts (`next_recovery_retry_at IS NULL`).
-8. **`PENDING_RECONCILIATION_CASES` (`BILLING_HEALTH_RECONCILIATION_BACKLOG_AGE_SECONDS=3600`):** Unresolved `payment_reconciliations` rows awaiting operator review.
+3. **`WORKER_ERRORING_NO_PROGRESS` / `WEBHOOK_WORKER_STALLED_OR_BACKLOGGED` / `RECOVERY_WORKER_STALLED_OR_BACKLOGGED`:** Flags alive workers whose queue backlog exceeds threshold or errors outpace progress.
+4. **`WEBHOOK_BACKLOG_COUNT_EXCEEDED` (`BILLING_HEALTH_WEBHOOK_BACKLOG_COUNT_THRESHOLD=50`):** Unprocessed (`pending + failed`) webhook events meet or exceed configured count threshold (escalates to `critical` at `>= 2x` threshold).
+5. **`WEBHOOK_BACKLOG_AGE_EXCEEDED` (`BILLING_HEALTH_WEBHOOK_BACKLOG_AGE_SECONDS=300`):** Oldest unprocessed (`pending` or `failed`) webhook older than 5 minutes.
+6. **`REPEATED_WEBHOOK_FAILURES` (`BILLING_HEALTH_WEBHOOK_FAILED_COUNT_THRESHOLD=5`) & `QUARANTINED_WEBHOOK_EVENTS`:** Elevated retrying failures (`failed`) or any `quarantined` webhook events.
+7. **`WEBHOOK_EXPIRED_LEASES` / `RECOVERY_EXPIRED_CLAIMS` / `REPEATED_EXPIRED_LEASES_OR_QUARANTINE` (`BILLING_HEALTH_REPEATED_LEASE_EXPIRY_THRESHOLD=2`):** Repeated lease/claim expirations, crash anomalies, or exhausted recovery attempts (`next_recovery_retry_at IS NULL`).
+8. **`RECOVERY_OVERDUE_BACKLOG` (`BILLING_HEALTH_RECOVERY_OVERDUE_AGE_SECONDS=300`):** Overdue `recovery_required` attempt older than 5 minutes past `next_recovery_retry_at`.
+9. **`PENDING_RECONCILIATION_CASES` (`BILLING_HEALTH_RECONCILIATION_BACKLOG_AGE_SECONDS=3600`):** Unresolved `payment_reconciliations` rows awaiting operator review.
+10. **`MONITORING_EVALUATION_FAILED`:** Database connectivity or health snapshot query failure during a `billing_health` run (payload contains sanitized error diagnostics only).
 
-> [!NOTE]
-> No external paging provider (PagerDuty/Slack) is wired into the codebase; `billing_health` emits structured warning/error logs and exit codes so Render log alerts or external cron runners can trigger notifications.
+### Incident Response Quick Reference
+- **Stale / Superseded Worker (`STALE_WORKER_HEARTBEAT`, `NO_ACTIVE_*_WORKER`, `ownership_lost` logs):** Inspect worker service health and logs in Render, verify database pooler reachability and unique `RAZORPAY_*_WORKER_ID` per instance (never share one ID across multiple live processes), and restart the stopped worker instance.
+- **Webhook Backlog / Quarantined Events (`WEBHOOK_BACKLOG_*`, `QUARANTINED_WEBHOOK_EVENTS`):** Verify `razorpay_webhook_worker` liveness and inspect quarantined events read-only via `python -m app.workers.billing_reconciliation list-quarantined-webhooks --environment <env>`. Investigate linked `payment_reconciliations` before taking manual operator action.
+- **Exhausted Recovery / Pending Reconciliations (`RECOVERY_OVERDUE_*`, `REPEATED_EXPIRED_LEASES_OR_QUARANTINE`, `PENDING_RECONCILIATION_CASES`):** Inspect exhausted attempts via `python -m app.workers.billing_reconciliation list-exhausted-recoveries --environment <env>` and open cases via `python -m app.workers.billing_reconciliation list --environment <env>`, resolving verified cases cleanly with `resolve --confirm`.
 
 ---
 

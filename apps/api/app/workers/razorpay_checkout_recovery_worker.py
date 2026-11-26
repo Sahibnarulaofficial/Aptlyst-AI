@@ -74,6 +74,7 @@ register_all_models()
 from app.services.billing.razorpay.monitoring import (
     WORKER_TYPE_RECOVERY,
     WorkerHeartbeatTracker,
+    cleanup_stale_worker_heartbeats,
 )
 from app.services.billing.razorpay.recovery_engine import (
     DEFAULT_RECOVERY_LEASE_DURATION_SECONDS,
@@ -346,7 +347,7 @@ class RazorpayCheckoutRecoveryWorker:
         results: list[RecoveryExecutionResult] = []
 
         for _ in range(limit):
-            if self._stop_event.is_set():
+            if self._stop_event.is_set() or self.heartbeat_tracker.ownership_lost:
                 break
 
             result = await self.process_one()
@@ -412,14 +413,41 @@ class RazorpayCheckoutRecoveryWorker:
             now=self._get_now(),
             force=True,
         )
+        if not self.heartbeat_tracker.ownership_lost and self.session_factory is not None:
+            try:
+                async def _cleanup() -> None:
+                    async with self.session_factory() as cleanup_db:  # type: ignore[misc]
+                        await cleanup_stale_worker_heartbeats(
+                            cleanup_db,
+                            now=self._get_now(),
+                            exclude_worker_id=self.worker_id,
+                        )
+
+                await asyncio.wait_for(_cleanup(), timeout=3.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(
+                    "Non-fatal heartbeat cleanup error for recovery worker %s: %s",
+                    self.worker_id,
+                    sanitize_billing_error_message(str(exc)),
+                )
+
         try:
-            while not self._stop_event.is_set():
+            while not self._stop_event.is_set() and not self.heartbeat_tracker.ownership_lost:
                 if not is_razorpay_enabled():
                     await self.heartbeat_tracker.record_heartbeat(
                         self.session_factory,
                         status="running",
                         now=self._get_now(),
                     )
+                    if self.heartbeat_tracker.ownership_lost:
+                        logger.error(
+                            "Recovery worker %s lost heartbeat ownership; halting claim loop safely.",
+                            self.worker_id,
+                        )
+                        self._stop_event.set()
+                        break
                     try:
                         await asyncio.wait_for(
                             self._stop_event.wait(), timeout=min(5.0, self.poll_interval)
@@ -436,6 +464,13 @@ class RazorpayCheckoutRecoveryWorker:
                         now=self._get_now(),
                         processed_delta=len(results),
                     )
+                    if self.heartbeat_tracker.ownership_lost:
+                        logger.error(
+                            "Recovery worker %s lost heartbeat ownership; halting claim loop safely.",
+                            self.worker_id,
+                        )
+                        self._stop_event.set()
+                        break
                     if results:
                         if len(results) >= self.batch_size:
                             # Full batch claimed, immediately loop for more without delay
@@ -463,6 +498,13 @@ class RazorpayCheckoutRecoveryWorker:
                         force=True,
                         error_message=str(exc),
                     )
+                    if self.heartbeat_tracker.ownership_lost:
+                        logger.error(
+                            "Recovery worker %s lost heartbeat ownership during error recovery; halting claim loop safely.",
+                            self.worker_id,
+                        )
+                        self._stop_event.set()
+                        break
                     try:
                         await asyncio.wait_for(
                             self._stop_event.wait(), timeout=min(5.0, self.poll_interval)
@@ -474,7 +516,7 @@ class RazorpayCheckoutRecoveryWorker:
             logger.info("RazorpayCheckoutRecoveryWorker %s cancelled during execution.", self.worker_id)
             raise
         finally:
-            if not cancelled:
+            if not cancelled and not self.heartbeat_tracker.ownership_lost:
                 await self.heartbeat_tracker.record_heartbeat(
                     self.session_factory,
                     status="stopped",
@@ -573,12 +615,12 @@ async def run_recovery_worker(
     finally:
         if client is None:
             try:
-                await close_cached_razorpay_client()
+                await asyncio.wait_for(close_cached_razorpay_client(), timeout=5.0)
             except Exception as exc:
                 logger.debug("Error closing cached Razorpay client: %s", exc)
         elif hasattr(client, "close"):
             try:
-                await client.close()
+                await asyncio.wait_for(client.close(), timeout=5.0)
             except Exception as exc:
                 logger.debug("Error closing injected Razorpay client: %s", exc)
 
@@ -586,7 +628,7 @@ async def run_recovery_worker(
             try:
                 from app.db.session import engine
 
-                await engine.dispose()
+                await asyncio.wait_for(engine.dispose(), timeout=5.0)
                 logger.debug("Disposed default database engine successfully.")
             except Exception as exc:
                 logger.debug("Error disposing database engine: %s", exc)

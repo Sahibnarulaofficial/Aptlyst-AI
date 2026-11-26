@@ -1,12 +1,19 @@
-"""Operational CLI for inspecting Razorpay worker heartbeats and billing queues.
+"""Operational CLI for inspecting Razorpay worker heartbeats, billing queues, and alerts.
 
 Usage:
     python -m app.workers.billing_health
     python -m app.workers.billing_health --environment live --json --fail-on-alert
+    python -m app.workers.billing_health --environment live --json --fail-on-alert --notify --state-file /var/lib/aptlyst/alerts.json
+
+Exit Codes (suitable for external cron/schedulers):
+    0: Healthy, OR alerts active without ``--fail-on-alert`` (and alert delivery succeeded if ``--notify``).
+    1: Active alert condition(s) present under ``--fail-on-alert``, OR database/monitoring evaluation failed.
+    2: Alert delivery or notification configuration failed when ``--notify`` is enabled.
 
 Guarantees:
-- Strictly read-only database inspection (zero queue mutations).
-- Zero secrets, signing keys, or customer PII output.
+- Strictly read-only database inspection (zero queue, reconciliation, or payment mutations).
+- Alert delivery executes strictly outside any database session or transaction.
+- Zero secrets, signing keys, bearer tokens, or customer PII output or logged.
 - Disposes database engine cleanly before exit.
 """
 
@@ -20,6 +27,7 @@ import json
 import logging
 import os
 import sys
+from typing import Any
 
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 _API_ROOT = os.path.abspath(os.path.join(_CURRENT_DIR, "..", ".."))
@@ -29,7 +37,7 @@ if _API_ROOT not in sys.path:
 # Read-only monitoring requires DB and deployment scope only (no API ingress secrets)
 _HAD_PROCESS_ROLE_ENV = "APTLYST_PROCESS_ROLE" in os.environ
 if not _HAD_PROCESS_ROLE_ENV and "app.config" not in sys.modules:
-    os.environ["APTLYST_PROCESS_ROLE"] = "webhook_worker"
+    os.environ["APTLYST_PROCESS_ROLE"] = "migration"
 
 try:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,11 +48,21 @@ finally:
         os.environ.pop("APTLYST_PROCESS_ROLE", None)
 from app.db.session import AsyncSessionLocal
 from app.models import register_all_models
+from app.services.billing.razorpay.alerting import (
+    AlertConfigurationError,
+    AlertSink,
+    AlertStateStore,
+    build_evaluation_failure_report,
+    dispatch_billing_alerts,
+    resolve_alert_sink_from_settings,
+    resolve_alert_state_store_from_settings,
+)
 from app.services.billing.razorpay.monitoring import (
     BillingHealthReport,
     BillingHealthThresholds,
     collect_billing_health_snapshot,
 )
+from app.services.billing.webhook_errors import sanitize_billing_error_message
 
 register_all_models()
 
@@ -121,36 +139,121 @@ async def run_billing_health_check(
     thresholds: BillingHealthThresholds | None = None,
     output_json: bool = False,
     fail_on_alert: bool = False,
+    notify: bool = False,
+    alert_sink: AlertSink | None = None,
+    state_store: AlertStateStore | None = None,
+    state_file: str | None = None,
+    renotify_seconds: int | None = None,
+    notify_on_recovery: bool = True,
     now: datetime | None = None,
 ) -> tuple[int, str]:
-    """Execute read-only billing health check and return (exit_code, formatted_output)."""
-    settings.validate_migration_configuration()
+    """Execute read-only billing health check + optional alerting and return (exit_code, output)."""
+    checked_at = now or datetime.now(timezone.utc)
+    try:
+        settings.validate_migration_configuration()
+    except Exception as exc:
+        report = build_evaluation_failure_report(
+            exc=exc, environment=environment, checked_at=checked_at
+        )
+        rendered = (
+            json.dumps(report.to_dict(), indent=2, sort_keys=True)
+            if output_json
+            else format_human_report(report)
+        )
+        return 1, rendered
+
+    resolved_sink: AlertSink | None = alert_sink
+    if notify and resolved_sink is None:
+        try:
+            resolved_sink = resolve_alert_sink_from_settings(notify=True)
+        except AlertConfigurationError as exc:
+            err_msg = sanitize_billing_error_message(exc, max_chars=256)
+            logger.error("Invalid alert delivery configuration: %s", err_msg)
+            rendered = (
+                json.dumps({"error": err_msg, "delivery_succeeded": False}, indent=2, sort_keys=True)
+                if output_json
+                else f"ERROR: {err_msg}"
+            )
+            return 2, rendered
+
     factory = session_factory or AsyncSessionLocal
+    eval_failed = False
 
     try:
         async with factory() as db:
             report = await collect_billing_health_snapshot(
                 db=db,
                 environment=environment,
-                now=now or datetime.now(timezone.utc),
+                now=checked_at,
                 thresholds=thresholds,
                 emit_alert_logs=True,
             )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        eval_failed = True
+        safe_err = sanitize_billing_error_message(exc, max_chars=256)
+        logger.error("Billing health check evaluation failed: %s", safe_err)
+        report = build_evaluation_failure_report(
+            exc=exc,
+            environment=environment,
+            checked_at=checked_at,
+        )
     finally:
         if session_factory is None:
             try:
                 from app.db.session import engine
 
-                await engine.dispose()
+                await asyncio.wait_for(engine.dispose(), timeout=5.0)
             except Exception as exc:
                 logger.debug("Error disposing database engine after health check: %s", exc)
 
-    rendered = (
-        json.dumps(report.to_dict(), indent=2, sort_keys=True)
-        if output_json
-        else format_human_report(report)
-    )
-    exit_code = 1 if (fail_on_alert and report.alerts) else 0
+    # Alert delivery occurs strictly outside any DB session or transaction
+    dispatch_dict: dict[str, Any] | None = None
+    delivery_failed = False
+    if notify and resolved_sink is not None:
+        resolved_store = state_store or resolve_alert_state_store_from_settings(
+            state_file=state_file
+        )
+        effective_renotify = int(
+            renotify_seconds
+            if renotify_seconds is not None
+            else getattr(settings, "billing_health_alert_renotify_seconds", 0)
+        )
+        dispatch_result = await dispatch_billing_alerts(
+            report,
+            sink=resolved_sink,
+            state_store=resolved_store,
+            renotify_interval_seconds=effective_renotify,
+            notify_on_recovery=notify_on_recovery,
+        )
+        dispatch_dict = dispatch_result.to_dict()
+        delivery_failed = not dispatch_result.delivery_succeeded
+
+    if output_json:
+        payload = report.to_dict()
+        if dispatch_dict is not None:
+            payload["alert_delivery"] = dispatch_dict
+        rendered = json.dumps(payload, indent=2, sort_keys=True)
+    else:
+        rendered = format_human_report(report)
+        if dispatch_dict is not None:
+            rendered += (
+                f"\n\nAlert Delivery ({dispatch_dict['sink_name']}): "
+                f"attempted={dispatch_dict['attempted_delivery']} "
+                f"succeeded={dispatch_dict['delivery_succeeded']} "
+                f"emitted={dispatch_dict['emitted_count']} "
+                f"suppressed={dispatch_dict['suppressed_count']}"
+            )
+            if dispatch_dict.get("error_message"):
+                rendered += f" error={dispatch_dict['error_message']}"
+
+    if delivery_failed:
+        exit_code = 2
+    elif eval_failed or (fail_on_alert and report.alerts):
+        exit_code = 1
+    else:
+        exit_code = 0
     return exit_code, rendered
 
 
@@ -177,6 +280,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exit with code 1 if any warning or critical alert condition is active.",
     )
     parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Dispatch deduplicated alert transitions via configured sink (webhook if enabled in env, else structured logs).",
+    )
+    parser.add_argument(
+        "--state-file",
+        type=str,
+        default=None,
+        help="Optional local JSON state file path for edge-triggered alert deduplication.",
+    )
+    parser.add_argument(
+        "--renotify-seconds",
+        type=int,
+        default=None,
+        help="Optional reminder interval (seconds) for continuing firing alerts (default: 0 = edge-triggered only).",
+    )
+    parser.add_argument(
+        "--no-recovery-notify",
+        action="store_true",
+        help="Suppress resolved recovery notifications when active alerts clear.",
+    )
+    parser.add_argument(
         "--heartbeat-stale-seconds",
         type=int,
         default=None,
@@ -187,6 +312,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Override webhook backlog age alert threshold in seconds.",
+    )
+    parser.add_argument(
+        "--webhook-backlog-count",
+        type=int,
+        default=None,
+        help="Override webhook backlog count alert threshold.",
+    )
+    parser.add_argument(
+        "--webhook-failed-count",
+        type=int,
+        default=None,
+        help="Override retrying failed webhook count alert threshold.",
     )
     parser.add_argument(
         "--recovery-overdue-seconds",
@@ -219,6 +356,16 @@ def main(argv: list[str] | None = None) -> None:
             if args.webhook_backlog_seconds is not None
             else base.webhook_backlog_age_seconds
         ),
+        webhook_backlog_count_threshold=(
+            args.webhook_backlog_count
+            if args.webhook_backlog_count is not None
+            else base.webhook_backlog_count_threshold
+        ),
+        webhook_failed_count_threshold=(
+            args.webhook_failed_count
+            if args.webhook_failed_count is not None
+            else base.webhook_failed_count_threshold
+        ),
         recovery_overdue_age_seconds=(
             args.recovery_overdue_seconds
             if args.recovery_overdue_seconds is not None
@@ -243,6 +390,10 @@ def main(argv: list[str] | None = None) -> None:
             thresholds=thresholds,
             output_json=args.json,
             fail_on_alert=args.fail_on_alert,
+            notify=args.notify,
+            state_file=args.state_file,
+            renotify_seconds=args.renotify_seconds,
+            notify_on_recovery=not args.no_recovery_notify,
         )
     )
     print(rendered)

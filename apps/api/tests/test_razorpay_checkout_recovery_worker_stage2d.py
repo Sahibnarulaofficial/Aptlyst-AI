@@ -227,6 +227,18 @@ class RecoveryWorkerMockDbSession:
         stmt_str = str(statement)
         now = self.clock_now
 
+        # 0. Worker Heartbeat & Retention queries (Stage 2J/2K-C)
+        if "billing_worker_heartbeats" in stmt_str:
+            if "RETURNING" in stmt_str:
+                hb_params: dict[str, Any] = {}
+                try:
+                    hb_params = statement.compile().params
+                except Exception:
+                    pass
+                token = hb_params.get("instance_token")
+                return ScalarResult([token] if token is not None else [])
+            return ScalarResult([])
+
         # 1. Claim Batch Query: SELECT ... FROM billing_checkout_attempts WHERE ... FOR UPDATE SKIP LOCKED
         if "billing_checkout_attempts.status = :status_1" in stmt_str or "status IN" in stmt_str or "ORDER BY" in stmt_str:
             candidates: list[BillingCheckoutAttempt] = []
