@@ -416,6 +416,8 @@ jobs:
             tests/test_razorpay_customer.py \
             tests/test_razorpay_checkout.py \
             tests/test_billing_api.py \
+            tests/test_billing_webhook_errors.py \
+            tests/test_billing_rollover.py \
             tests/test_stage2j_config_lifecycle_monitoring.py \
             tests/test_stage2kb_reconciliation_ops.py \
             tests/test_stage2kc_alerting_health_hardening.py \
@@ -429,6 +431,24 @@ jobs:
             tests/test_checkout_recovery_schema_stage2c.py \
             tests/test_phase2b_stage1_models.py \
             --junitxml=test-results-models.xml
+
+      - name: Enforce zero skipped tests in focused regression JUnit report
+        working-directory: apps/api
+        run: |
+          python - <<'PY'
+          from tests.postgres_test_guard import assert_junit_zero_skips
+
+          tests, skipped, failures, errors = assert_junit_zero_skips(
+              "test-results-models.xml",
+              expected_exact_tests=805,
+              max_age_seconds=1800,
+              require_testcase_elements=True,
+          )
+          print(
+              f"Verified Focused Regression JUnit gate: tests={tests}, skipped={skipped}, "
+              f"failures={failures}, errors={errors}"
+          )
+          PY
 
       - name: Preserve Test Results Artifacts
         if: always()
