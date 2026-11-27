@@ -19,6 +19,7 @@ from app.schemas.organization import (
     OrganizationOut,
     OrganizationWithRoleOut,
 )
+from app.services.billing.advisory_lock import derive_advisory_lock_key
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
 
@@ -94,14 +95,22 @@ async def setup_initial_organization(
     - Paid plan: can create multiple owned organizations.
     - Non-owner memberships (member, admin) do not count toward this limit.
     """
-    # Acquire a transaction-level advisory lock scoped to the user ID to serialize
+    # Acquire transaction-level advisory locks scoped to the user ID to serialize
     # concurrent creation attempts for the same user (preventing TOCTOU races).
+    # Transitional Dual-Locking (BLK-03):
+    # 1. Acquire legacy 31-bit lock first to maintain mutual exclusion against older pods during rolling deployment.
+    # 2. Acquire canonical 64-bit lock second to establish the collision-resistant namespace.
     bind = db.get_bind()
     if bind is not None and bind.dialect.name == "postgresql":
-        lock_key = int(current_user.id.int % 2147483647)
+        legacy_lock_key = int(current_user.id.int % 2147483647)
         await db.execute(
             text("SELECT pg_advisory_xact_lock(:key)"),
-            {"key": lock_key},
+            {"key": legacy_lock_key},
+        )
+        canonical_lock_key = derive_advisory_lock_key("user", current_user.id)
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(:key)"),
+            {"key": canonical_lock_key},
         )
 
     try:

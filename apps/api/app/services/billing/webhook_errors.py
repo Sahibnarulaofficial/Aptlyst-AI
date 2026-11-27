@@ -597,6 +597,7 @@ UNIQUE_CONCURRENCY_RACE_EXACT: frozenset[str] = frozenset({
     "uq_billing_customer_provisions_org_provider",
     "uq_subscriptions_provider_subscription",
     "uq_org_scoped_active_billing_checkout_attempt",
+    "uq_org_env_active_billing_checkout_attempt",  # ADR-006 Stage 2C env-scoped active attempt index
     "uq_checkout_attempts_provider_sub",        # added
     "uq_checkout_attempts_provider_payment",    # added
     "uq_org_active_checkout_attempt",           # added (stripe_checkout_attempts)

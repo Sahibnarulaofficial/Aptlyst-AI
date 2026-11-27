@@ -156,11 +156,14 @@ class BillingCheckoutAttempt(Base):
     """Durable tenant-scoped checkout session attempt for provider-neutral billing.
 
     Guarantees:
-    1. Mutual Exclusion: At most one in-flight, pending, or open attempt per organization
-       per provider/account/environment scope via partial unique index uq_org_scoped_active_billing_checkout_attempt.
+    1. Mutual Exclusion: At most one in-flight, pending, or open attempt per
+       (organization_id, environment) across providers via partial unique index
+       uq_org_env_active_billing_checkout_attempt (ADR-006 Decision A).
     2. Deterministic Idempotency: UniqueConstraint on (organization_id, idempotency_key).
-    3. Crash Safety: Leased creating state protects tenant reservation while external gateway
-       call is in flight.
+    3. Crash Safety & Recovery Scheduling: Leased creating state protects tenant
+       reservation while external gateway call is in flight; dedicated recovery fields
+       (next_recovery_retry_at, recovery_claim_expires_at, recovery_claim_id,
+       recovery_attempts) govern ADR-006 Decision C worker claiming and stale-worker fencing.
     """
 
     __tablename__ = "billing_checkout_attempts"
@@ -222,6 +225,18 @@ class BillingCheckoutAttempt(Base):
     attempt_lease_expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+    next_recovery_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    recovery_claim_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    recovery_claim_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    recovery_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     session_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -260,10 +275,8 @@ class BillingCheckoutAttempt(Base):
             name="uq_bca_composite_identity",
         ),
         Index(
-            "uq_org_scoped_active_billing_checkout_attempt",
+            "uq_org_env_active_billing_checkout_attempt",
             "organization_id",
-            "provider",
-            "merchant_account_id",
             "environment",
             unique=True,
             postgresql_where=text(
@@ -301,6 +314,15 @@ class BillingCheckoutAttempt(Base):
             "status",
             "attempt_lease_expires_at",
             postgresql_where=text("status = 'creating'"),
+        ),
+        Index(
+            "ix_billing_checkout_attempts_recovery_claim",
+            "status",
+            "next_recovery_retry_at",
+            "recovery_claim_expires_at",
+            postgresql_where=text(
+                "status = 'recovery_required' AND next_recovery_retry_at IS NOT NULL"
+            ),
         ),
     )
 
@@ -643,7 +665,9 @@ class BillingPayment(Base):
             "reconciliation_state",
             "lease_expires_at",
             "attempt_count",
-            postgresql_where=text("reconciliation_state IN ('unreconciled', 'reconciling')"),
+            postgresql_where=text(
+                "reconciliation_state IN ('unreconciled', 'reconciling', 'pending_attempt_binding')"
+            ),
         ),
     )
 
@@ -860,6 +884,89 @@ class BillingCustomerProvision(Base):
             "ix_billing_customer_provisions_lease",
             "status",
             "lease_expires_at",
+        ),
+    )
+
+
+class BillingWorkerHeartbeat(Base):
+    """Lightweight durable liveness & progress record for background billing workers.
+
+    Guarantees:
+    1. Process-Level Identity: Each worker incarnation generates a unique instance_token
+       and default UUID-backed worker_id so restarts never inherit prior liveness silently.
+    2. Liveness vs. Progress: Tracks last_heartbeat_at separately from last_processed_at
+       and last_error_at so hung or error-looping processes are distinguishable from idle ones.
+    3. Zero Customer/Secret Data: Stores operational identifiers and sanitized error summaries only.
+    """
+
+    __tablename__ = "billing_worker_heartbeats"
+
+    worker_id: Mapped[str] = mapped_column(
+        String(128), primary_key=True
+    )
+    instance_token: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False
+    )
+    worker_type: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )
+    deployment_environment: Mapped[str] = mapped_column(
+        String(32), nullable=False
+    )
+    environment: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    merchant_account_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="starting", server_default="starting"
+    )
+    pid: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    hostname: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    last_heartbeat_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    last_processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error_message: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    processed_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    error_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_billing_worker_heartbeats_type_env_hb",
+            "worker_type",
+            "environment",
+            "last_heartbeat_at",
+        ),
+        Index(
+            "ix_billing_worker_heartbeats_status_hb",
+            "status",
+            "last_heartbeat_at",
         ),
     )
 

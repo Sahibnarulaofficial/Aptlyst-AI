@@ -1,28 +1,30 @@
 """Tests for public chatbot runtime endpoint and CORS behavior."""
 
-import os
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import delete
 
-from app.db.session import AsyncSessionLocal, get_db
+from app.db.session import get_db
 from app.main import app
-from app.models.organization import Organization
-from tests.test_auth import TEST_JWT_SECRET, make_token
-
-RUN_INTEGRATION_TESTS = os.getenv("RUN_SUPABASE_INTEGRATION_TESTS", "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
+from tests.postgres_api_test_helper import (
+    SKIP_IF_OPTIONAL_POSTGRES,
+    cleanup_test_organizations,
+    verified_pg_api_session_factory,
 )
+from tests.test_auth import TEST_JWT_SECRET, make_token
 
 
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+@pytest.fixture
+async def pg_session_factory():
+    async for factory in verified_pg_api_session_factory():
+        yield factory
 
 
 @pytest.fixture
@@ -33,12 +35,12 @@ async def client() -> AsyncClient:
         yield ac
 
 
+@pytest.mark.pg_api_integration
+@SKIP_IF_OPTIONAL_POSTGRES
 @pytest.mark.anyio
-@pytest.mark.skipif(
-    not RUN_INTEGRATION_TESTS,
-    reason="Public chatbot full lifecycle integration test requires real PostgreSQL with RUN_SUPABASE_INTEGRATION_TESTS=1",
-)
-async def test_get_public_chatbot_active_success_and_field_filtering(client: AsyncClient) -> None:
+async def test_get_public_chatbot_active_success_and_field_filtering(
+    client: AsyncClient, pg_session_factory
+) -> None:
     """Verifies that an active chatbot returns only public visual fields, never instructions or org IDs."""
     user_id = uuid.uuid4()
     token = make_token(user_id=str(user_id))
@@ -122,10 +124,7 @@ async def test_get_public_chatbot_active_success_and_field_filtering(client: Asy
             assert res_public_inactive.status_code == 404
             assert res_public_inactive.json()["detail"] == "Chatbot not found"
     finally:
-        if org_id:
-            async with AsyncSessionLocal() as session:
-                await session.execute(delete(Organization).where(Organization.id == org_id))
-                await session.commit()
+        await cleanup_test_organizations(pg_session_factory, [org_id])
 
 
 @pytest.mark.anyio

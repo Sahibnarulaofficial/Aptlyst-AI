@@ -3,13 +3,27 @@
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from app.workers.razorpay_checkout_recovery_worker import (
+        RazorpayCheckoutRecoveryWorker,
+        run_recovery_worker,
+    )
     from app.workers.razorpay_webhook_worker import RazorpayWebhookWorker
     from app.workers.stripe_webhook_worker import StripeWebhookWorker, run_worker
 
-__all__ = ["RazorpayWebhookWorker", "StripeWebhookWorker", "run_worker"]
+__all__ = [
+    "RazorpayCheckoutRecoveryWorker",
+    "RazorpayWebhookWorker",
+    "StripeWebhookWorker",
+    "run_recovery_worker",
+    "run_worker",
+]
 
 
 def __getattr__(name: str) -> Any:
+    if name in ("RazorpayCheckoutRecoveryWorker", "run_recovery_worker"):
+        from app.workers import razorpay_checkout_recovery_worker
+
+        return getattr(razorpay_checkout_recovery_worker, name)
     if name == "RazorpayWebhookWorker":
         from app.workers import razorpay_webhook_worker
 

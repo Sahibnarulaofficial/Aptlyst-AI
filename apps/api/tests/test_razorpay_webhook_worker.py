@@ -219,6 +219,17 @@ class RazorpayWorkerMockDbSession:
         stmt_str = str(statement)
         now = self.clock_now
 
+        # Worker Heartbeat & Retention queries (Stage 2J/2K-C)
+        if "billing_worker_heartbeats" in stmt_str:
+            if "RETURNING" in stmt_str:
+                hb_params: dict[str, Any] = {}
+                try:
+                    hb_params = statement.compile().params
+                except Exception:
+                    pass
+                return ScalarResult(hb_params.get("instance_token"))
+            return ScalarResult(None)
+
         # Reconciliation Upsert query
         if "payment_reconciliations" in stmt_str:
             params: dict[str, Any] = {}

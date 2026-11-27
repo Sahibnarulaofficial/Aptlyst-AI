@@ -56,9 +56,11 @@ from app.models.payment import (
 )
 from app.models.subscription import (
     CheckoutAttemptStatus,
+    StripeCheckoutAttempt,
     Subscription,
     SubscriptionStatus,
 )
+from app.services.billing.advisory_lock import acquire_advisory_lock
 from app.services.billing.razorpay.client import (
     RazorpayAPIError,
     RazorpayAuthError,
@@ -222,6 +224,79 @@ async def _safe_rollback(db: AsyncSession) -> None:
         pass
 
 
+_ACTIVE_CHECKOUT_STATUSES: tuple[CheckoutAttemptStatus, ...] = (
+    CheckoutAttemptStatus.creating,
+    CheckoutAttemptStatus.recovery_required,
+    CheckoutAttemptStatus.open,
+    CheckoutAttemptStatus.payment_pending,
+)
+
+
+def _classify_legacy_stripe_attempt_environment(
+    attempt: StripeCheckoutAttempt,
+) -> str | None:
+    """Infer deterministic environment provenance for a historical Stripe checkout attempt.
+
+    Rules (conservative, Option A compliant):
+    - 'cs_live_*' -> 'live'
+    - 'cs_test_*' -> 'test'
+    - NULL, empty, or unrecognized prefix -> None (unresolved provenance; fail closed)
+
+    Never assumes 'legacy' or NULL session ID means 'live' or safe to ignore.
+    """
+    sid = (attempt.stripe_session_id or "").strip() if isinstance(attempt.stripe_session_id, str) else ""
+    if sid.startswith("cs_live_"):
+        return "live"
+    if sid.startswith("cs_test_"):
+        return "test"
+    return None
+
+
+async def _assert_no_conflicting_legacy_stripe_attempt(
+    db: AsyncSession,
+    organization_id: uuid.UUID,
+    environment: str,
+) -> None:
+    """Strictly read-only cross-table compatibility guard against active legacy Stripe attempts.
+
+    Must be invoked inside Phase B under the canonical Level 0A organization advisory lock.
+    Never mutates stripe_checkout_attempts.
+    """
+    stmt_legacy = (
+        select(StripeCheckoutAttempt)
+        .where(
+            StripeCheckoutAttempt.organization_id == organization_id,
+            StripeCheckoutAttempt.status.in_(_ACTIVE_CHECKOUT_STATUSES),
+        )
+        .order_by(StripeCheckoutAttempt.created_at.desc(), StripeCheckoutAttempt.id.asc())
+        .limit(1)
+    )
+    res_legacy = await db.execute(stmt_legacy)
+    legacy_attempt = res_legacy.scalar_one_or_none()
+    if legacy_attempt is None:
+        return
+
+    legacy_env = _classify_legacy_stripe_attempt_environment(legacy_attempt)
+    if legacy_env is None:
+        await _safe_rollback(db)
+        raise CheckoutRecoveryRequiredError(
+            f"An active legacy Stripe checkout attempt ({legacy_attempt.id}) with unresolved "
+            f"environment provenance requires reconciliation before a new checkout can be initiated."
+        )
+
+    if legacy_env == environment:
+        await _safe_rollback(db)
+        if legacy_attempt.status == CheckoutAttemptStatus.recovery_required:
+            raise CheckoutRecoveryRequiredError(
+                f"A conflicting legacy Stripe checkout attempt ({legacy_attempt.id}) in "
+                f"'{environment}' requires reconciliation before a new checkout can be initiated."
+            )
+        raise CheckoutInProgressError(
+            f"A conflicting legacy Stripe checkout attempt ({legacy_attempt.id}) is already "
+            f"active for organization {organization_id} in '{environment}'."
+        )
+
+
 # =============================================================================
 # Subscription Checkout Creation Service
 # =============================================================================
@@ -297,14 +372,18 @@ async def create_razorpay_subscription_checkout(
 
     # -------------------------------------------------------------------------
     # Phase B: Fresh Transaction — Checkout Locks, Revalidation & Attempt Staging
-    # Lock order (L1B -> L3 -> L6):
-    #   Organization FOR UPDATE
+    # Lock order (ADR-005 monotonic):
+    #   Level 0A: Organization Advisory Lock (pg_advisory_xact_lock)
+    #     -> Organization FOR UPDATE
     #     -> BillingCustomerProvision FOR UPDATE
     #     -> Subscription FOR UPDATE
+    #     -> Cross-table read-only legacy Stripe attempt guard
     #     -> BillingCheckoutAttempt FOR UPDATE
     # Zero external HTTP calls permitted in Phase B.
     # -------------------------------------------------------------------------
     try:
+        await acquire_advisory_lock(db, "organization", organization.id)
+
         stmt_org_lock = (
             select(Organization)
             .where(Organization.id == organization.id)
@@ -385,6 +464,13 @@ async def create_razorpay_subscription_checkout(
             raise ActiveSubscriptionExistsError(
                 f"Organization {organization.id} already has an active Pro subscription."
             )
+
+        # Cross-table read-only compatibility guard against reachable legacy Stripe checkouts
+        await _assert_no_conflicting_legacy_stripe_attempt(
+            db=db,
+            organization_id=organization.id,
+            environment=environment,
+        )
 
         # Evaluate timestamp after acquiring Phase B row locks
         now_utc = datetime.now(timezone.utc)
@@ -478,6 +564,10 @@ async def create_razorpay_subscription_checkout(
                 )
                 active_attempt.status = CheckoutAttemptStatus.recovery_required
                 active_attempt.error_message = "creation_lease_expired"
+                active_attempt.next_recovery_retry_at = now_utc
+                active_attempt.recovery_claim_id = None
+                active_attempt.recovery_claim_expires_at = None
+                active_attempt.recovery_attempts = 0
                 await db.commit()
                 raise CheckoutRecoveryRequiredError(
                     f"Checkout attempt {active_attempt.id} creation lease expired; recovery required before retry."
@@ -734,7 +824,7 @@ async def create_razorpay_subscription_checkout(
     expire_by_ts = sub_data.get("expire_by")
     session_expires_at = _parse_timestamp(expire_by_ts) or (now_utc + timedelta(days=DEFAULT_SUBSCRIPTION_EXPIRY_DAYS))
 
-    await _record_attempt_success(
+    persisted_status = await _record_attempt_success(
         db=db,
         attempt_id=attempt_id,
         subscription_id=sub_id,
@@ -750,7 +840,7 @@ async def create_razorpay_subscription_checkout(
         key_id=key_id,
         plan_id=plan_id,
         checkout_url=short_url,
-        status=CheckoutAttemptStatus.open,
+        status=persisted_status,
     )
 
 
@@ -851,34 +941,44 @@ async def recover_razorpay_checkout_attempt(
             attempt_id,
             evidence_str,
         )
-        reconciliation = PaymentReconciliation(
-            id=uuid.uuid4(),
+        case_key = f"recovery_definitive_failure:{attempt_id}"
+        diag_data = {
+            "attempt_id": str(attempt_id),
+            "evidence": evidence_str,
+            "reconciled_at": now_utc.isoformat(),
+        }
+        reconciliation = await stage_or_update_payment_reconciliation(
+            db=db,
+            case_key=case_key,
+            reason="definitive_nonexistence_evidence",
             provider="razorpay",
             merchant_account_id=merchant_account_id,
             environment=environment,
             organization_id=organization_id,
-            payment_id=None,
-            invoice_id=None,
-            raw_event_id=None,
-            reason="definitive_nonexistence_evidence",
-            status=ReconciliationStatus.resolved_ignored,
-            diagnostic_payload={
-                "attempt_id": str(attempt_id),
-                "evidence": evidence_str,
-                "reconciled_at": now_utc.isoformat(),
-            },
+            diagnostic_data=diag_data,
+            now=now_utc,
         )
-        db.add(reconciliation)
+        reconciliation.status = ReconciliationStatus.resolved_ignored
+        reconciliation.diagnostic_payload = {
+            **diag_data,
+            **reconciliation.diagnostic_payload,
+        }
         attempt.status = CheckoutAttemptStatus.failed
         attempt.error_message = evidence_str
+        attempt.next_recovery_retry_at = None
+        attempt.recovery_claim_id = None
+        attempt.recovery_claim_expires_at = None
         await db.commit()
         raise RazorpayCheckoutError(
             f"Attempt {attempt_id} marked failed with defensible evidence: {evidence_str}"
         )
 
     # 1.3 Acquire Recovery Claim (Lease) for Concurrency Safety
-    recovery_claim_id = f"rec_claim_{uuid.uuid4().hex[:12]}"
+    claim_uuid = uuid.uuid4()
+    recovery_claim_id = f"rec_claim_{claim_uuid.hex[:12]}"
     attempt.attempt_lease_expires_at = now_utc + timedelta(seconds=CHECKOUT_LEASE_SECONDS)
+    attempt.recovery_claim_id = claim_uuid
+    attempt.recovery_claim_expires_at = now_utc + timedelta(seconds=CHECKOUT_LEASE_SECONDS)
     payload_copy = dict(attempt.request_payload or {})
     payload_copy["recovery_claim_id"] = recovery_claim_id
     attempt.request_payload = payload_copy
@@ -1154,24 +1254,27 @@ async def recover_razorpay_checkout_attempt(
                 candidate_ids,
             )
             try:
-                reconciliation = PaymentReconciliation(
-                    id=uuid.uuid4(),
+                case_key = f"recovery_multiple_candidates:{attempt_id}"
+                diag_data = {
+                    "attempt_id": str(attempt_id),
+                    "candidate_subscription_ids": candidate_ids,
+                    "detected_at": now_utc.isoformat(),
+                }
+                reconciliation = await stage_or_update_payment_reconciliation(
+                    db=db,
+                    case_key=case_key,
+                    reason="multiple_recovery_candidates_found",
                     provider="razorpay",
                     merchant_account_id=merchant_account_id,
                     environment=environment,
                     organization_id=organization_id,
-                    payment_id=None,
-                    invoice_id=None,
-                    raw_event_id=None,
-                    reason="multiple_recovery_candidates_found",
-                    status=ReconciliationStatus.pending_review,
-                    diagnostic_payload={
-                        "attempt_id": str(attempt_id),
-                        "candidate_subscription_ids": candidate_ids,
-                        "detected_at": now_utc.isoformat(),
-                    },
+                    diagnostic_data=diag_data,
+                    now=now_utc,
                 )
-                db.add(reconciliation)
+                reconciliation.diagnostic_payload = {
+                    **diag_data,
+                    **reconciliation.diagnostic_payload,
+                }
                 await db.commit()
             except Exception as rec_exc:
                 logger.warning("Failed to commit reconciliation case for multiple candidates: %s", rec_exc)
@@ -1209,37 +1312,50 @@ async def recover_razorpay_checkout_attempt(
     if locked_attempt is None:
         raise RazorpayCheckoutNotFoundError(f"Attempt {attempt_id} disappeared during recovery.")
 
-    current_claim = locked_attempt.request_payload.get("recovery_claim_id") if isinstance(locked_attempt.request_payload, dict) else None
-    if current_claim != recovery_claim_id:
+    current_claim_payload = (
+        locked_attempt.request_payload.get("recovery_claim_id")
+        if isinstance(locked_attempt.request_payload, dict)
+        else None
+    )
+    current_claim_col = locked_attempt.recovery_claim_id
+    is_claim_match = (
+        (current_claim_payload == recovery_claim_id)
+        and (current_claim_col is None or current_claim_col == claim_uuid or str(current_claim_col) == str(claim_uuid))
+    )
+    if not is_claim_match:
         logger.warning(
-            "Stale recovery worker detected on attempt %s: claim %s was superseded by %s",
+            "Stale recovery worker detected on attempt %s: claim %s was superseded by payload=%s col=%s",
             attempt_id,
             recovery_claim_id,
-            current_claim,
+            current_claim_payload,
+            current_claim_col,
         )
         if target_sub_id:
             # Preserve the recovered candidate in PaymentReconciliation so it is never lost
             try:
-                reconciliation = PaymentReconciliation(
-                    id=uuid.uuid4(),
+                case_key = f"recovery_superseded:{attempt_id}:{target_sub_id}"
+                diag_data = {
+                    "attempt_id": str(attempt_id),
+                    "recovered_subscription_id": target_sub_id,
+                    "worker_claim_id": recovery_claim_id,
+                    "superseded_by": current_claim_payload or str(current_claim_col),
+                    "detected_at": now_utc.isoformat(),
+                }
+                reconciliation = await stage_or_update_payment_reconciliation(
+                    db=db,
+                    case_key=case_key,
+                    reason="superseded_recovery_worker",
                     provider="razorpay",
                     merchant_account_id=merchant_account_id,
                     environment=environment,
                     organization_id=organization_id,
-                    payment_id=None,
-                    invoice_id=None,
-                    raw_event_id=None,
-                    reason="superseded_recovery_worker",
-                    status=ReconciliationStatus.pending_review,
-                    diagnostic_payload={
-                        "attempt_id": str(attempt_id),
-                        "recovered_subscription_id": target_sub_id,
-                        "worker_claim_id": recovery_claim_id,
-                        "superseded_by": current_claim,
-                        "detected_at": now_utc.isoformat(),
-                    },
+                    diagnostic_data=diag_data,
+                    now=now_utc,
                 )
-                db.add(reconciliation)
+                reconciliation.diagnostic_payload = {
+                    **diag_data,
+                    **reconciliation.diagnostic_payload,
+                }
                 await db.commit()
             except Exception as rec_exc:
                 logger.warning("Failed to commit superseded recovery reconciliation: %s", rec_exc)
@@ -1259,6 +1375,9 @@ async def recover_razorpay_checkout_attempt(
     locked_attempt.session_expires_at = session_expires_at
     locked_attempt.status = CheckoutAttemptStatus.open
     locked_attempt.error_message = None
+    locked_attempt.next_recovery_retry_at = None
+    locked_attempt.recovery_claim_id = None
+    locked_attempt.recovery_claim_expires_at = None
 
     payload_final = dict(locked_attempt.request_payload or {})
     payload_final["recovery_evidence"] = {
@@ -2095,6 +2214,22 @@ async def _record_attempt_outcome(
         if attempt is not None:
             attempt.status = status
             attempt.error_message = error_message
+            if status == CheckoutAttemptStatus.recovery_required:
+                if getattr(attempt, "next_recovery_retry_at", None) is None:
+                    attempt.next_recovery_retry_at = datetime.now(timezone.utc)
+                attempt.recovery_claim_id = None
+                attempt.recovery_claim_expires_at = None
+                if getattr(attempt, "recovery_attempts", None) is None:
+                    attempt.recovery_attempts = 0
+            elif status in (
+                CheckoutAttemptStatus.open,
+                CheckoutAttemptStatus.complete,
+                CheckoutAttemptStatus.failed,
+                CheckoutAttemptStatus.expired,
+            ):
+                attempt.next_recovery_retry_at = None
+                attempt.recovery_claim_id = None
+                attempt.recovery_claim_expires_at = None
             await db.commit()
         else:
             await _safe_rollback(db)
@@ -2114,8 +2249,19 @@ async def _record_attempt_success(
     subscription_id: str,
     checkout_url: str | None,
     session_expires_at: datetime | None,
-) -> None:
-    """Record successful remote subscription creation on the checkout attempt."""
+) -> CheckoutAttemptStatus:
+    """Record successful remote subscription creation on the checkout attempt with strict status guards.
+
+    State-machine invariants (Stage 2A):
+    - 'creating' and 'recovery_required' may transition to 'open' if no conflicting
+      provider_subscription_id is bound.
+    - 'open' is idempotent when provider_subscription_id is absent or identical.
+    - 'payment_pending' and 'complete' are NEVER regressed to 'open'; missing
+      provider_subscription_id may be bound safely, while conflicting IDs stage reconciliation.
+    - 'expired' and 'failed' are strictly terminal: NEVER resurrected or rebound; a durable
+      PaymentReconciliation case is staged and RazorpayCheckoutConflictError is raised.
+    """
+    clean_sub_id = subscription_id.strip()
     try:
         stmt = (
             select(BillingCheckoutAttempt)
@@ -2125,16 +2271,113 @@ async def _record_attempt_success(
         )
         res = await db.execute(stmt)
         attempt = res.scalar_one_or_none()
-        if attempt is not None:
-            attempt.provider_subscription_id = subscription_id
-            attempt.provider_session_id = subscription_id
-            attempt.checkout_url = checkout_url
-            attempt.session_expires_at = session_expires_at
-            attempt.status = CheckoutAttemptStatus.open
-            attempt.error_message = None
-            await db.commit()
-        else:
+        if attempt is None:
             await _safe_rollback(db)
+            raise RazorpayCheckoutNotFoundError(
+                f"Checkout attempt {attempt_id} disappeared before remote success persistence."
+            )
+
+        existing_sub_id = (
+            attempt.provider_subscription_id.strip()
+            if isinstance(attempt.provider_subscription_id, str)
+            and attempt.provider_subscription_id.strip()
+            else None
+        )
+        now_utc = datetime.now(timezone.utc)
+
+        # 1. Terminal states ('expired', 'failed'): NEVER resurrect or overwrite
+        if attempt.status in (CheckoutAttemptStatus.expired, CheckoutAttemptStatus.failed):
+            logger.warning(
+                "Refusing to overwrite terminal checkout attempt %s (status=%s) with remote subscription %s; "
+                "staging reconciliation.",
+                attempt_id,
+                attempt.status.value,
+                clean_sub_id,
+            )
+            await stage_or_update_payment_reconciliation(
+                db=db,
+                case_key=f"checkout_success_on_terminal_attempt:{attempt.id}",
+                reason="checkout_success_on_terminal_attempt",
+                provider=attempt.provider or "razorpay",
+                merchant_account_id=attempt.merchant_account_id or "default",
+                environment=attempt.environment or "live",
+                organization_id=attempt.organization_id,
+                diagnostic_data={
+                    "attempt_id": str(attempt.id),
+                    "attempt_status": attempt.status.value,
+                    "existing_provider_subscription_id": existing_sub_id,
+                    "remote_subscription_id": clean_sub_id,
+                },
+                now=now_utc,
+            )
+            await db.commit()
+            raise RazorpayCheckoutConflictError(
+                f"Checkout attempt {attempt_id} is in terminal state '{attempt.status.value}' "
+                f"and cannot transition to 'open'."
+            )
+
+        # 2. Conflicting provider_subscription_id on any non-terminal state: NEVER overwrite
+        if existing_sub_id is not None and existing_sub_id != clean_sub_id:
+            logger.warning(
+                "Refusing to overwrite bound subscription '%s' with '%s' on attempt %s (status=%s); "
+                "staging reconciliation.",
+                existing_sub_id,
+                clean_sub_id,
+                attempt_id,
+                attempt.status.value,
+            )
+            await stage_or_update_payment_reconciliation(
+                db=db,
+                case_key=f"checkout_success_sub_conflict:{attempt.id}",
+                reason="checkout_success_subscription_conflict",
+                provider=attempt.provider or "razorpay",
+                merchant_account_id=attempt.merchant_account_id or "default",
+                environment=attempt.environment or "live",
+                organization_id=attempt.organization_id,
+                diagnostic_data={
+                    "attempt_id": str(attempt.id),
+                    "attempt_status": attempt.status.value,
+                    "existing_provider_subscription_id": existing_sub_id,
+                    "remote_subscription_id": clean_sub_id,
+                },
+                now=now_utc,
+            )
+            await db.commit()
+            raise RazorpayCheckoutConflictError(
+                f"Checkout attempt {attempt_id} is already bound to a different subscription '{existing_sub_id}'."
+            )
+
+        # 3. Advanced states ('payment_pending', 'complete'): NEVER regress status to 'open'
+        if attempt.status in (
+            CheckoutAttemptStatus.payment_pending,
+            CheckoutAttemptStatus.complete,
+        ):
+            if existing_sub_id is None:
+                attempt.provider_subscription_id = clean_sub_id
+                if not attempt.provider_session_id:
+                    attempt.provider_session_id = clean_sub_id
+            if checkout_url and not attempt.checkout_url:
+                attempt.checkout_url = checkout_url
+            if session_expires_at and attempt.session_expires_at is None:
+                attempt.session_expires_at = session_expires_at
+            preserved_status = attempt.status
+            await db.commit()
+            return preserved_status
+
+        # 4. Valid transition ('creating', 'recovery_required') or idempotent 'open'
+        attempt.provider_subscription_id = clean_sub_id
+        attempt.provider_session_id = clean_sub_id
+        attempt.checkout_url = checkout_url
+        attempt.session_expires_at = session_expires_at
+        attempt.status = CheckoutAttemptStatus.open
+        attempt.error_message = None
+        attempt.next_recovery_retry_at = None
+        attempt.recovery_claim_id = None
+        attempt.recovery_claim_expires_at = None
+        await db.commit()
+        return CheckoutAttemptStatus.open
+    except RazorpayCheckoutError:
+        raise
     except Exception:
         await _safe_rollback(db)
         raise

@@ -3357,6 +3357,9 @@ def _make_real_asyncpg_session_harness(
             if "standard_conforming_strings" in s_low:
                 self._status = "SHOW"
                 return [("on",)]
+            if s_low.startswith("savepoint ") or s_low.startswith("release savepoint ") or s_low.startswith("rollback to savepoint "):
+                self._status = "SAVEPOINT"
+                return []
 
             tx = self.conn._current_tx
             assert tx is not None and tx.staging is not None

@@ -36,7 +36,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
+from app.config import settings, validate_razorpay_runtime_scope
 from app.models.payment import BillingWebhookEvent
 from app.models.subscription import WebhookProcessingStatus
 from app.services.billing.razorpay.client import (
@@ -87,17 +87,17 @@ class RazorpayWebhookPersistenceError(RazorpayWebhookError, RuntimeError):
 def get_webhook_scope() -> tuple[str, str]:
     """Retrieve and validate the Razorpay environment and merchant account scope.
 
-    Fails closed if merchant_account_id or environment is unconfigured or invalid.
+    Fails closed if deployment environment, merchant_account_id, or razorpay_environment
+    is unconfigured, invalid, or violates Option A production live-only isolation.
     """
-    env = (settings.razorpay_environment or "").strip().lower()
-    if env not in ("test", "live"):
-        raise RazorpayConfigurationError(
-            f"Invalid Razorpay environment '{settings.razorpay_environment}'. Must be 'test' or 'live'."
+    try:
+        return validate_razorpay_runtime_scope(
+            deployment_env=getattr(settings, "environment", None),
+            razorpay_env=getattr(settings, "razorpay_environment", None),
+            merchant_account_id=getattr(settings, "razorpay_merchant_account_id", None),
         )
-    merchant_id = (settings.razorpay_merchant_account_id or "").strip()
-    if not merchant_id:
-        raise RazorpayConfigurationError("Razorpay merchant account ID must be configured.")
-    return merchant_id, env
+    except ValueError as exc:
+        raise RazorpayConfigurationError(str(exc)) from exc
 
 
 async def read_bounded_request_body(
@@ -319,11 +319,21 @@ async def ingest_razorpay_webhook_event(
     Returns:
         tuple[BillingWebhookEvent, bool]: (event_record, is_newly_created)
     """
+    # 0. Fail-closed provenance validation (Option A)
+    try:
+        validated_merchant, validated_env = validate_razorpay_runtime_scope(
+            deployment_env=getattr(settings, "environment", None),
+            razorpay_env=environment,
+            merchant_account_id=merchant_account_id,
+        )
+    except ValueError as exc:
+        raise RazorpayConfigurationError(str(exc)) from exc
+
     # 1. Fast path: check if event was already received and committed
     stmt = select(BillingWebhookEvent).where(
         BillingWebhookEvent.provider == "razorpay",
-        BillingWebhookEvent.merchant_account_id == merchant_account_id,
-        BillingWebhookEvent.environment == environment,
+        BillingWebhookEvent.merchant_account_id == validated_merchant,
+        BillingWebhookEvent.environment == validated_env,
         BillingWebhookEvent.provider_event_id == event_id,
     )
     res = await db.execute(stmt)
@@ -341,8 +351,8 @@ async def ingest_razorpay_webhook_event(
     new_event = BillingWebhookEvent(
         id=uuid.uuid4(),
         provider="razorpay",
-        merchant_account_id=merchant_account_id,
-        environment=environment,
+        merchant_account_id=validated_merchant,
+        environment=validated_env,
         provider_event_id=event_id,
         event_type=event_type,
         status=WebhookProcessingStatus.pending,

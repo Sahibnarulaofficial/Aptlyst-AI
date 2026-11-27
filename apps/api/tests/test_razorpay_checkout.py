@@ -158,6 +158,10 @@ class CheckoutMockDbSession:
         "invoice_id",
         "payment_id",
         "raw_event_id",
+        "next_recovery_retry_at",
+        "recovery_claim_expires_at",
+        "recovery_claim_id",
+        "recovery_attempts",
     )
 
     def __init__(
@@ -252,7 +256,7 @@ class CheckoutMockDbSession:
             return self.organizations.get(ident)
         return None
 
-    async def execute(self, stmt: Any) -> MockScalarResult:
+    async def execute(self, stmt: Any, params: Any = None) -> MockScalarResult:
         self.executed_stmts.append(stmt)
         self._begin_tx_if_needed()
 
@@ -547,7 +551,7 @@ class SharedCheckoutMockDbSession:
 
         return _factory
 
-    async def execute(self, stmt: Any) -> MockScalarResult:
+    async def execute(self, stmt: Any, params: Any = None) -> MockScalarResult:
         self._in_tx = True
         for_update = getattr(stmt, "_for_update_arg", None) is not None
         exec_opts = stmt.get_execution_options() if hasattr(stmt, "get_execution_options") else {}
@@ -4597,7 +4601,7 @@ class ProvisionCheckoutIsolationSession:
             baseline_map[row_id] = copy.deepcopy(row)
         return inst
 
-    async def execute(self, stmt: Any) -> MockScalarResult:
+    async def execute(self, stmt: Any, params: Any = None) -> MockScalarResult:
         tx_id = self._ensure_tx()
         for_update = getattr(stmt, "_for_update_arg", None) is not None
         exec_opts = stmt.get_execution_options() if hasattr(stmt, "get_execution_options") else {}
@@ -5700,9 +5704,11 @@ async def test_c1_scenario_11_phase_a_transaction_never_reused_for_phase_b_locks
         "billing_checkout_attempts",
     ]
     assert phase_b["stmts"] == [
+        ("", False, False),  # Level 0A organization advisory lock (pg_advisory_xact_lock)
         ("organizations", True, True),
         ("billing_customer_provisions", True, True),
         ("subscriptions", True, True),
+        ("stripe_checkout_attempts", False, False),  # Read-only legacy Stripe compatibility guard
         ("billing_checkout_attempts", True, True),
     ]
     assert phase_4["locked_tables"] == ["billing_checkout_attempts"]

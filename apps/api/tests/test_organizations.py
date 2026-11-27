@@ -1,33 +1,25 @@
 """Tests for organization management, role authorization, tenant isolation, and concurrency."""
 
 import asyncio
-import os
 import uuid
 from unittest.mock import patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
-from app.db.session import AsyncSessionLocal
 from app.main import app
-from app.models.organization import MemberRole, Organization, OrganizationMember
+from app.models.organization import MemberRole, OrganizationMember
+from tests.postgres_api_test_helper import (
+    SKIP_IF_OPTIONAL_POSTGRES,
+    cleanup_test_organizations,
+    verified_pg_api_session_factory,
+)
 from tests.test_auth import TEST_JWT_SECRET, make_token
 
-RUN_INTEGRATION_TESTS = os.getenv("RUN_SUPABASE_INTEGRATION_TESTS", "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-)
-
 pytestmark = [
-    pytest.mark.skipif(
-        not RUN_INTEGRATION_TESTS,
-        reason=(
-            "Organization integration tests require real PostgreSQL database. "
-            "Set RUN_SUPABASE_INTEGRATION_TESTS=1 and configure test environment variables to enable."
-        ),
-    ),
+    pytest.mark.pg_api_integration,
+    SKIP_IF_OPTIONAL_POSTGRES,
     pytest.mark.anyio,
 ]
 
@@ -35,6 +27,12 @@ pytestmark = [
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+@pytest.fixture
+async def pg_session_factory():
+    async for factory in verified_pg_api_session_factory():
+        yield factory
 
 
 @pytest.fixture
@@ -46,7 +44,9 @@ async def client() -> AsyncClient:
 
 
 @pytest.mark.anyio
-async def test_setup_organization_creates_org_and_owner(client: AsyncClient) -> None:
+async def test_setup_organization_creates_org_and_owner(
+    client: AsyncClient, pg_session_factory
+) -> None:
     user_id = uuid.uuid4()
     token = make_token(user_id=str(user_id))
     org_id = None
@@ -67,7 +67,7 @@ async def test_setup_organization_creates_org_and_owner(client: AsyncClient) -> 
         org_id = uuid.UUID(data["id"])
 
         # Verify DB records
-        async with AsyncSessionLocal() as session:
+        async with pg_session_factory() as session:
             member = await session.scalar(
                 select(OrganizationMember).where(
                     OrganizationMember.organization_id == org_id,
@@ -77,14 +77,13 @@ async def test_setup_organization_creates_org_and_owner(client: AsyncClient) -> 
             assert member is not None
             assert member.role == MemberRole.owner
     finally:
-        if org_id:
-            async with AsyncSessionLocal() as session:
-                await session.execute(delete(Organization).where(Organization.id == org_id))
-                await session.commit()
+        await cleanup_test_organizations(pg_session_factory, [org_id])
 
 
 @pytest.mark.anyio
-async def test_setup_organization_free_plan_limit_returns_403(client: AsyncClient) -> None:
+async def test_setup_organization_free_plan_limit_returns_403(
+    client: AsyncClient, pg_session_factory
+) -> None:
     user_id = uuid.uuid4()
     token = make_token(user_id=str(user_id))
     org_id = None
@@ -109,18 +108,17 @@ async def test_setup_organization_free_plan_limit_returns_403(client: AsyncClien
             assert r2.status_code == 403
             assert "Free plan is limited to 1 organization" in r2.json()["detail"]
     finally:
-        if org_id:
-            async with AsyncSessionLocal() as session:
-                await session.execute(delete(Organization).where(Organization.id == org_id))
-                await session.commit()
+        await cleanup_test_organizations(pg_session_factory, [org_id])
 
 
 @pytest.mark.anyio
-async def test_setup_organization_paid_plan_allows_multiple_orgs(client: AsyncClient) -> None:
+async def test_setup_organization_paid_plan_allows_multiple_orgs(
+    client: AsyncClient, pg_session_factory
+) -> None:
     """Paid users (e.g. Pro) can create multiple owned organizations."""
     user_id = uuid.uuid4()
     token = make_token(user_id=str(user_id), app_metadata={"plan": "pro"})
-    created_org_ids = []
+    created_org_ids: list[uuid.UUID] = []
 
     try:
         with patch("app.auth.dependencies.settings") as mock_settings:
@@ -151,7 +149,7 @@ async def test_setup_organization_paid_plan_allows_multiple_orgs(client: AsyncCl
             assert r3.status_code == 201
             created_org_ids.append(uuid.UUID(r3.json()["id"]))
 
-        async with AsyncSessionLocal() as session:
+        async with pg_session_factory() as session:
             members = (
                 await session.scalars(
                     select(OrganizationMember).where(
@@ -162,23 +160,19 @@ async def test_setup_organization_paid_plan_allows_multiple_orgs(client: AsyncCl
             ).all()
             assert len(members) == 3
     finally:
-        if created_org_ids:
-            async with AsyncSessionLocal() as session:
-                for oid in created_org_ids:
-                    await session.execute(delete(Organization).where(Organization.id == oid))
-                await session.commit()
+        await cleanup_test_organizations(pg_session_factory, created_org_ids)
 
 
 @pytest.mark.anyio
 async def test_free_user_non_owner_memberships_do_not_count_towards_limit(
-    client: AsyncClient,
+    client: AsyncClient, pg_session_factory
 ) -> None:
     """Non-owner memberships (admin, member) do not count toward the owned organization limit."""
     owner_user_id = uuid.uuid4()
     free_user_id = uuid.uuid4()
     owner_token = make_token(user_id=str(owner_user_id))
     free_token = make_token(user_id=str(free_user_id))
-    created_org_ids = []
+    created_org_ids: list[uuid.UUID] = []
 
     try:
         with patch("app.auth.dependencies.settings") as mock_settings:
@@ -196,7 +190,7 @@ async def test_free_user_non_owner_memberships_do_not_count_towards_limit(
             created_org_ids.append(org1_id)
 
             # 2. Add free_user as a regular member to Org 1
-            async with AsyncSessionLocal() as session:
+            async with pg_session_factory() as session:
                 session.add(
                     OrganizationMember(
                         organization_id=org1_id,
@@ -224,15 +218,13 @@ async def test_free_user_non_owner_memberships_do_not_count_towards_limit(
             assert r_free_2.status_code == 403
             assert "Free plan is limited to 1 organization" in r_free_2.json()["detail"]
     finally:
-        if created_org_ids:
-            async with AsyncSessionLocal() as session:
-                for oid in created_org_ids:
-                    await session.execute(delete(Organization).where(Organization.id == oid))
-                await session.commit()
+        await cleanup_test_organizations(pg_session_factory, created_org_ids)
 
 
 @pytest.mark.anyio
-async def test_frontend_payload_cannot_spoof_paid_plan(client: AsyncClient) -> None:
+async def test_frontend_payload_cannot_spoof_paid_plan(
+    client: AsyncClient, pg_session_factory
+) -> None:
     """Extra fields in the request body (e.g. plan='pro', is_paid=True) are ignored."""
     user_id = uuid.uuid4()
     token = make_token(user_id=str(user_id))
@@ -264,18 +256,17 @@ async def test_frontend_payload_cannot_spoof_paid_plan(client: AsyncClient) -> N
             assert r2.status_code == 403
             assert "Free plan is limited to 1 organization" in r2.json()["detail"]
     finally:
-        if org_id:
-            async with AsyncSessionLocal() as session:
-                await session.execute(delete(Organization).where(Organization.id == org_id))
-                await session.commit()
+        await cleanup_test_organizations(pg_session_factory, [org_id])
 
 
 @pytest.mark.anyio
-async def test_setup_organization_concurrency_race_condition(client: AsyncClient) -> None:
+async def test_setup_organization_concurrency_race_condition(
+    client: AsyncClient, pg_session_factory
+) -> None:
     """Tests that concurrent setup requests for the same user cannot create duplicate orgs."""
     user_id = uuid.uuid4()
     token = make_token(user_id=str(user_id))
-    created_org_ids = []
+    created_org_ids: list[uuid.UUID] = []
 
     try:
         with patch("app.auth.dependencies.settings") as mock_settings:
@@ -295,16 +286,16 @@ async def test_setup_organization_concurrency_race_condition(client: AsyncClient
                 run_setup("Concurrent Org B"),
             )
 
-        status_codes = [res1.status_code, res2.status_code]
-        assert 201 in status_codes, f"Expected at least one 201, got {status_codes}"
-        assert 403 in status_codes, f"Expected at least one 403, got {status_codes}"
-
         for r in (res1, res2):
             if r.status_code == 201:
                 created_org_ids.append(uuid.UUID(r.json()["id"]))
 
+        status_codes = [res1.status_code, res2.status_code]
+        assert 201 in status_codes, f"Expected at least one 201, got {status_codes}"
+        assert 403 in status_codes, f"Expected at least one 403, got {status_codes}"
+
         # Verify only 1 org owned in database
-        async with AsyncSessionLocal() as session:
+        async with pg_session_factory() as session:
             members = (
                 await session.scalars(
                     select(OrganizationMember).where(
@@ -315,15 +306,13 @@ async def test_setup_organization_concurrency_race_condition(client: AsyncClient
             ).all()
             assert len(members) == 1
     finally:
-        if created_org_ids:
-            async with AsyncSessionLocal() as session:
-                for oid in created_org_ids:
-                    await session.execute(delete(Organization).where(Organization.id == oid))
-                await session.commit()
+        await cleanup_test_organizations(pg_session_factory, created_org_ids)
 
 
 @pytest.mark.anyio
-async def test_organization_tenant_isolation(client: AsyncClient) -> None:
+async def test_organization_tenant_isolation(
+    client: AsyncClient, pg_session_factory
+) -> None:
     """Verifies that User B cannot list or get User A's organization."""
     user_a = uuid.uuid4()
     user_b = uuid.uuid4()
@@ -361,14 +350,13 @@ async def test_organization_tenant_isolation(client: AsyncClient) -> None:
             assert get_res.status_code == 404
             assert get_res.json()["detail"] == "Not found"
     finally:
-        if org_a_id:
-            async with AsyncSessionLocal() as session:
-                await session.execute(delete(Organization).where(Organization.id == org_a_id))
-                await session.commit()
+        await cleanup_test_organizations(pg_session_factory, [org_a_id])
 
 
 @pytest.mark.anyio
-async def test_update_organization_role_enforcement(client: AsyncClient) -> None:
+async def test_update_organization_role_enforcement(
+    client: AsyncClient, pg_session_factory
+) -> None:
     """Verifies role permissions: owner/admin can update, member gets 403, non-member gets 404."""
     owner_id = uuid.uuid4()
     member_id = uuid.uuid4()
@@ -395,7 +383,7 @@ async def test_update_organization_role_enforcement(client: AsyncClient) -> None
             org_id = uuid.UUID(res.json()["id"])
 
             # Add member_id as MemberRole.member
-            async with AsyncSessionLocal() as session:
+            async with pg_session_factory() as session:
                 session.add(
                     OrganizationMember(
                         organization_id=org_id,
@@ -432,7 +420,4 @@ async def test_update_organization_role_enforcement(client: AsyncClient) -> None
             assert owner_patch.status_code == 200
             assert owner_patch.json()["name"] == "Updated By Owner"
     finally:
-        if org_id:
-            async with AsyncSessionLocal() as session:
-                await session.execute(delete(Organization).where(Organization.id == org_id))
-                await session.commit()
+        await cleanup_test_organizations(pg_session_factory, [org_id])

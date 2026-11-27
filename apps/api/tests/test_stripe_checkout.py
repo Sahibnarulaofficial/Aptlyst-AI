@@ -133,7 +133,7 @@ class InMemoryCheckoutDbSession:
     def in_transaction(self) -> bool:
         return self._in_transaction
 
-    async def execute(self, stmt: Any) -> MockScalarResult:
+    async def execute(self, stmt: Any, params: Any = None) -> MockScalarResult:
         self._in_transaction = True
         stmt_str = str(stmt)
 
@@ -1505,11 +1505,11 @@ async def test_customer_resolution_occurs_before_org_lock():
 
     original_execute = db.execute
 
-    async def tracking_execute(stmt: Any) -> Any:
+    async def tracking_execute(stmt: Any, *args: Any, **kwargs: Any) -> Any:
         stmt_str = str(stmt)
         if "organizations" in stmt_str and "organizations.id" in stmt_str:
             call_order.append("org_lock")
-        return await original_execute(stmt)
+        return await original_execute(stmt, *args, **kwargs)
 
     db.execute = tracking_execute  # type: ignore[method-assign]
 
@@ -1875,13 +1875,13 @@ async def test_org_lock_reacquired_before_attempt_lock_after_retrieval():
     execution_log: list[str] = []
     original_execute = db.execute
 
-    async def logging_execute(stmt: Any) -> Any:
+    async def logging_execute(stmt: Any, *args: Any, **kwargs: Any) -> Any:
         stmt_str = str(stmt)
         if "organizations" in stmt_str and "organizations.id" in stmt_str and "FOR UPDATE" in stmt_str:
             execution_log.append("org_lock")
         elif "stripe_checkout_attempts" in stmt_str and "stripe_checkout_attempts.id =" in stmt_str and "FOR UPDATE" in stmt_str:
             execution_log.append("attempt_lock")
-        return await original_execute(stmt)
+        return await original_execute(stmt, *args, **kwargs)
 
     db.execute = logging_execute  # type: ignore[method-assign]
 

@@ -895,6 +895,12 @@ async def handle_razorpay_webhook(
 
     try:
         event_payload = parse_and_validate_razorpay_envelope(raw_body)
+    except RazorpayConfigurationError as exc:
+        logger.error("Razorpay webhook configuration error: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Razorpay webhook configuration unavailable",
+        )
     except (RazorpayWebhookPayloadMalformedError, RazorpayWebhookMerchantMismatchError) as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -929,6 +935,12 @@ async def handle_razorpay_webhook(
             payload=event_payload,
             merchant_account_id=merchant_account_id,
             environment=env,
+        )
+    except RazorpayConfigurationError as exc:
+        logger.error("Razorpay webhook configuration error during ingestion: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Razorpay webhook configuration unavailable",
         )
     except (RazorpayWebhookPersistenceError, IntegrityError):
         raise HTTPException(

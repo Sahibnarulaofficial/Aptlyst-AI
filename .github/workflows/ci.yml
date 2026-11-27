@@ -262,11 +262,188 @@ jobs:
           )
           PY
 
+      - name: Run PostgreSQL 16 Checkout Recovery Concurrency Integration Tests (16 scenarios)
+        working-directory: apps/api
+        env:
+          REQUIRE_POSTGRES_TESTS: "1"
+          DATABASE_URL: postgresql+asyncpg://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
+          POSTGRES_TEST_URL: postgresql+psycopg2://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
+        run: |
+          rm -f test-results-postgres-recovery.xml
+          python -m pytest -v tests/test_razorpay_checkout_recovery_pg16_concurrency.py --junitxml=test-results-postgres-recovery.xml
+
+      - name: Enforce zero skipped tests in PostgreSQL recovery concurrency JUnit report
+        working-directory: apps/api
+        run: |
+          python - <<'PY'
+          from tests.postgres_test_guard import assert_junit_zero_skips
+
+          tests, skipped, failures, errors = assert_junit_zero_skips(
+              "test-results-postgres-recovery.xml",
+              expected_exact_tests=16,
+              max_age_seconds=1800,
+              require_testcase_elements=True,
+          )
+          print(
+              f"Verified PostgreSQL Recovery Concurrency JUnit gate: tests={tests}, skipped={skipped}, "
+              f"failures={failures}, errors={errors}"
+          )
+          PY
+
+      - name: Run PostgreSQL 16 Multi-Process Checkout Recovery Integration Tests (11 scenarios)
+        working-directory: apps/api
+        env:
+          REQUIRE_POSTGRES_TESTS: "1"
+          DATABASE_URL: postgresql+asyncpg://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
+          POSTGRES_TEST_URL: postgresql+psycopg2://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
+        run: |
+          rm -f test-results-postgres-multiprocess.xml
+          python -m pytest -v tests/test_razorpay_checkout_recovery_multiprocess_stage2g.py --junitxml=test-results-postgres-multiprocess.xml
+
+      - name: Enforce zero skipped tests in PostgreSQL multi-process recovery JUnit report
+        working-directory: apps/api
+        run: |
+          python - <<'PY'
+          from tests.postgres_test_guard import assert_junit_zero_skips
+
+          tests, skipped, failures, errors = assert_junit_zero_skips(
+              "test-results-postgres-multiprocess.xml",
+              expected_exact_tests=11,
+              max_age_seconds=1800,
+              require_testcase_elements=True,
+          )
+          print(
+              f"Verified PostgreSQL Multi-Process Recovery JUnit gate: tests={tests}, skipped={skipped}, "
+              f"failures={failures}, errors={errors}"
+          )
+          PY
+
+      - name: Run PostgreSQL 16 Stage 2J Heartbeat, Monitoring & Migration Tests (4 scenarios)
+        working-directory: apps/api
+        env:
+          REQUIRE_POSTGRES_TESTS: "1"
+          DATABASE_URL: postgresql+asyncpg://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
+          POSTGRES_TEST_URL: postgresql+psycopg2://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
+        run: |
+          rm -f test-results-postgres-stage2j.xml
+          python -m pytest -v tests/test_postgres_heartbeat_monitoring_stage2j.py --junitxml=test-results-postgres-stage2j.xml
+
+      - name: Enforce zero skipped tests in PostgreSQL Stage 2J JUnit report
+        working-directory: apps/api
+        run: |
+          python - <<'PY'
+          from tests.postgres_test_guard import assert_junit_zero_skips
+
+          tests, skipped, failures, errors = assert_junit_zero_skips(
+              "test-results-postgres-stage2j.xml",
+              expected_exact_tests=4,
+              max_age_seconds=1800,
+              require_testcase_elements=True,
+          )
+          print(
+              f"Verified PostgreSQL Stage 2J JUnit gate: tests={tests}, skipped={skipped}, "
+              f"failures={failures}, errors={errors}"
+          )
+          PY
+
+      - name: Run PostgreSQL 16 Stage 2K-B Operator Reconciliation Tests (3 scenarios)
+        working-directory: apps/api
+        env:
+          REQUIRE_POSTGRES_TESTS: "1"
+          DATABASE_URL: postgresql+asyncpg://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
+          POSTGRES_TEST_URL: postgresql+psycopg2://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
+        run: |
+          rm -f test-results-postgres-stage2kb.xml
+          python -m pytest -v tests/test_postgres_reconciliation_ops_stage2kb.py --junitxml=test-results-postgres-stage2kb.xml
+
+      - name: Enforce zero skipped tests in PostgreSQL Stage 2K-B JUnit report
+        working-directory: apps/api
+        run: |
+          python - <<'PY'
+          from tests.postgres_test_guard import assert_junit_zero_skips
+
+          tests, skipped, failures, errors = assert_junit_zero_skips(
+              "test-results-postgres-stage2kb.xml",
+              expected_exact_tests=3,
+              max_age_seconds=1800,
+              require_testcase_elements=True,
+          )
+          print(
+              f"Verified PostgreSQL Stage 2K-B JUnit gate: tests={tests}, skipped={skipped}, "
+              f"failures={failures}, errors={errors}"
+          )
+          PY
+
+      - name: Run PostgreSQL 16 Stage 2K-C Heartbeat Hardening & Retention Tests (3 scenarios)
+        working-directory: apps/api
+        env:
+          REQUIRE_POSTGRES_TESTS: "1"
+          DATABASE_URL: postgresql+asyncpg://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
+          POSTGRES_TEST_URL: postgresql+psycopg2://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
+        run: |
+          rm -f test-results-postgres-stage2kc.xml
+          python -m pytest -v tests/test_postgres_alerting_retention_stage2kc.py --junitxml=test-results-postgres-stage2kc.xml
+
+      - name: Enforce zero skipped tests in PostgreSQL Stage 2K-C JUnit report
+        working-directory: apps/api
+        run: |
+          python - <<'PY'
+          from tests.postgres_test_guard import assert_junit_zero_skips
+
+          tests, skipped, failures, errors = assert_junit_zero_skips(
+              "test-results-postgres-stage2kc.xml",
+              expected_exact_tests=3,
+              max_age_seconds=1800,
+              require_testcase_elements=True,
+          )
+          print(
+              f"Verified PostgreSQL Stage 2K-C JUnit gate: tests={tests}, skipped={skipped}, "
+              f"failures={failures}, errors={errors}"
+          )
+          PY
+
+      - name: Run PostgreSQL 16 Stage 2K-D2 API Integration Tests (21 scenarios)
+        working-directory: apps/api
+        env:
+          REQUIRE_POSTGRES_TESTS: "1"
+          DATABASE_URL: postgresql+asyncpg://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
+          POSTGRES_TEST_URL: postgresql+psycopg2://aptlyst_ci_user:aptlyst_ci_password_secure@127.0.0.1:5432/aptlyst_ci_test
+          SECRET_KEY: ci-test-secret-key-at-least-32-characters-long
+          VISITOR_TOKEN_SECRET: ci-test-visitor-secret-key-at-least-32-chars
+        run: |
+          rm -f test-results-postgres-stage2kd2.xml
+          python -m pytest -v -m pg_api_integration \
+            tests/test_organizations.py \
+            tests/test_chatbots.py \
+            tests/test_conversations.py \
+            tests/test_public_chatbots.py \
+            --junitxml=test-results-postgres-stage2kd2.xml
+
+      - name: Enforce zero skipped tests in PostgreSQL Stage 2K-D2 JUnit report
+        working-directory: apps/api
+        run: |
+          python - <<'PY'
+          from tests.postgres_test_guard import assert_junit_zero_skips
+
+          tests, skipped, failures, errors = assert_junit_zero_skips(
+              "test-results-postgres-stage2kd2.xml",
+              expected_exact_tests=21,
+              max_age_seconds=1800,
+              require_testcase_elements=True,
+          )
+          print(
+              f"Verified PostgreSQL Stage 2K-D2 JUnit gate: tests={tests}, skipped={skipped}, "
+              f"failures={failures}, errors={errors}"
+          )
+          PY
+
       - name: Run Focused Migration, Guard, Billing, and Model Regression Tests
         working-directory: apps/api
         run: |
           rm -f test-results-models.xml
+          python -m pytest -v tests/test_advisory_lock.py
           python -m pytest -v \
+            tests/test_health.py \
             tests/test_postgres_test_guard.py \
             tests/test_payment_association_migration.py \
             tests/test_provider_neutral_billing_models.py \
@@ -274,7 +451,56 @@ jobs:
             tests/test_razorpay_customer.py \
             tests/test_razorpay_checkout.py \
             tests/test_billing_api.py \
+            tests/test_billing_webhook_errors.py \
+            tests/test_billing_rollover.py \
+            tests/test_accounting.py \
+            tests/test_accounting_subscription_auth.py \
+            tests/test_ai_generation.py \
+            tests/test_auth.py \
+            tests/test_infrastructure.py \
+            tests/test_orchestrator.py \
+            tests/test_phase2a_models.py \
+            tests/test_pricing.py \
+            tests/test_public_chat_orchestration.py \
+            tests/test_rate_limits.py \
+            tests/test_razorpay_agreement_handlers.py \
+            tests/test_razorpay_checkout_exclusivity_stage2a.py \
+            tests/test_razorpay_client.py \
+            tests/test_razorpay_handler_foundation.py \
+            tests/test_razorpay_webhook_exceptions.py \
+            tests/test_razorpay_webhook_ingestion.py \
+            tests/test_razorpay_webhook_reconciliation_stage2b.py \
+            tests/test_stage2j_config_lifecycle_monitoring.py \
+            tests/test_stage2kb_reconciliation_ops.py \
+            tests/test_stage2kc_alerting_health_hardening.py \
+            tests/test_staging_migration_gate.py \
+            tests/test_razorpay_config.py \
+            tests/test_stripe_config.py \
+            tests/test_razorpay_production_isolation.py \
+            tests/test_razorpay_single_merchant_isolation_stage2f.py \
+            tests/test_razorpay_webhook_worker.py \
+            tests/test_razorpay_checkout_recovery_worker_stage2d.py \
+            tests/test_checkout_recovery_schema_stage2c.py \
+            tests/test_phase2b_stage1_models.py \
             --junitxml=test-results-models.xml
+
+      - name: Enforce zero skipped tests in focused regression JUnit report
+        working-directory: apps/api
+        run: |
+          python - <<'PY'
+          from tests.postgres_test_guard import assert_junit_zero_skips
+
+          tests, skipped, failures, errors = assert_junit_zero_skips(
+              "test-results-models.xml",
+              expected_exact_tests=1198,
+              max_age_seconds=1800,
+              require_testcase_elements=True,
+          )
+          print(
+              f"Verified Focused Regression JUnit gate: tests={tests}, skipped={skipped}, "
+              f"failures={failures}, errors={errors}"
+          )
+          PY
 
       - name: Preserve Test Results Artifacts
         if: always()
@@ -285,4 +511,10 @@ jobs:
             apps/api/test-results-postgres.xml
             apps/api/test-results-postgres-customer.xml
             apps/api/test-results-postgres-webhook.xml
+            apps/api/test-results-postgres-recovery.xml
+            apps/api/test-results-postgres-multiprocess.xml
+            apps/api/test-results-postgres-stage2j.xml
+            apps/api/test-results-postgres-stage2kb.xml
+            apps/api/test-results-postgres-stage2kc.xml
+            apps/api/test-results-postgres-stage2kd2.xml
             apps/api/test-results-models.xml

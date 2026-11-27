@@ -36,10 +36,26 @@ _API_ROOT = os.path.abspath(os.path.join(_CURRENT_DIR, "..", ".."))
 if _API_ROOT not in sys.path:
     sys.path.insert(0, _API_ROOT)
 
-from sqlalchemy.ext.asyncio import AsyncSession
+_HAD_PROCESS_ROLE_ENV = "APTLYST_PROCESS_ROLE" in os.environ
+if not _HAD_PROCESS_ROLE_ENV and "app.config" not in sys.modules:
+    os.environ["APTLYST_PROCESS_ROLE"] = "webhook_worker"
 
+try:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from app.config import (
+        ALLOWED_RAZORPAY_ENVIRONMENTS,
+        settings,
+        validate_deployment_environment,
+    )
+finally:
+    if not _HAD_PROCESS_ROLE_ENV:
+        os.environ.pop("APTLYST_PROCESS_ROLE", None)
 from app.db.session import AsyncSessionLocal
+from app.models import register_all_models
 from app.models.subscription import WebhookProcessingStatus
+
+register_all_models()
 from app.services.billing.razorpay.webhook_engine import (
     DEFAULT_LEASE_DURATION_SECONDS,
     MAX_WEBHOOK_ATTEMPTS,
@@ -54,6 +70,11 @@ from app.services.billing.razorpay.webhook_engine import (
     default_razorpay_dispatcher,
     execute_claimed_razorpay_webhook_event,
     record_razorpay_webhook_outcome,
+)
+from app.services.billing.razorpay.monitoring import (
+    WORKER_TYPE_WEBHOOK,
+    WorkerHeartbeatTracker,
+    cleanup_stale_worker_heartbeats,
 )
 from app.services.billing.webhook_errors import sanitize_billing_error_message
 
@@ -95,7 +116,14 @@ class RazorpayWebhookWorker:
         """
         self.session_factory = session_factory or AsyncSessionLocal
         self.dispatcher = dispatcher or default_razorpay_dispatcher
-        self.worker_id = worker_id or f"worker_rzp_{uuid.uuid4().hex[:12]}"
+        env_worker_id = (
+            os.getenv("RAZORPAY_WEBHOOK_WORKER_ID") or os.getenv("APTLYST_WORKER_ID") or ""
+        ).strip()
+        self.worker_id = (
+            worker_id.strip()
+            if isinstance(worker_id, str) and worker_id.strip()
+            else (env_worker_id or f"worker_rzp_{uuid.uuid4().hex[:12]}")
+        )
         self.lease_duration = (
             lease_duration if lease_duration is not None else DEFAULT_LEASE_DURATION_SECONDS
         )
@@ -117,7 +145,30 @@ class RazorpayWebhookWorker:
         self.max_attempts = (
             max_attempts if max_attempts is not None else MAX_WEBHOOK_ATTEMPTS
         )
-        self.environment = environment
+        _, is_prod = validate_deployment_environment(getattr(settings, "environment", None))
+        settings.validate_webhook_worker_configuration()
+        if environment is not None:
+            clean_env = environment.strip().lower() if isinstance(environment, str) else ""
+            if clean_env not in ALLOWED_RAZORPAY_ENVIRONMENTS:
+                raise ValueError(
+                    f"Invalid Razorpay worker environment '{environment}'. Must be 'test' or 'live'."
+                )
+            if is_prod and clean_env != "live":
+                raise ValueError(
+                    "Production RazorpayWebhookWorker strictly requires environment='live'; "
+                    "'test' is prohibited."
+                )
+            self.environment: str | None = clean_env
+        elif is_prod:
+            cfg_env = (getattr(settings, "razorpay_environment", None) or "").strip().lower()
+            if cfg_env != "live":
+                raise ValueError(
+                    "Production RazorpayWebhookWorker strictly requires RAZORPAY_ENVIRONMENT='live'; "
+                    f"got '{getattr(settings, 'razorpay_environment', None)}'."
+                )
+            self.environment = "live"
+        else:
+            self.environment = None
         self.clock = clock
         self.merchant_account_id = (
             merchant_account_id if merchant_account_id is not None else env_merchant
@@ -132,6 +183,13 @@ class RazorpayWebhookWorker:
 
         self._stop_event = asyncio.Event()
         self._signal_handlers_registered = False
+        self.heartbeat_tracker = WorkerHeartbeatTracker(
+            worker_id=self.worker_id,
+            worker_type=WORKER_TYPE_WEBHOOK,
+            deployment_environment=str(getattr(settings, "environment", "development")).strip().lower(),
+            environment=self.environment,
+            merchant_account_id=self.merchant_account_id,
+        )
 
     def _get_now(self) -> datetime:
         """Get current UTC timestamp, using clock callable if configured."""
@@ -220,7 +278,7 @@ class RazorpayWebhookWorker:
         results: list[ProcessResult] = []
 
         for _ in range(limit):
-            if self._stop_event.is_set():
+            if self._stop_event.is_set() or self.heartbeat_tracker.ownership_lost:
                 break
 
             result = await self.process_one()
@@ -237,8 +295,33 @@ class RazorpayWebhookWorker:
         Returns:
             Number of events processed.
         """
-        results = await self.run_batch()
-        return len(results)
+        await self.heartbeat_tracker.record_heartbeat(
+            self.session_factory,
+            status="running",
+            now=self._get_now(),
+            force=True,
+        )
+        try:
+            results = await self.run_batch()
+            await self.heartbeat_tracker.record_heartbeat(
+                self.session_factory,
+                status="stopped",
+                now=self._get_now(),
+                force=True,
+                processed_delta=len(results),
+            )
+            return len(results)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self.heartbeat_tracker.record_heartbeat(
+                self.session_factory,
+                status="error",
+                now=self._get_now(),
+                force=True,
+                error_message=str(exc),
+            )
+            raise
 
     async def run_forever(self) -> None:
         """Continuously poll and process events until stop() is invoked."""
@@ -254,10 +337,50 @@ class RazorpayWebhookWorker:
             self.lease_duration,
             self.max_attempts,
         )
+        cancelled = False
+        await self.heartbeat_tracker.record_heartbeat(
+            self.session_factory,
+            status="running",
+            now=self._get_now(),
+            force=True,
+        )
+        if not self.heartbeat_tracker.ownership_lost and self.session_factory is not None:
+            try:
+                async def _cleanup() -> None:
+                    async with self.session_factory() as cleanup_db:  # type: ignore[misc]
+                        await cleanup_stale_worker_heartbeats(
+                            cleanup_db,
+                            now=self._get_now(),
+                            exclude_worker_id=self.worker_id,
+                        )
+
+                await asyncio.wait_for(_cleanup(), timeout=3.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(
+                    "Non-fatal heartbeat cleanup error for worker %s: %s",
+                    self.worker_id,
+                    sanitize_billing_error_message(str(exc)),
+                )
+
         try:
-            while not self._stop_event.is_set():
+            while not self._stop_event.is_set() and not self.heartbeat_tracker.ownership_lost:
                 try:
                     results = await self.run_batch()
+                    await self.heartbeat_tracker.record_heartbeat(
+                        self.session_factory,
+                        status="running",
+                        now=self._get_now(),
+                        processed_delta=len(results),
+                    )
+                    if self.heartbeat_tracker.ownership_lost:
+                        logger.error(
+                            "Worker %s lost heartbeat ownership; halting claim loop safely.",
+                            self.worker_id,
+                        )
+                        self._stop_event.set()
+                        break
                     if results:
                         # If full batch was processed, immediately poll again without delay
                         if len(results) >= self.batch_size:
@@ -271,12 +394,27 @@ class RazorpayWebhookWorker:
                         except asyncio.TimeoutError:
                             pass
                 except asyncio.CancelledError:
+                    cancelled = True
                     raise
                 except Exception as exc:
                     logger.error(
                         "Error in RazorpayWebhookWorker polling loop: %s",
                         sanitize_billing_error_message(str(exc)),
                     )
+                    await self.heartbeat_tracker.record_heartbeat(
+                        self.session_factory,
+                        status="error",
+                        now=self._get_now(),
+                        force=True,
+                        error_message=str(exc),
+                    )
+                    if self.heartbeat_tracker.ownership_lost:
+                        logger.error(
+                            "Worker %s lost heartbeat ownership during error recovery; halting claim loop safely.",
+                            self.worker_id,
+                        )
+                        self._stop_event.set()
+                        break
                     try:
                         await asyncio.wait_for(
                             self._stop_event.wait(), timeout=min(5.0, self.poll_interval)
@@ -284,9 +422,17 @@ class RazorpayWebhookWorker:
                     except asyncio.TimeoutError:
                         pass
         except asyncio.CancelledError:
+            cancelled = True
             logger.info("RazorpayWebhookWorker %s cancelled during execution.", self.worker_id)
             raise
         finally:
+            if not cancelled and not self.heartbeat_tracker.ownership_lost:
+                await self.heartbeat_tracker.record_heartbeat(
+                    self.session_factory,
+                    status="stopped",
+                    now=self._get_now(),
+                    force=True,
+                )
             logger.info("RazorpayWebhookWorker %s stopped cleanly.", self.worker_id)
 
     def stop(self) -> None:
@@ -398,7 +544,7 @@ async def run_worker(
             try:
                 from app.db.session import engine
 
-                await engine.dispose()
+                await asyncio.wait_for(engine.dispose(), timeout=5.0)
                 logger.debug("Disposed default database engine successfully.")
             except Exception as exc:
                 logger.debug("Error disposing database engine: %s", exc)

@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan managing startup validation and resource cleanup."""
+    settings.validate_api_configuration()
     validate_rate_limiter_configuration()
     if settings.default_free_monthly_token_quota <= 0:
         logger.warning(
@@ -68,10 +69,7 @@ async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) 
 # Internal dashboard CORS: restricted to authorized frontend origins with credentials.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=settings.parsed_cors_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

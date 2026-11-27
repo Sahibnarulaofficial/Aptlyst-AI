@@ -147,6 +147,34 @@ class RazorpayAgreementMockDbSession:
         self.rollbacks: int = 0
         self.flushes: int = 0
         self.advisory_locks: list[int] = []
+        self.statement_log: list[tuple[str, Any]] = []
+
+    @staticmethod
+    def _matches_where(record: Any, stmt: Any) -> bool:
+        """Minimally evaluate SQLAlchemy equality, inequality, and IN WHERE predicates on mock rows."""
+        criteria = getattr(stmt, "_where_criteria", None)
+        if not criteria:
+            return True
+        for crit in criteria:
+            left = getattr(crit, "left", None)
+            right = getattr(crit, "right", None)
+            op = getattr(crit, "operator", None)
+            col_name = getattr(left, "name", None) or getattr(left, "key", None)
+            if not col_name or not hasattr(record, col_name):
+                continue
+            actual = getattr(record, col_name)
+            expected = getattr(right, "value", None)
+            op_name = getattr(op, "__name__", str(op))
+            if op_name in ("eq", "__eq__"):
+                if actual != expected:
+                    return False
+            elif op_name in ("ne", "__ne__"):
+                if actual == expected:
+                    return False
+            elif op_name == "in_op":
+                if expected is not None and actual not in expected:
+                    return False
+        return True
 
     async def __aenter__(self) -> "RazorpayAgreementMockDbSession":
         return self
@@ -190,35 +218,46 @@ class RazorpayAgreementMockDbSession:
             key = params.get("key") if params else None
             if key is not None:
                 self.advisory_locks.append(key)
+                self.statement_log.append(("advisory_lock", key))
             return MockScalarResult(None)
 
         if "pg_try_advisory_xact_lock" in stmt_str:
             key = params.get("key") if params else None
             if key is not None:
                 self.advisory_locks.append(key)
+                self.statement_log.append(("try_advisory_lock", key))
             return MockScalarResult(True)
+
+        is_for_update = "FOR UPDATE" in stmt_str.upper()
 
         # 2. BillingCustomerProvision Lookups
         if "billing_customer_provisions" in stmt_str:
+            self.statement_log.append(("select_customer_provision", is_for_update))
             for prov in self.customer_provisions.values():
-                return MockScalarResult(prov.organization_id)
+                if self._matches_where(prov, stmt):
+                    return MockScalarResult(prov.organization_id)
             return MockScalarResult(None)
 
         # 3. Subscription Lookups
         if "subscriptions" in stmt_str:
+            self.statement_log.append(("select_subscription_for_update" if is_for_update else "select_subscription", is_for_update))
+            matched_subs = [
+                sub for sub in self.subscriptions.values() if self._matches_where(sub, stmt)
+            ]
             # Full subscription model lookup (includes subscriptions.id)
             if "subscriptions.id" in stmt_str:
-                for sub in self.subscriptions.values():
-                    return MockScalarResult(sub)
-                return MockScalarResult(None)
+                return MockScalarResult(matched_subs)
             # Querying organization_id specifically (tenant resolution)
-            for sub in self.subscriptions.values():
-                return MockScalarResult(sub.organization_id)
+            if matched_subs:
+                return MockScalarResult(matched_subs[0].organization_id)
             return MockScalarResult(None)
 
         # 4. BillingCheckoutAttempt Lookups
         if "billing_checkout_attempts" in stmt_str:
-            matched_attempts = list(self.checkout_attempts.values())
+            self.statement_log.append(("select_checkout_attempt_for_update" if is_for_update else "select_checkout_attempt", is_for_update))
+            matched_attempts = [
+                att for att in self.checkout_attempts.values() if self._matches_where(att, stmt)
+            ]
             return MockScalarResult(matched_attempts)
 
         # 5. PaymentReconciliation Lookups & Upsert Statements
