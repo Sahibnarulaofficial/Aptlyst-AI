@@ -4,14 +4,16 @@
 
 ---
 
-## 1. Product Capabilities
+## 1. Product Capabilities & Implementation Boundary
 
-- **Custom AI Chatbots**: Configure custom prompt instructions, temperature, themes, brand avatars, and conversational guardrails.
-- **RAG Knowledge Base**: Upload and index documents (PDFs, Markdown, raw text) for accurate, grounded similarity search and conversational retrieval.
-- **Embeddable Chat Widget**: Lightweight, isolated embeddable widget (`/embed`) with real-time Server-Sent Events (SSE) token streaming for external customer websites.
-- **Lead Capture & Analytics**: Collect visitor contact information dynamically during chat sessions and view conversation trends.
-- **Multi-Tenant Organizations**: Team membership roles (`owner`, `admin`, `member`), organization switching, and scoped data isolation powered by Supabase Auth SSR.
-- **Provider-Neutral Billing Engine**: Decoupled entitlement architecture supporting Razorpay Subscriptions (domestic INR e-mandates) and historical Stripe records.
+- **Implemented Core Foundation**:
+  - **Custom AI Chatbots**: Authenticated chatbot CRUD, system prompt configuration, temperature settings, and dashboard shell.
+  - **Visitor Conversation API & Widget Preview**: Unauthenticated `/embed/[id]` branding/welcome preview and `/api/v1/public/chatbots/*` conversation/message APIs with signed visitor sessions, rate limiting, token reservation, and Phase 1 `LLM_PROVIDER` (`disabled` or `mock`).
+  - **Multi-Tenant Organizations**: Team membership roles (`owner`, `admin`, `member`), organization switching, and tenant isolation backed by Supabase Auth SSR.
+  - **Billing Infrastructure Foundation (Frozen in Stage 2L)**: Provider-neutral billing models, webhook queue & recovery workers, advisory locking, and health tooling merged through `6872f47` (kept disabled via `RAZORPAY_ENABLED=false` during chatbot product development).
+- **Planned / Next Chatbot Product Work**:
+  - **RAG Knowledge Base (`/knowledge`)**, **Live LLM Providers & SSE Widget Streaming (`/embed/[id]`)**, and **Conversations / Leads / Analytics / Integrations / Settings UIs** (currently placeholder routes).
+  - **Final Razorpay Settlement & Billing UI Cutover**: `subscription.charged`/`payment.captured`/`payment.failed`, Pro quota rollover, `BLK-04` sweeper, and frontend cutover from legacy Stripe routes remain deferred until after chatbot product development.
 
 ---
 
@@ -60,8 +62,8 @@ For detailed architecture specifications, consult:
 ```text
 Aptlyst-AI/
 ├── README.md                      # This project overview
-├── AGENTS.md                      # Next.js agent instruction block
-├── CLAUDE.md                      # Agent tool instructions
+├── AGENTS.md                      # Repository engineering contract
+├── GEMINI.md                      # Agent execution rules
 ├── PROJECT_STATUS.md              # Live status dashboard & active gates
 ├── TECHNICAL_DECISIONS.md         # Index of formal Architecture Decision Records
 ├── BILLING_ROADMAP.md             # Authoritative billing implementation tracker
@@ -77,15 +79,17 @@ Aptlyst-AI/
 │       │   ├── api/               # API endpoint routers
 │       │   ├── models/            # SQLAlchemy declarative models
 │       │   ├── services/          # Core business services
-│       │   └── workers/           # Asynchronous queue workers
-│       ├── alembic/               # Database migration scripts
-│       └── tests/                 # Pytest unit & integration test suites
+│       │   └── workers/           # Webhook, recovery, health & reconciliation workers
+│       ├── alembic/               # Database migration scripts (head: a4b5c6d7e8f3)
+│       └── tests/                 # Pytest unit & PostgreSQL 16 integration suites
 │
 └── docs/                          # Comprehensive Documentation
     ├── architecture/              # Canonical living architecture specs
     ├── development/               # Setup, testing, and workflow guides
-    ├── decisions/                 # Formal Architecture Decision Records (ADR-001 - 005)
+    ├── decisions/                 # Formal Architecture Decision Records (ADR-001 – ADR-006)
+    ├── operations/                # Stage 2L Billing Handoff/Freeze & Render Deployment Guide
     ├── audits/                    # Documentation audit deliverables
+    ├── reports/                   # Stage implementation & CI validation reports
     └── archive/                   # Immutable audit trail of historical reports
 ```
 
@@ -139,30 +143,30 @@ Dashboard available at `http://localhost:3000`.
 
 ## 6. Testing
 
-### Run Backend Unit Tests:
+### Run Offline Backend Tests (No PostgreSQL Required):
 ```bash
 cd apps/api
-pytest -q
+pytest -m "not pg_api_integration" -q
 ```
-*Current test metrics: 634 passed, 0 failed.*
 
-### Run PostgreSQL CI Integration Tests:
+### Run PostgreSQL API Integration Tests (`21` tests; full `106`-test suite via CI):
 ```bash
 cd apps/api
-# Requires POSTGRES_TEST_URL pointing to a running PostgreSQL 16 instance
-pytest tests/test_postgres_provenance_integration.py
+# Requires REQUIRE_POSTGRES_TESTS=1 and a dedicated test POSTGRES_TEST_URL.
+# Note: `-m pg_api_integration` selects only the 21 API integration tests, NOT all 106 PG tests.
+REQUIRE_POSTGRES_TESTS=1 pytest -m pg_api_integration
 ```
+*Full 106-test PostgreSQL 16 suite (9 CI modules) is orchestrated by [`.github/workflows/ci.yml`](.github/workflows/ci.yml). Post-merge CI baseline on `main` (`6872f47`, [Run `46048131091`](https://github.com/Sahibnarulaofficial/Aptlyst-AI/actions/runs/46048131091)): `1,322` passed (`106` PostgreSQL 16 integration + `18` advisory-lock + `1,198` regression), `0` skipped, `0` failed.*
 
 ### Run Frontend Tests:
 ```bash
 npm test
 ```
-*Current test metrics: 4 passed, 0 failed.*
 
 ---
 
 ## 7. Current Project Status
 
-- **Active Milestone**: **Phase 5.2D — Step 5.2D.3.3A.2 (PostgreSQL CI Validation)**.
-- **Status Summary**: Core chatbot, RAG, multi-tenancy, and frontend dashboards are fully implemented. The provider-neutral billing database schema and provenance migration (`e2f3a4b5c6d1`) are authored and awaiting live PostgreSQL service container execution in GitHub Actions before Step 5.2D.3.3B (Razorpay payment settlement handlers) begins.
-- For complete details, see [`PROJECT_STATUS.md`](PROJECT_STATUS.md) and [`BILLING_ROADMAP.md`](BILLING_ROADMAP.md).
+- **Active Phase**: **Stage 2L — Billing Handoff & Freeze (Chatbot Product Development Active)** (`main` @ [`6872f47`](https://github.com/Sahibnarulaofficial/Aptlyst-AI/commit/6872f471df201faeeae62decfb76552cdc28d084)).
+- **Status Summary**: Stage 1–2K billing infrastructure (provider-neutral schema through `a4b5c6d7e8f3`, checkout recovery worker, advisory lock unification, heartbeats/monitoring, and PostgreSQL 16 CI isolation) is merged and green in CI. Paid Razorpay billing (`RAZORPAY_ENABLED=false`) is **frozen and NOT production-ready**; engineering focus is now on Chatbot Product Development (RAG, live LLM/SSE streaming, dashboard UI modules) before the Final Razorpay Integration & Cutover Phase.
+- For complete details, see [`docs/operations/BILLING_HANDOFF_AND_FREEZE.md`](docs/operations/BILLING_HANDOFF_AND_FREEZE.md), [`PROJECT_STATUS.md`](PROJECT_STATUS.md), and [`BILLING_ROADMAP.md`](BILLING_ROADMAP.md).

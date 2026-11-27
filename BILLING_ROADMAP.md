@@ -9,8 +9,8 @@ This document outlines the authoritative sequence, architectural milestones, and
 Aptlyst AI is transitioning its primary subscription billing provider from **Stripe** to **Razorpay Subscriptions**, anchored by a robust **provider-neutral foundation**:
 
 ```text
-[Phase 5.1: Stripe Legacy] ──▶ [Phase 5.2A-C: Provider-Neutral Foundation] ──▶ [Phase 5.2D: Agreement Handlers & D-04A] ──▶ [Phase D-2 Stage 2: Settlement & Sweeper]
-(Historical Audit Records)     (Neutral Tables, Webhooks, Leased Worker)      (Closed via PR #2 Merge: 6d11ec5)            (Active: BLK-03/08 Resolved; BLK-04..07 Pending)
+[Phase 5.1: Stripe Legacy] ──▶ [Phase 5.2A-D / D-04A] ──▶ [Stage 2J–2K: Recovery, Ops & CI] ──▶ [Stage 2L: Billing Freeze] ──▶ [Final Razorpay Cutover]
+(Historical Audit Records)     (Neutral Foundation)       (Merged via PR #3: 6872f47)            (Active: Chatbot Dev)         (Settlement, BLK-04, UI, Live)
 ```
 
 ---
@@ -49,50 +49,47 @@ Aptlyst AI is transitioning its primary subscription billing provider from **Str
 
 ---
 
-## 3. Milestone D-2 Stage 2: Razorpay Settlement & Concurrency Unification (Active)
+## 3. Stages 2J – 2K Completion & Stage 2L Billing Freeze
 
-We are currently executing **D-2 Stage 2: Preparatory Phase (TASK-D2-S2-PREP-01)**.
+**Stage 2K Billing Infrastructure (`PR #3` / `6872f471df201faeeae62decfb76552cdc28d084`) is merged into `main` and CI-verified on PostgreSQL 16 (Run `46048131091`: `1,322` passed, `0` skipped, `0` failed, `0` errors).**
+Platform work is now in **Stage 2L: Billing Handoff & Freeze** ([`docs/operations/BILLING_HANDOFF_AND_FREEZE.md`](docs/operations/BILLING_HANDOFF_AND_FREEZE.md)). Paid Razorpay billing remains **NOT production-ready** until the Final Razorpay Integration & Cutover Phase completes.
 
-> [!IMPORTANT]
-> **Completion Status**: **IN PROGRESS — NOT COMPLETE**.
-> TASK-D2-S2-PREP-01 resolves blockers BLK-03 and BLK-08 only. Implementation of settlement handlers, sweeper background tasks, and schema modifications remains gated until remaining blockers BLK-04 through BLK-07 are formally cleared.
+### 3.1 Completed Since D-04A (Merged on `main` @ `6872f47`)
+- **Stage 2J (Recovery Worker & Migration `f3a4b5c6d7e2`):** Leased `razorpay_checkout_recovery_worker.py`, UUID `recovery_claim_id` fencing, bounded retry backoff, and `(organization_id, environment)` active attempt exclusivity per ADR-006 Option A.
+- **Stage 2K-B & 2K-C (Unification, Heartbeats & Ops Hardening):** Canonical `advisory_lock.py`, migration `a4b5c6d7e8f3` (`billing_worker_heartbeats`), ownership-loss fencing, `billing_health.py` inspection/alerting CLI, `billing_reconciliation.py`, redacted `GET /health/db`, staging gate (`scripts/check_staging_migration_gate.py`), and [`docs/operations/RENDER_DEPLOYMENT_GUIDE.md`](docs/operations/RENDER_DEPLOYMENT_GUIDE.md).
+- **Stage 2K-D1 / D2 / D3 (PostgreSQL 16 & Offline Test Isolation):** Dedicated `postgres_api_test_helper.py`, fail-closed `REQUIRE_POSTGRES_TESTS=1` guard, `pg_api_integration` marker separation, async `get_db` fixture restoration in `test_ai_generation.py`, and dedicated PostgreSQL 16 CI job (`106` PG16 integration + `18` advisory-lock + `1,198` regression = `1,322` passed).
 
-### 3.1 Stage 2 Blocker Matrix
+### 3.2 Deferred Scope & Blocker Matrix (Final Razorpay Cutover Phase)
 
-| Blocker ID | Domain | Scope & Objective | Resolution Status |
+| Blocker / Gate ID | Domain | Scope & Objective | Status (Stage 2L) |
 | :--- | :--- | :--- | :---: |
-| **BLK-03** | Concurrency / Locks | Advisory lock primitive unification (`advisory_lock.py`, facade in `razorpay/lock.py`, transitional dual-lock in `organizations.py`, strictly ascending multi-entity sort order) | **RESOLVED** (PREP-01) |
-| **BLK-08** | Documentation | Canonical roadmap and ADR-005 synchronization reflecting D-04A closure and D-2 Stage 2 status | **RESOLVED** (PREP-01) |
-| **BLK-04** | Data Integrity | Payment binding sweeper schema & query design for timed-out attempts | **PENDING** |
-| **BLK-05** | State Machine | Checkout exclusivity, recovery lifecycle & settlement state machine policy | **DESIGN FINALIZED (ADR-006 Option A Authorized)** — *Implementation Pending* |
-| **BLK-06** | Resilience | Reconciliation quarantine & out-of-order webhook isolation | **PENDING** |
-| **BLK-07** | Test Harness | Live PostgreSQL multi-tenant fixture harness for parallel webhook/checkout concurrency | **PENDING** |
+| **BLK-03** | Concurrency / Locks | Advisory lock primitive unification (`advisory_lock.py`, `razorpay/lock.py` facade, multi-entity sort order) | **COMPLETED** (`6872f47`) |
+| **BLK-08** | Documentation | Canonical roadmap, ADR-005/006, and Stage 2L handoff/freeze synchronization | **COMPLETED** |
+| **BLK-05** | Checkout & Option A | Live-only production isolation, `(organization_id, environment)` attempt exclusivity, and `razorpay_checkout_recovery_worker.py` | **CORE MERGED** (`6872f47`) *(settlement transitions deferred)* |
+| **BLK-07** | Test Harness | Dedicated PostgreSQL 16 CI integration harness (`106` PG16 tests green in Run `46048131091`) | **CORE MERGED** (`6872f47`) *(settlement soak tests deferred)* |
+| **BLK-04** | Data Integrity | Payment binding sweeper for `pending_attempt_binding` & timed-out attempts | **DEFERRED** (Final Razorpay Phase) |
+| **BLK-06** | Reconciliation & Settlement | `subscription.charged` / `payment.captured` / `payment.failed` settlement, Pro quota rollover provisioning, pre-activation conflict guard | **DEFERRED** (Final Razorpay Phase) |
+| **UI & Live Ops** | Frontend & Render | Migrate Next.js billing UI from legacy Stripe routes; validate real Render services, staging Razorpay webhooks, and persistent `billing_health --notify` | **DEFERRED** (Final Razorpay Phase) |
 
 > [!NOTE]
-> **BLK-05 Status Note**: The Product Owner has authorized **Option A** (production billing databases are live-only; test-mode billing runs in isolated development, staging, and CI databases), and **ADR-006 documentation is finalized** (supporting rationale preserved in `docs/decisions/ADR-006-TEST-LIVE-SUBSCRIPTION-DECISION-BRIEF.md`). Decisions include defensive `(organization_id, environment)` attempt exclusivity, preserved global active-subscription uniqueness, live-only production entitlements, read-only Stripe archive, NULL-safe recovery worker leases with `recovery_claim_id` fencing, and platform-staff authorization with two-person approval. **Implementation remains strictly pending and NOT complete**: production safety safeguards (Stripe `livemode` enforcement, `accounting.py` test-environment exclusion, Razorpay pre-activation conflict reconciliation), schema migrations, recovery worker, staff auth boundaries, and settlement reconciliation are **not yet implemented** and remain gated behind separate implementation authorization and BLK-04, BLK-06, and BLK-07.
+> See [`docs/operations/BILLING_HANDOFF_AND_FREEZE.md`](docs/operations/BILLING_HANDOFF_AND_FREEZE.md) for the mandatory **Billing Freeze** (`RAZORPAY_ENABLED=false`, `STRIPE_ENABLED=false`, no live payments or staging/production DB migrations during product dev) and the **7-Point Final Razorpay Release Gate**.
 
 ---
 
-## 4. Strict Boundary Rules for Stage 2 Settlement Implementation
+## 4. Strict Boundary Rules for the Final Razorpay Integration Phase
 
-When authorization is granted following resolution of BLK-04 through BLK-07, full Stage 2 settlement implementation will enact:
+When explicit authorization is granted following chatbot product development, the Final Razorpay Integration Phase must still enact:
 
-1. **`subscription.authenticated` Settlement Handler**:
-   - Records authentication payment in `billing_payments`.
-   - Transitions subscription agreement to `authenticated`.
-   - Binds originating checkout attempt if `checkout_attempt_id` is present.
-2. **`subscription.charged` / `payment.captured` Settlement Handler**:
-   - Acquires Level 0 organization advisory lock via canonical `derive_advisory_lock_key("organization", org_id)`.
-   - Follows monotonic lock ordering ($L_{0A} \prec L_{0B} \prec L_1 \prec L_2 \prec L_3$).
-   - Multi-entity entity locks acquired in ascending signed 64-bit integer order.
-   - Conservative rollover: provisions future period (`P2`) starting at `P1.period_end`.
-   - Emits paid invoice in `billing_invoices`.
-3. **Delayed Payment Settlement for Terminal Subscriptions**:
-   - Settles payment and generates invoice for bookkeeping.
-   - Enforces *Refusal of Resurrection*: terminal agreement status remains `canceled` or `completed`.
-4. **Payment Binding Sweeper**:
-   - Discovers captured payments staged with `pending_attempt_binding` whose checkout attempt timed out before webhook arrival.
-   - Preserves *Refusal to Rewrite History*: links payment to expired attempt without mutating `attempt.status = 'expired'`.
+1. **`subscription.charged` / `payment.captured` / `payment.failed` Settlement Handlers:**
+   - Record settled or failed payments in `billing_payments`, emit invoices in `billing_invoices`, and handle dunning/grace transitions cleanly.
+   - Acquire Level 0 organization advisory lock via canonical `derive_advisory_lock_key("organization", org_id)` and follow monotonic lock ordering (`L0A < L0B < L1 < L2 < L3`).
+   - Provision future Pro `OrganizationBillingPeriod` quota (`DEFAULT_PRO_MONTHLY_TOKEN_QUOTA > 0`) via conservative rollover (`P2` starts at `P1.period_end`).
+2. **Delayed Payment Settlement for Terminal Subscriptions & Reconciliation:**
+   - Settle payment and generate bookkeeping invoice while enforcing *Refusal of Resurrection* (terminal agreement status remains `canceled` or `completed`).
+3. **Payment Binding Sweeper (`BLK-04`) & Conflict Guard (`BLK-06`):**
+   - Discover captured payments staged with `pending_attempt_binding` whose checkout attempt timed out before webhook arrival without mutating `attempt.status = 'expired'` (*Refusal to Rewrite History*), and enforce pre-activation conflict quarantine.
+4. **Frontend Razorpay Cutover & Live Staging Validation:**
+   - Migrate `app/(app)/billing/page.tsx` and `lib/api.ts` away from legacy Stripe routes and pass all 7 gates in [`docs/operations/BILLING_HANDOFF_AND_FREEZE.md`](docs/operations/BILLING_HANDOFF_AND_FREEZE.md).
 
 > [!CAUTION]
-> **Implementation Prohibition**: Under no circumstances should settlement handler business logic or database schema changes be committed or merged until all Stage 2 blockers (BLK-04 through BLK-07) are formally designed, reviewed, and approved.
+> **Freeze Enforcement:** Under **Stage 2L Billing Freeze**, do not implement paid settlement handlers, alter frozen billing migrations/contracts, or enable `RAZORPAY_ENABLED=true` / `STRIPE_ENABLED=true` until Chatbot Product Development hands back cleanly and the Final Razorpay Phase is explicitly authorized.

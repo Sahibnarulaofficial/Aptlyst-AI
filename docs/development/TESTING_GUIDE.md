@@ -17,63 +17,51 @@ Aptlyst AI enforces a strict separation between **fast, isolated unit/mock tests
 
 ## 2. Backend Testing (`apps/api/tests`)
 
-### 2.1 Test Execution Metrics
-- **Total Passing Local Unit Tests**: **634 tests**
-- **Authored PostgreSQL Integration Tests**: **14 tests** (in `tests/test_postgres_provenance_integration.py`, skipped locally when `POSTGRES_TEST_URL` is absent)
+### 2.1 Post-Merge CI Verified Baseline (`main` @ `6872f47`, [Run `46048131091`](https://github.com/Sahibnarulaofficial/Aptlyst-AI/actions/runs/46048131091))
+- **Total Passing Tests in CI**: **`1,322` passed**, `0` skipped, `0` failed, `0` errors
+  - **PostgreSQL 16 Integration (`REQUIRE_POSTGRES_TESTS=1`)**: **`106` tests** across 9 live PostgreSQL test suites (including provenance immutability, checkout/recovery concurrency, heartbeat fencing, and `pg_api_integration` tests).
+  - **Advisory Lock Unit Suite (`tests/test_advisory_lock.py`)**: **`18` tests**
+  - **Focused Offline / Non-PG Regression Suite**: **`1,198` tests**
 
-### 2.2 Running Unit Tests Locally
-Navigate to `apps/api/` and invoke pytest:
+### 2.2 Running Offline / Non-PostgreSQL Tests Locally
+Navigate to `apps/api/` and exclude tests marked `pg_api_integration`:
 
 ```bash
-# In apps/api with .venv activated:
-pytest
+# In apps/api with .venv activated (offline/mock/SQLite tests without PostgreSQL):
+pytest -m "not pg_api_integration" -q
 
-# Run tests with short summary output:
-pytest -q
+# Enforce fail-closed PG test guard behavior check:
+pytest tests/test_postgres_test_guard.py -q
 
-# Run specific test modules:
-pytest tests/test_billing_api.py
-pytest tests/test_payment_association_migration.py
-pytest tests/test_razorpay_webhook_worker.py
+# Run specific unit modules:
+pytest tests/test_billing_api.py tests/test_ai_generation.py -q
 ```
+
+> [!NOTE]
+> Setting `REQUIRE_POSTGRES_TESTS=1` without `POSTGRES_TEST_URL` fails closed via `tests/postgres_api_test_helper.py` (`test_postgres_test_guard.py`). When running offline locally without PostgreSQL, use `-m "not pg_api_integration"` so live PostgreSQL API tests are cleanly excluded rather than stalling or touching `.env` / `DATABASE_URL`.
 
 ### 2.3 Running PostgreSQL Integration Tests Locally
-If you have a local PostgreSQL 16 instance running on `localhost:5432`:
+If you have a dedicated, disposable local PostgreSQL 16 test database running:
 
-```bash
-# Set POSTGRES_TEST_URL environment variable:
-# PowerShell:
-$env:POSTGRES_TEST_URL="postgresql://postgres:postgres@localhost:5432/aptlyst_test"
+```powershell
+# PowerShell (never point POSTGRES_TEST_URL at staging, production, or .env DATABASE_URL):
+$env:REQUIRE_POSTGRES_TESTS="1"
+$env:POSTGRES_TEST_URL="postgresql+asyncpg://aptlyst_ci_user:postgres_ci_password@localhost:5432/aptlyst_ci_test"
+
+# Run the 14 provenance integration tests (does NOT carry the pg_api_integration marker):
 pytest tests/test_postgres_provenance_integration.py
 
-# Linux / macOS:
-export POSTGRES_TEST_URL="postgresql://postgres:postgres@localhost:5432/aptlyst_test"
-pytest tests/test_postgres_provenance_integration.py
+# Run the 21 PostgreSQL API integration tests (organizations, chatbots, conversations, public_chatbots):
+pytest -m pg_api_integration
 ```
+
+> [!NOTE]
+> `-m pg_api_integration` selects only the **21** PostgreSQL API integration tests. The full **106**-test PostgreSQL 16 suite spans **9** CI modules and is orchestrated step-by-step in [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml).
 
 ### 2.4 CI Pipeline Configuration
-The CI workflow is defined in `.github/workflows/ci.yml`. It spins up an ephemeral PostgreSQL 16 service container:
-
-```yaml
-services:
-  postgres:
-    image: postgres:16-alpine
-    env:
-      POSTGRES_DB: aptlyst_test
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres_ci_password
-    ports:
-      - 5432:5432
-    options: >-
-      --health-cmd pg_isready
-      --health-interval 10s
-      --health-timeout 5s
-      --health-retries 5
-```
-
-The CI job runs:
-1. `pytest` for unit and migration mock tests.
-2. `pytest tests/test_postgres_provenance_integration.py` against the PostgreSQL service container with `POSTGRES_TEST_URL` set.
+The CI workflow in `.github/workflows/ci.yml` spins up an isolated PostgreSQL 16 service container (`POSTGRES_DB: aptlyst_ci_test`, `POSTGRES_USER: aptlyst_ci_user`) and executes:
+1. Advisory-lock & focused offline regression suites (`-m "not pg_api_integration"`).
+2. All PostgreSQL 16 integration suites with `REQUIRE_POSTGRES_TESTS=1` against the CI service container.
 
 ---
 

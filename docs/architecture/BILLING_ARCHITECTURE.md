@@ -85,39 +85,29 @@ In migration `e2f3a4b5c6d1`, candidate subscription-to-period links from both St
 
 To prevent deadlocks between concurrent webhooks, checkout verification, and automated renewal workers, the billing engine defines two concurrency states:
 
-### 4.1 Currently Implemented (Verified in Code)
-- **Entity Advisory Locking**: `acquire_razorpay_advisory_lock` in `apps/api/app/services/billing/razorpay/lock.py` acquires transaction-scoped advisory locks on `{"subscription", "payment", "invoice", "customer"}` entities using deterministic SHA-256 derivation.
-- **Agreement Handler Row Locking**: Agreement handlers in `agreement_handlers.py` acquire row-level locks on `organization_billing_periods` before `subscriptions`.
-- **Network Isolation**: All external network HTTP requests (Razorpay/Stripe API) execute strictly **outside** database transactions.
+### 4.1 Implemented Through Stage 2K (Verified in Code & PostgreSQL 16 CI)
+- **Canonical Advisory Lock Module (`apps/api/app/services/billing/advisory_lock.py`)**: Provider-neutral lock derivation and acquisition, strictly ascending multi-entity sort order (`acquire_multi_entity_advisory_locks`), backward-compatible `apps/api/app/services/billing/razorpay/lock.py` facade, and transitional user lock ordering in `apps/api/app/api/organizations.py`.
+- **Agreement Handler Row Locking & Triggers**: `agreement_handlers.py` acquires entity/row locks consistently, and migration `e2f3a4b5c6d1` enforces PostgreSQL immutability triggers on provenance columns.
+- **Recovery & Worker Lease Fencing**: Migrations `f3a4b5c6d7e2` and `a4b5c6d7e8f3` enforce UUID `recovery_claim_id` fencing, `(organization_id, environment)` attempt uniqueness (ADR-006 Option A), `billing_worker_heartbeats`, and ownership-loss halts.
+- **Network Isolation**: All external Razorpay/Stripe HTTP calls execute strictly **outside** database transactions and locks.
 
-### 4.2 Approved Architectural Specification (Scheduled for Step 5.2D.3.3B)
-- **Level 0A Organization Advisory Lock**:
-  ```sql
-  SELECT pg_advisory_xact_lock(hashtext('org:' || :organization_id));
-  ```
-  This transaction-scoped lock serializes all billing state modifications for the tenant and closes the concurrency void when an organization has zero existing billing periods.
-- **Monotonic 5-Level Acquisition Sequence**:
-  Transactions must acquire locks in strictly ascending order:
-  1. **Level 0A**: `pg_advisory_xact_lock(hashtext('org:' || org_id))`
-  2. **Level 0B**: `pg_advisory_xact_lock(hashtext('subscription:' || sub_id))`
-  3. **Level 1**: `organization_billing_periods` (`SELECT ... FOR UPDATE`)
-  4. **Level 2**: `subscriptions` (`SELECT ... FOR UPDATE`)
-  5. **Level 3**: Auxiliary tables (`billing_invoices`, `billing_payments`, `billing_checkout_attempts`)
+### 4.2 Deferred Settlement Concurrency & Release Gate (Final Razorpay Phase)
+- Full Level 0A organization-to-auxiliary monotonic locking inside `subscription.charged` / `payment.captured` / `payment.failed` settlement handlers (`L0A -> L0B -> L1 -> L2 -> L3`), Pro `OrganizationBillingPeriod` provisioning, and the `BLK-04` payment-binding sweeper remain **not implemented** under the [Stage 2L Billing Freeze](../operations/BILLING_HANDOFF_AND_FREEZE.md).
 
 ---
 
-## 5. Current Subsystem Implementation Status
+## 5. Current Subsystem Implementation Status (`main` @ `6872f47`)
 
-To maintain engineering accuracy, the billing architecture is classified into exact implementation states:
-
-| Subsystem / Capability | Current Status | Notes & Blockers |
+| Subsystem / Capability | Current Status | Notes & Gate |
 | :--- | :---: | :--- |
-| **Historical Stripe Invoicing & Subscriptions** | **Implemented & Verified** | Legacy implementation preserved; unit tested in `test_stripe_*.py`. |
-| **Provider-Neutral Database Models** | **Implemented & Verified** | Models in `app/models/billing.py` tested with 17 SQLite unit tests. |
-| **Webhook Ingestion Endpoint (`/razorpay/webhook`)** | **Implemented & Verified** | HMAC signature verification and payload persistence unit tested. |
-| **Webhook Background Worker Daemon & CLI** | **Implemented & Verified** | Lease claiming, backoff, and DLQ tested in unit test suite. |
-| **Migration `e2f3a4b5c6d1` (Payment Association)** | **Implemented, Not Fully Validated** | DDL and conflict gate authored; **blocked by outstanding PostgreSQL CI execution**. |
-| **PostgreSQL Integration Test Suite (14 tests)** | **Authored, Not Executed in CI** | `test_postgres_provenance_integration.py` requires live PostgreSQL service container. |
-| **Razorpay Payment Settlement Handlers** | **Designed, Not Implemented** | Full mathematical design completed (Step 5.2D.3.2); Step 5.2D.3.3B pending. |
-| **Payment Binding Background Sweeper** | **Designed, Not Implemented** | Sweeper for expired checkout payment rediscovery designed; Step 5.2D.3.3B pending. |
-| **Live Razorpay Gateway Sandbox Verification** | **Pending Future Milestone** | No live API credentials or sandbox network tests executed to date. |
+| **Historical Stripe Invoicing & Subscriptions** | **Implemented (Legacy)** | Read-only compatibility preserved; no new Stripe functionality added. |
+| **Provider-Neutral Models & Provenance (`a1b2c3d4e5f7`–`e2f3a4b5c6d1`)** | **Implemented & PG16 CI-Verified** | Immutability triggers, composite FKs, conflict gates verified on PostgreSQL 16 (Run `46048131091`). |
+| **Webhook Ingestion Endpoint & Queue Worker** | **Implemented & CI-Verified** | HMAC verification, lease claiming, backoff, quarantine, heartbeats (`a4b5c6d7e8f3`). |
+| **Checkout Recovery Worker & Exclusivity (`f3a4b5c6d7e2`)** | **Implemented & CI-Verified** | `razorpay_checkout_recovery_worker.py` + Option A `(organization_id, environment)` uniqueness. |
+| **Advisory Lock Unification (`BLK-03`) & Ops Runbook** | **Implemented & CI-Verified** | `advisory_lock.py`, 18 tests, `billing_health.py`, `billing_reconciliation.py`, `RENDER_DEPLOYMENT_GUIDE.md`. |
+| **Razorpay Payment Settlement & Pro Quota Rollover** | **Deferred (Not Implemented)** | `subscription.charged`, `payment.captured`, `payment.failed` & Pro `OrganizationBillingPeriod` provisioning await Final Razorpay Phase. |
+| **Payment Binding Sweeper (`BLK-04`) & Conflict Guard (`BLK-06`)** | **Deferred (Not Implemented)** | Timed-out `pending_attempt_binding` sweeper & pre-activation conflict quarantine deferred. |
+| **Next.js Billing UI Cutover & Live Render / Sandbox Validation** | **Deferred (Not Implemented)** | `app/(app)/billing/page.tsx` still calls legacy Stripe routes; zero real staging/live Razorpay runs yet. |
+
+> [!IMPORTANT]
+> Paid Razorpay billing is **frozen (`RAZORPAY_ENABLED=false`, `STRIPE_ENABLED=false`) and NOT production-ready**. See [`BILLING_HANDOFF_AND_FREEZE.md`](../operations/BILLING_HANDOFF_AND_FREEZE.md).
