@@ -14,35 +14,33 @@ if sys.platform == "win32":
     BaseProactorEventLoop._make_self_pipe = _safe_make_self_pipe
     BaseProactorEventLoop._loop_self_reading = lambda self, f=None: None
 
-import os
 import uuid
 from unittest.mock import patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
-from app.db.session import AsyncSessionLocal
 from app.main import app
 from app.models.chatbot import Chatbot, ChatbotStatus
 from app.models.organization import MemberRole, Organization, OrganizationMember
+from tests.postgres_api_test_helper import (
+    SKIP_IF_OPTIONAL_POSTGRES,
+    cleanup_test_organizations,
+    verified_pg_api_session_factory,
+)
 from tests.test_auth import TEST_JWT_SECRET, make_token
-
-RUN_INTEGRATION_TESTS = os.getenv("RUN_SUPABASE_INTEGRATION_TESTS", "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-)
-
-db_required = pytest.mark.skipif(
-    not RUN_INTEGRATION_TESTS,
-    reason="Chatbot database integration test requires real PostgreSQL with RUN_SUPABASE_INTEGRATION_TESTS=1",
-)
 
 
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+@pytest.fixture
+async def pg_session_factory():
+    async for factory in verified_pg_api_session_factory():
+        yield factory
 
 
 @pytest.fixture
@@ -53,9 +51,13 @@ async def client() -> AsyncClient:
         yield ac
 
 
+@pytest.mark.pg_api_integration
+@SKIP_IF_OPTIONAL_POSTGRES
 @pytest.mark.anyio
-@db_required
-async def test_create_and_list_chatbots_scoped_to_organization(client: AsyncClient) -> None:
+async def test_create_and_list_chatbots_scoped_to_organization(
+    client: AsyncClient,
+    pg_session_factory,
+) -> None:
     """Verifies that an organization member can create and list chatbots scoped to their org."""
     user_id = uuid.uuid4()
     token = make_token(user_id=str(user_id))
@@ -125,15 +127,16 @@ async def test_create_and_list_chatbots_scoped_to_organization(client: AsyncClie
             assert res_get.status_code == 200
             assert res_get.json()["id"] == bot_id
     finally:
-        if org_id:
-            async with AsyncSessionLocal() as session:
-                await session.execute(delete(Organization).where(Organization.id == org_id))
-                await session.commit()
+        await cleanup_test_organizations(pg_session_factory, [org_id])
 
 
+@pytest.mark.pg_api_integration
+@SKIP_IF_OPTIONAL_POSTGRES
 @pytest.mark.anyio
-@db_required
-async def test_chatbot_validation_rules(client: AsyncClient) -> None:
+async def test_chatbot_validation_rules(
+    client: AsyncClient,
+    pg_session_factory,
+) -> None:
     """Verifies that invalid payloads (empty name, bad URL, bad hex) are rejected with 422."""
     user_id = uuid.uuid4()
     token = make_token(user_id=str(user_id))
@@ -177,15 +180,16 @@ async def test_chatbot_validation_rules(client: AsyncClient) -> None:
             )
             assert res_bad_color.status_code == 422
     finally:
-        if org_id:
-            async with AsyncSessionLocal() as session:
-                await session.execute(delete(Organization).where(Organization.id == org_id))
-                await session.commit()
+        await cleanup_test_organizations(pg_session_factory, [org_id])
 
 
+@pytest.mark.pg_api_integration
+@SKIP_IF_OPTIONAL_POSTGRES
 @pytest.mark.anyio
-@db_required
-async def test_chatbot_cross_tenant_isolation(client: AsyncClient) -> None:
+async def test_chatbot_cross_tenant_isolation(
+    client: AsyncClient,
+    pg_session_factory,
+) -> None:
     """Verifies tenant isolation: User B cannot list, create, or read chatbots in User A's org."""
     user_a = uuid.uuid4()
     user_b = uuid.uuid4()
@@ -240,15 +244,16 @@ async def test_chatbot_cross_tenant_isolation(client: AsyncClient) -> None:
             assert res_b_create.status_code == 404
             assert res_b_create.json()["detail"] == "Not found"
     finally:
-        if org_a_id:
-            async with AsyncSessionLocal() as session:
-                await session.execute(delete(Organization).where(Organization.id == org_a_id))
-                await session.commit()
+        await cleanup_test_organizations(pg_session_factory, [org_a_id])
 
 
+@pytest.mark.pg_api_integration
+@SKIP_IF_OPTIONAL_POSTGRES
 @pytest.mark.anyio
-@db_required
-async def test_chatbot_cross_org_id_tampering(client: AsyncClient) -> None:
+async def test_chatbot_cross_org_id_tampering(
+    client: AsyncClient,
+    pg_session_factory,
+) -> None:
     """Verifies that requesting a Bot from Org A through Org B URL path returns 404 even if user belongs to Org B."""
     user = uuid.uuid4()
     token = make_token(user_id=str(user))
@@ -278,7 +283,7 @@ async def test_chatbot_cross_org_id_tampering(client: AsyncClient) -> None:
             bot_1_id = res_bot1.json()["id"]
 
             # Directly create Org 2 and add user as member to simulate belonging to two orgs
-            async with AsyncSessionLocal() as session:
+            async with pg_session_factory() as session:
                 org2 = Organization(name="Org 2")
                 session.add(org2)
                 await session.flush()
@@ -301,12 +306,7 @@ async def test_chatbot_cross_org_id_tampering(client: AsyncClient) -> None:
             assert res_tamper.status_code == 404
             assert res_tamper.json()["detail"] == "Not found"
     finally:
-        async with AsyncSessionLocal() as session:
-            if org_1_id:
-                await session.execute(delete(Organization).where(Organization.id == org_1_id))
-            if org_2_id:
-                await session.execute(delete(Organization).where(Organization.id == org_2_id))
-            await session.commit()
+        await cleanup_test_organizations(pg_session_factory, [org_1_id, org_2_id])
 
 
 @pytest.mark.anyio
@@ -339,9 +339,13 @@ async def test_chatbot_unauthenticated_requests_rejected(client: AsyncClient) ->
     assert res_no_auth_del.status_code == 401
 
 
+@pytest.mark.pg_api_integration
+@SKIP_IF_OPTIONAL_POSTGRES
 @pytest.mark.anyio
-@db_required
-async def test_update_chatbot_supported_fields_and_partial_updates(client: AsyncClient) -> None:
+async def test_update_chatbot_supported_fields_and_partial_updates(
+    client: AsyncClient,
+    pg_session_factory,
+) -> None:
     """Verifies partial updates, updating each supported field, and explicit null vs omitted."""
     user_id = uuid.uuid4()
     token = make_token(user_id=str(user_id))
@@ -458,15 +462,16 @@ async def test_update_chatbot_supported_fields_and_partial_updates(client: Async
             assert res_empty_patch.status_code == 400
             assert res_empty_patch.json()["detail"] == "No fields provided for update"
     finally:
-        if org_id:
-            async with AsyncSessionLocal() as session:
-                await session.execute(delete(Organization).where(Organization.id == org_id))
-                await session.commit()
+        await cleanup_test_organizations(pg_session_factory, [org_id])
 
 
+@pytest.mark.pg_api_integration
+@SKIP_IF_OPTIONAL_POSTGRES
 @pytest.mark.anyio
-@db_required
-async def test_update_chatbot_validation_rules(client: AsyncClient) -> None:
+async def test_update_chatbot_validation_rules(
+    client: AsyncClient,
+    pg_session_factory,
+) -> None:
     """Verifies that invalid updates (empty name, bad URL, bad hex, bad status, null name) are rejected with 422."""
     user_id = uuid.uuid4()
     token = make_token(user_id=str(user_id))
@@ -541,15 +546,16 @@ async def test_update_chatbot_validation_rules(client: AsyncClient) -> None:
             )
             assert res_null_status.status_code == 422
     finally:
-        if org_id:
-            async with AsyncSessionLocal() as session:
-                await session.execute(delete(Organization).where(Organization.id == org_id))
-                await session.commit()
+        await cleanup_test_organizations(pg_session_factory, [org_id])
 
 
+@pytest.mark.pg_api_integration
+@SKIP_IF_OPTIONAL_POSTGRES
 @pytest.mark.anyio
-@db_required
-async def test_update_chatbot_isolation_and_authorization(client: AsyncClient) -> None:
+async def test_update_chatbot_isolation_and_authorization(
+    client: AsyncClient,
+    pg_session_factory,
+) -> None:
     """Verifies that non-existent bot returns 404, cross-org access returns 404, and members/admins/owners can update."""
     user_a = uuid.uuid4()
     user_b = uuid.uuid4()
@@ -617,7 +623,7 @@ async def test_update_chatbot_isolation_and_authorization(client: AsyncClient) -
             assert res_cross_tamper.json()["detail"] == "Not found"
 
             # 4. Member role can update: Add user_b to Org A as MemberRole.member
-            async with AsyncSessionLocal() as session:
+            async with pg_session_factory() as session:
                 session.add(
                     OrganizationMember(
                         organization_id=org_a_id,
@@ -635,18 +641,15 @@ async def test_update_chatbot_isolation_and_authorization(client: AsyncClient) -
             assert res_member_update.status_code == 200
             assert res_member_update.json()["name"] == "Updated By Member"
     finally:
-        async with AsyncSessionLocal() as session:
-            if org_a_id:
-                await session.execute(delete(Organization).where(Organization.id == org_a_id))
-            if org_b_id:
-                await session.execute(delete(Organization).where(Organization.id == org_b_id))
-            await session.commit()
+        await cleanup_test_organizations(pg_session_factory, [org_a_id, org_b_id])
 
 
+@pytest.mark.pg_api_integration
+@SKIP_IF_OPTIONAL_POSTGRES
 @pytest.mark.anyio
-@db_required
 async def test_chatbot_color_validation_consistency_and_editing_regression(
     client: AsyncClient,
+    pg_session_factory,
 ) -> None:
     """Verifies color validation consistency between create and update, ensuring valid
 
@@ -720,16 +723,15 @@ async def test_chatbot_color_validation_consistency_and_editing_regression(
             assert res_empty_color.status_code == 200
             assert res_empty_color.json()["primary_color"] == "#3b82f6"
     finally:
-        if org_id:
-            async with AsyncSessionLocal() as session:
-                await session.execute(delete(Organization).where(Organization.id == org_id))
-                await session.commit()
+        await cleanup_test_organizations(pg_session_factory, [org_id])
 
 
+@pytest.mark.pg_api_integration
+@SKIP_IF_OPTIONAL_POSTGRES
 @pytest.mark.anyio
-@db_required
 async def test_delete_chatbot_successful_and_cross_tenant_isolation(
     client: AsyncClient,
+    pg_session_factory,
 ) -> None:
     """Verifies successful 204 deletion, 404 for deleted or nonexistent bot, and cross-tenant isolation."""
     user_a = uuid.uuid4()
@@ -841,18 +843,15 @@ async def test_delete_chatbot_successful_and_cross_tenant_isolation(
             assert res_bot_2_check.status_code == 200
             assert res_bot_2_check.json()["name"] == "Bot 2"
     finally:
-        async with AsyncSessionLocal() as session:
-            if org_a_id:
-                await session.execute(delete(Organization).where(Organization.id == org_a_id))
-            if org_b_id:
-                await session.execute(delete(Organization).where(Organization.id == org_b_id))
-            await session.commit()
+        await cleanup_test_organizations(pg_session_factory, [org_a_id, org_b_id])
 
 
+@pytest.mark.pg_api_integration
+@SKIP_IF_OPTIONAL_POSTGRES
 @pytest.mark.anyio
-@db_required
 async def test_delete_chatbot_roles_and_transaction_safety(
     client: AsyncClient,
+    pg_session_factory,
 ) -> None:
     """Verifies role authorization (member, admin, owner can delete; outsider rejected) and transaction safety."""
     user_owner = uuid.uuid4()
@@ -881,7 +880,7 @@ async def test_delete_chatbot_roles_and_transaction_safety(
             org_id = uuid.UUID(res_org.json()["id"])
 
             # Add admin and member
-            async with AsyncSessionLocal() as session:
+            async with pg_session_factory() as session:
                 session.add(
                     OrganizationMember(
                         organization_id=org_id,
@@ -945,7 +944,7 @@ async def test_delete_chatbot_roles_and_transaction_safety(
             assert res_get_4.status_code == 200
 
             # 5. Schema check: deleting chatbots leaves organization and members intact
-            async with AsyncSessionLocal() as session:
+            async with pg_session_factory() as session:
                 org_check = await session.get(Organization, org_id)
                 assert org_check is not None
                 members_result = await session.execute(
@@ -953,7 +952,4 @@ async def test_delete_chatbot_roles_and_transaction_safety(
                 )
                 assert len(members_result.scalars().all()) == 3
     finally:
-        if org_id:
-            async with AsyncSessionLocal() as session:
-                await session.execute(delete(Organization).where(Organization.id == org_id))
-                await session.commit()
+        await cleanup_test_organizations(pg_session_factory, [org_id])

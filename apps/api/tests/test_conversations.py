@@ -13,7 +13,6 @@ Covers:
 - Multi-tenant database invariant (composite foreign key rejects cross-org associations).
 """
 
-import os
 import time
 import uuid
 from unittest.mock import patch
@@ -21,7 +20,7 @@ from unittest.mock import patch
 import jwt
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app.auth.visitor_session import (
@@ -31,23 +30,28 @@ from app.auth.visitor_session import (
     create_visitor_token,
     verify_visitor_token,
 )
-from app.db.session import AsyncSessionLocal
+from app.config import settings
 from app.main import app
 from app.models.chatbot import Chatbot, ChatbotStatus
-from app.models.conversation import Conversation, ConversationStatus, Message, MessageSenderType
+from app.models.conversation import Conversation, ConversationStatus, Message
 from app.models.organization import Organization
-from tests.test_auth import TEST_JWT_SECRET, make_token
-
-RUN_INTEGRATION_TESTS = os.getenv("RUN_SUPABASE_INTEGRATION_TESTS", "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
+from tests.postgres_api_test_helper import (
+    SKIP_IF_OPTIONAL_POSTGRES,
+    cleanup_test_organizations,
+    verified_pg_api_session_factory,
 )
+from tests.test_auth import TEST_JWT_SECRET, make_token
 
 
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+@pytest.fixture
+async def pg_session_factory():
+    async for factory in verified_pg_api_session_factory():
+        yield factory
 
 
 @pytest.fixture
@@ -247,12 +251,13 @@ def test_production_secret_enforcement() -> None:
 # ============================================================================
 
 
+@pytest.mark.pg_api_integration
+@SKIP_IF_OPTIONAL_POSTGRES
 @pytest.mark.anyio
-@pytest.mark.skipif(
-    not RUN_INTEGRATION_TESTS,
-    reason="Conversation lifecycle integration test requires real PostgreSQL with RUN_SUPABASE_INTEGRATION_TESTS=1",
-)
-async def test_conversation_lifecycle_and_security(client: AsyncClient) -> None:
+async def test_conversation_lifecycle_and_security(
+    client: AsyncClient,
+    pg_session_factory,
+) -> None:
     """Full lifecycle integration test:
 
     1. Org setup and chatbot creation (draft -> active).
@@ -271,7 +276,10 @@ async def test_conversation_lifecycle_and_security(client: AsyncClient) -> None:
     org_id = None
 
     try:
-        with patch("app.auth.dependencies.settings") as mock_settings:
+        with (
+            patch.object(settings, "llm_provider", "disabled"),
+            patch("app.auth.dependencies.settings") as mock_settings,
+        ):
             mock_settings.supabase_jwt_algorithm = "HS256"
             mock_settings.supabase_jwt_secret = TEST_JWT_SECRET
 
@@ -467,7 +475,7 @@ async def test_conversation_lifecycle_and_security(client: AsyncClient) -> None:
             assert res_del_bot.status_code == 204
 
             # Verify cascading deletion in the database
-            async with AsyncSessionLocal() as session:
+            async with pg_session_factory() as session:
                 remaining_convs = (
                     await session.execute(
                         select(Conversation).where(Conversation.id == uuid.UUID(conv_id))
@@ -482,26 +490,19 @@ async def test_conversation_lifecycle_and_security(client: AsyncClient) -> None:
                 ).scalars().all()
                 assert len(remaining_msgs) == 0
     finally:
-        if org_id:
-            async with AsyncSessionLocal() as session:
-                await session.execute(delete(Organization).where(Organization.id == org_id))
-                await session.commit()
+        await cleanup_test_organizations(pg_session_factory, [org_id])
 
 
+@pytest.mark.pg_api_integration
+@SKIP_IF_OPTIONAL_POSTGRES
 @pytest.mark.anyio
-@pytest.mark.skipif(
-    not RUN_INTEGRATION_TESTS,
-    reason="Composite foreign key test requires real PostgreSQL with RUN_SUPABASE_INTEGRATION_TESTS=1",
-)
-async def test_composite_foreign_key_cross_org_invariant() -> None:
+async def test_composite_foreign_key_cross_org_invariant(pg_session_factory) -> None:
     """Verifies that the database composite FK rejects conversations referencing a bot from another org."""
-    user_id = uuid.uuid4()
-    auth_token = make_token(user_id=str(user_id))
     org_a_id = None
     org_b_id = None
 
-    async with AsyncSessionLocal() as session:
-        try:
+    try:
+        async with pg_session_factory() as session:
             # Create Org A and Org B
             org_a = Organization(name="Org A Invariant Test")
             org_b = Organization(name="Org B Invariant Test")
@@ -537,9 +538,5 @@ async def test_composite_foreign_key_cross_org_invariant() -> None:
             # Must fail the fk_conversations_chatbot_org constraint
             assert "fk_conversations_chatbot_org" in str(exc_info.value)
             await session.rollback()
-        finally:
-            if org_a_id or org_b_id:
-                await session.execute(
-                    delete(Organization).where(Organization.id.in_([org_a_id, org_b_id]))
-                )
-                await session.commit()
+    finally:
+        await cleanup_test_organizations(pg_session_factory, [org_a_id, org_b_id])
