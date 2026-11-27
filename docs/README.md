@@ -24,10 +24,18 @@ docs/
 │   ├── ADR-002-FULL-PAYMENT-SETTLEMENT.md
 │   ├── ADR-003-SUBSCRIPTION-ENTITLEMENT-SEPARATION.md
 │   ├── ADR-004-PAYMENT-PROVENANCE.md
-│   └── ADR-005-BILLING-LOCK-ORDERING.md
+│   ├── ADR-005-BILLING-LOCK-ORDERING.md
+│   ├── ADR-006-CHECKOUT-EXCLUSIVITY-AND-RECOVERY.md
+│   └── ADR-006-TEST-LIVE-SUBSCRIPTION-DECISION-BRIEF.md
+│
+├── operations/                    # Deployment, Monitoring & Handoff Runbooks
+│   ├── BILLING_HANDOFF_AND_FREEZE.md
+│   └── RENDER_DEPLOYMENT_GUIDE.md
 │
 ├── audits/                        # Formal Audit Deliverables
 │   └── DOCUMENTATION_AUDIT_REPORT.md # Inventory and restructuring audit report
+│
+├── reports/                       # Stage implementation & CI validation reports
 │
 └── archive/                       # Historical Phase Reports (Immutable Audit Trail)
     ├── README.md                  # Master archive index (29 historical reports)
@@ -47,14 +55,17 @@ docs/
 3. Review [`docs/development/TESTING_GUIDE.md`](development/TESTING_GUIDE.md) to run and write unit and integration tests.
 
 ### For Billing & Database Engineers
-1. Read [`docs/architecture/BILLING_ARCHITECTURE.md`](architecture/BILLING_ARCHITECTURE.md) to understand provider-neutral modeling.
-2. Review the formal [Architecture Decision Records](decisions/) covering:
+1. Read [`docs/operations/BILLING_HANDOFF_AND_FREEZE.md`](operations/BILLING_HANDOFF_AND_FREEZE.md) for the active **Stage 2L Billing Freeze** and **Chatbot Product Development Handoff**.
+2. Read [`docs/architecture/BILLING_ARCHITECTURE.md`](architecture/BILLING_ARCHITECTURE.md) to understand provider-neutral modeling.
+3. Review the formal [Architecture Decision Records](decisions/) covering:
    - [ADR-001: Provider Migration](decisions/ADR-001-BILLING-PROVIDER-MIGRATION.md)
    - [ADR-002: Full Payment Settlement](decisions/ADR-002-FULL-PAYMENT-SETTLEMENT.md)
    - [ADR-003: Option A Decoupling](decisions/ADR-003-SUBSCRIPTION-ENTITLEMENT-SEPARATION.md)
    - [ADR-004: Payment Provenance & Triggers](decisions/ADR-004-PAYMENT-PROVENANCE.md)
    - [ADR-005: Billing Lock Ordering](decisions/ADR-005-BILLING-LOCK-ORDERING.md)
-3. Track the live billing implementation sequence in [`BILLING_ROADMAP.md`](../BILLING_ROADMAP.md).
+   - [ADR-006: Checkout Exclusivity & Recovery](decisions/ADR-006-CHECKOUT-EXCLUSIVITY-AND-RECOVERY.md) ([Option A Decision Brief](decisions/ADR-006-TEST-LIVE-SUBSCRIPTION-DECISION-BRIEF.md))
+4. Track billing milestones and remaining Razorpay release gates in [`BILLING_ROADMAP.md`](../BILLING_ROADMAP.md).
+5. Reference [`docs/operations/RENDER_DEPLOYMENT_GUIDE.md`](operations/RENDER_DEPLOYMENT_GUIDE.md) for manual Render service specs, environment matrices, and worker monitoring (`docs/archive/` holds immutable historical records).
 
 ### For Codebase Auditors
 - Review the historical audit trail of 29 step reports in [`docs/archive/README.md`](archive/README.md).

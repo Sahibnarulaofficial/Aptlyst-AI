@@ -36,9 +36,12 @@ apps/api/
 │   ├── security/                  # Cryptographic utilities & signature checks
 │   ├── services/                  # Business logic services
 │   │   └── billing/               # Stripe legacy handlers & Razorpay services
-│   └── workers/                   # Background workers & CLI runners
-│       └── razorpay_webhook_worker.py # Webhook ingestion worker & queue processor
-├── tests/                         # Pytest test suite (634 passing unit/model tests)
+│   └── workers/                   # Background workers, health & operator CLIs
+│       ├── razorpay_webhook_worker.py
+│       ├── razorpay_checkout_recovery_worker.py
+│       ├── billing_health.py
+│       └── billing_reconciliation.py
+├── tests/                         # Pytest suite (1,322 CI tests passing on Run 46048131091)
 ├── requirements.txt               # Production dependencies
 └── requirements-dev.txt           # Testing and development tooling
 ```
@@ -71,24 +74,19 @@ The top-level tenant is `Organization`. All entities link directly or transitive
 
 To guarantee absolute consistency across multi-threaded operations and asynchronous webhook arrivals, the backend architecture defines two concurrency tiers:
 
-### 4.1 Currently Implemented Concurrency Controls
-1. **Entity-Level Transaction-Scoped Advisory Locking**:
-   - Implemented in `apps/api/app/services/billing/razorpay/lock.py` via `acquire_razorpay_advisory_lock(db, entity_type, entity_id)`.
-   - Derives a deterministic signed 64-bit integer from `SHA-256("razorpay:<clean_type>:<clean_id>")[:8]`.
-   - Serializes concurrent processing for `subscription`, `payment`, `invoice`, and `customer` entities.
-   - Enforced in `apps/api/app/services/billing/razorpay/agreement_handlers.py` and Stripe handlers (`stripe_invoice_paid_handler.py`).
-2. **Database-Level Immutability Triggers (Migration `e2f3a4b5c6d1`)**:
-   - PostgreSQL procedural triggers prevent post-settlement reassignment of `subscription_id`, `checkout_attempt_id`, or `provider_payment_id`.
-3. **Network Call Isolation**:
-   - All external HTTP calls (e.g. to Razorpay API) execute strictly outside database transactions to prevent connection pool exhaustion.
+### 4.1 Implemented Concurrency Controls (Verified Through Stage 2K / `6872f47`)
+1. **Unified Advisory Locking (`apps/api/app/services/billing/advisory_lock.py`)**:
+   - Canonical provider-neutral advisory lock module with backward-compatible facade in `apps/api/app/services/billing/razorpay/lock.py`.
+   - Enforces ascending signed 64-bit integer ordering for multi-entity locks (`acquire_multi_entity_advisory_locks`) and transitional dual-locking in `apps/api/app/api/organizations.py`.
+2. **Worker Lease & Heartbeat Fencing (`f3a4b5c6d7e2`, `a4b5c6d7e8f3`)**:
+   - `SELECT ... FOR UPDATE SKIP LOCKED` claiming, UUID `lease_token` / `recovery_claim_id` fencing, and `instance_token` ownership-loss guards in `razorpay_webhook_worker.py` and `razorpay_checkout_recovery_worker.py`.
+3. **Database-Level Immutability Triggers (`e2f3a4b5c6d1`)**:
+   - PostgreSQL procedural triggers prevent post-settlement reassignment of `subscription_id`, `checkout_attempt_id`, or `provider_payment_id` (CI-verified on PostgreSQL 16).
+4. **Network Call Isolation**:
+   - External Razorpay HTTP calls execute strictly outside database transactions and locks.
 
-### 4.2 Approved Concurrency Design (Scheduled for Step 5.2D.3.3B)
-1. **Level 0A Organization Advisory Locking**:
-   - `pg_advisory_xact_lock(hashtext('org:' || organization_id))` will be added to `lock.py` to close the concurrency void when an organization has zero existing billing periods.
-2. **Global Monotonic 5-Level Lock Hierarchy**:
-   - Strict ascending lock acquisition order across upcoming settlement handlers:
-     $$L_{0A}(\text{org}) \prec L_{0B}(\text{entity}) \prec L_1(\text{period}) \prec L_2(\text{sub}) \prec L_3(\text{auxiliary})$$
-   - Designed in Steps 5.2D.3.2.10–12; implementation scheduled for Step 5.2D.3.3B.
+### 4.2 Deferred Settlement Concurrency & Reconciliation (Final Razorpay Phase)
+- Monotonic 5-level organization-to-auxiliary settlement locking (`L0A(org) -> L0B(entity) -> L1(period) -> L2(sub) -> L3(auxiliary)`) inside upcoming `subscription.charged` / `payment.captured` / `payment.failed` settlement handlers and the `BLK-04` payment-binding sweeper remains deferred under the [Stage 2L Billing Freeze](../operations/BILLING_HANDOFF_AND_FREEZE.md).
 
 ---
 

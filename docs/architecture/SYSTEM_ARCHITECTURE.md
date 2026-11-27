@@ -33,10 +33,10 @@ The system is architected as a decoupled, multi-tier web application:
 |  +--------------------------------------------------------------|--------------+  |
 |                                                                 |                 |
 |  +--------------------------------------------------------------v--------------+  |
-|  |                    Background Webhook Workers & CLI                         |  |
+|  |                    Background Workers & Ops Tooling                         |  |
 |  |  +------------------------------------+ +--------------------------------+  |  |
-|  |  | Razorpay Webhook Ingestion Worker   | | Payment Binding Sweeper        |  |  |
-|  |  | (Lease-Based Queue, Exponential BO)| | (Designed - Step 5.2D.3.3B)    |  |  |
+|  |  | Razorpay Webhook Ingestion Worker   | | Checkout Recovery Worker & CLI |  |  |
+|  |  | (Lease-Based Queue, Heartbeats)     | | (Lease Fencing + Monitoring)   |  |  |
 |  |  +------------------------------------+ +--------------------------------+  |  |
 |  +-----------------------------------------------------------------------------+  |
 +-----------------------------------|-----------------------------------------------+
@@ -66,10 +66,9 @@ All data access in Aptlyst AI is strictly partitioned by **Organization (`organi
 - Backend endpoints automatically validate organization membership using JWT claims extracted from the Supabase session.
 - Database queries scope all chatbot, knowledge base, conversation, and billing rows to the active `organization_id`.
 
-### 2.2 Conversational AI & RAG Engine
-- Users upload documents (PDF, Markdown, text, URLs) to a chatbot's knowledge base.
-- Text is chunked, embedded, and indexed for similarity search.
-- When an end-user chats via the embedded widget, the system retrieves relevant context chunks, constructs a prompt with strict guardrails, and streams the completion back to the client via Server-Sent Events (SSE).
+### 2.2 Conversational AI & Chatbot Layer
+- **Implemented Today:** Chatbot CRUD configuration (`chatbots`), visitor conversation & message REST endpoints (`/api/v1/public/chatbots/*`) with signed visitor session cookies, rate limiting, token reservation accounting, and Phase 1 `LLM_PROVIDER` (`disabled` or `mock`), plus preview-only widget route (`app/embed/[id]`).
+- **Planned Product Work:** RAG document upload/indexing/retrieval (`app/(app)/knowledge`), live LLM provider integration and SSE token streaming in the widget, and full conversations/leads/analytics UIs.
 
 ### 2.3 Provider-Neutral Billing Engine
 Aptlyst AI separates payment gateway mechanics from organizational entitlements:
@@ -103,11 +102,11 @@ Aptlyst AI separates payment gateway mechanics from organizational entitlements:
 
 ## 4. Current Implementation Status
 
-To maintain documentation integrity, the platform subsystems are categorized below according to their real repository implementation state:
+To maintain documentation integrity, platform subsystems are categorized below according to their real repository state on `main` (`6872f47`, [Stage 2L Billing Freeze](../operations/BILLING_HANDOFF_AND_FREEZE.md)):
 
-- **Frontend Core & Chatbot Management**: *Implemented and verified.*
-- **FastAPI Foundation & Organization Scoping**: *Implemented and verified (634 passing API tests).*
-- **Historical Stripe Billing**: *Implemented and verified historically; maintained for legacy audit.*
-- **Provider-Neutral Schema & Migrations**: *Implemented in code (`e2f3a4b5c6d1`), but PostgreSQL CI execution remains unverified pending container run.*
-- **Razorpay Webhook Ingestion & Worker**: *Implemented and locally unit-tested; pending live sandbox validation.*
-- **Razorpay Settlement Handlers & Payment Binding Sweeper**: *Designed in detail (Steps 5.2D.3.2.1-14); implementation NOT yet started (Step 5.2D.3.3B).*
+- **Frontend Core, Auth & Chatbot Management:** *Dashboard shell, Supabase SSR auth, org switcher, chatbot builder, legacy `/billing`, and `/embed/[id]` preview implemented; `/knowledge`, `/conversations`, `/leads`, `/analytics`, `/integrations`, and `/settings` routes are milestone placeholders.*
+- **FastAPI Foundation & Organization Scoping:** *Implemented and CI-verified (`1,322` tests green on PostgreSQL 16 in Run `46048131091`).*
+- **Historical Stripe Billing:** *Preserved read-only/legacy paths and routes; no new Stripe functionality added.*
+- **Provider-Neutral Schema, Recovery & Heartbeats:** *Alembic chain verified through `a4b5c6d7e8f3` on PostgreSQL 16 CI (`6872f47`).*
+- **Razorpay Ingestion, Agreement Handlers & Workers:** *Implemented and unit/CI-tested; frozen (`RAZORPAY_ENABLED=false`) with zero live/staging operational runs yet.*
+- **Razorpay Settlement Handlers (`subscription.charged`, `payment.captured`, `payment.failed`), Pro Quota Rollover, `BLK-04` Sweeper & Billing UI Cutover:** *Deferred to the Final Razorpay Integration & Cutover Phase (paid Razorpay billing is NOT production-ready).*

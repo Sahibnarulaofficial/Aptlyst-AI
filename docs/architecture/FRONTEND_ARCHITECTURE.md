@@ -20,13 +20,13 @@ Aptlyst-AI/
 │   │   ├── layout.tsx             # Main dashboard shell & sidebar navigation
 │   │   ├── dashboard/             # Overview dashboard (usage metrics, recent activity)
 │   │   ├── chatbots/              # Chatbot management & prompt configurator
-│   │   ├── knowledge/             # Document upload & knowledge base indexing
-│   │   ├── conversations/         # Live chat transcripts & user sessions
-│   │   ├── leads/                 # Captured lead contact lists & export
-│   │   ├── analytics/             # Usage graphs & conversational performance
-│   │   ├── billing/               # Plan tiers, quota meters, checkout trigger
-│   │   ├── integrations/          # External integrations (Zapier, Webhooks, Slack)
-│   │   └── settings/              # Organization settings, team members, API keys
+│   │   ├── knowledge/             # Placeholder page (planned RAG ingestion UI)
+│   │   ├── conversations/         # Placeholder page (planned transcripts UI)
+│   │   ├── leads/                 # Placeholder page (planned lead capture UI)
+│   │   ├── analytics/             # Placeholder page (planned analytics UI)
+│   │   ├── billing/               # Plan/quota display + legacy Stripe endpoints (Razorpay cutover deferred)
+│   │   ├── integrations/          # Placeholder page (planned integrations UI)
+│   │   └── settings/              # Placeholder page (planned organization settings UI)
 │   ├── embed/                     # Embeddable chat widget route
 │   ├── layout.tsx                 # Root HTML layout & fonts
 │   ├── page.tsx                   # Public landing page
@@ -72,11 +72,10 @@ State management for the active organization is handled via React Context:
 
 ## 5. Embeddable Widget Architecture
 
-The embeddable widget is served from `app/embed/`:
-- **Isolation**: Optimized for zero CSS contamination with the host website by running in an isolated container or iframe.
-- **Streaming UI**: Uses Server-Sent Events (SSE) or chunked streams from the backend API to render real-time assistant responses token-by-token.
-- **Customization**: Renders custom themes, brand colors, bot avatars, and placeholder queries configured by the bot owner.
-- **Lead Capture Forms**: Inline form components triggered dynamically during conversation to collect visitor email addresses and names.
+The embeddable widget preview is served from `app/embed/[id]/`:
+- **Implemented Today (Preview Mode):** Loads public chatbot branding, theme color, and welcome message via `GET /api/v1/public/chatbots/{bot_id}`; displays clean loading, unavailable, and error states with a disabled composer (`preview mode`).
+- **Planned Chatbot Product Scope:** Interactive visitor messaging connected to `/api/v1/public/chatbots/*`, real-time streaming responses, and inline lead capture forms.
+- *(Note on Billing UI: `app/(app)/billing/page.tsx` and `lib/api.ts` currently call legacy Stripe endpoints and remain frozen under [Stage 2L Billing Freeze](../operations/BILLING_HANDOFF_AND_FREEZE.md) until the Final Razorpay Phase.)*
 
 ---
 

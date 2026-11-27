@@ -65,7 +65,8 @@ Edit `.env` to configure your local credentials:
 - `SUPABASE_JWT_SECRET`: For JWT token verification.
 - `ENVIRONMENT`: Set to `development`.
 - `VISITOR_SESSION_SECRET`: Random 32+ character string (e.g. `python -c "import secrets; print(secrets.token_hex(32))"`).
-- `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`: Required for Razorpay sandbox integration.
+- `RAZORPAY_ENABLED=false` & `STRIPE_ENABLED=false`: Keep disabled during the **Stage 2L Billing Freeze** ([handoff spec](../operations/BILLING_HANDOFF_AND_FREEZE.md)). Do not configure live keys in development.
+- `LLM_PROVIDER` & `DEFAULT_FREE_MONTHLY_TOKEN_QUOTA`: Both default safely to disabled/fail-closed (`disabled` / `0`). For local chatbot testing without enabling paid billing, set `LLM_PROVIDER=mock` and a positive `DEFAULT_FREE_MONTHLY_TOKEN_QUOTA` (e.g., `100000`) in your local `.env`.
 
 ### 3.3 Database Migrations
 Apply the Alembic migrations up to the latest head:
@@ -75,7 +76,7 @@ alembic upgrade head
 ```
 
 > [!NOTE]
-> The current migration chain head is `e2f3a4b5c6d1` (`add_payment_association_and_entitlement_provenance`). In a clean local PostgreSQL database, running `upgrade head` will provision all core tables, constraints, triggers, and billing structures.
+> The current migration chain head is `a4b5c6d7e8f3` (`add_billing_worker_heartbeats`, layered cleanly atop `f3a4b5c6d7e2` and `e2f3a4b5c6d1`). In a clean local PostgreSQL database, running `upgrade head` provisions all core tables, constraints, triggers, and billing structures.
 
 ### 3.4 Running the Backend Server
 Start the development server with live reload:
@@ -85,15 +86,14 @@ uvicorn app.main:app --reload --port 8000
 ```
 - API Base URL: `http://localhost:8000`
 - Interactive Swagger UI: `http://localhost:8000/docs`
-- Health check: `http://localhost:8000/health`
+- Health check: `http://localhost:8000/health` (`GET /health/db` checks PostgreSQL connectivity)
 
-### 3.5 Running the Webhook Worker
-In a separate terminal (with the virtual environment activated):
+### 3.5 Running Billing Workers (Only When Explicitly Testing Billing)
+Under Stage 2L Billing Freeze, workers do not need to run for chatbot development. When authorized for billing tests:
 
 ```bash
 python -m app.workers.razorpay_webhook_worker --once
-# Or run continuously:
-python -m app.workers.razorpay_webhook_worker --poll-interval 2.0
+python -m app.workers.razorpay_checkout_recovery_worker --once
 ```
 
 ---
