@@ -22,7 +22,9 @@ Covers:
 """
 
 import asyncio
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from typing import Any
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -39,6 +41,7 @@ from app.models.chatbot import Chatbot, ChatbotStatus
 from app.models.conversation import Conversation, ConversationStatus, Message, MessageSenderType
 from app.models.generation import GenerationTaskStatus
 from app.schemas.conversation import GenerationStatus, VisitorMessageCreate
+from app.security.rate_limiter import _in_memory_limiter
 from app.services.llm import (
     BaseLLMProvider,
     LLMConfigurationError,
@@ -70,13 +73,35 @@ async def client() -> AsyncClient:
 
 @pytest.fixture(autouse=True)
 def reset_test_provider():
-    """Reset the global LLM provider between tests and configure mock provider by default."""
+    """Reset the global LLM provider and rate limiter between tests."""
     original_provider = settings.llm_provider
     settings.llm_provider = "mock"
     set_llm_provider_for_testing(None)
-    yield
-    settings.llm_provider = original_provider
-    set_llm_provider_for_testing(None)
+    _in_memory_limiter.clear()
+    try:
+        yield
+    finally:
+        settings.llm_provider = original_provider
+        set_llm_provider_for_testing(None)
+        _in_memory_limiter.clear()
+
+
+@contextmanager
+def _override_db_session(mock_session: Any):
+    """Temporarily override FastAPI get_db with an async generator yielding mock_session."""
+    previous_override = app.dependency_overrides.get(get_db)
+
+    async def _mock_get_db() -> Any:
+        yield mock_session
+
+    app.dependency_overrides[get_db] = _mock_get_db
+    try:
+        yield
+    finally:
+        if previous_override is not None:
+            app.dependency_overrides[get_db] = previous_override
+        else:
+            app.dependency_overrides.pop(get_db, None)
 
 
 # ============================================================================
@@ -623,9 +648,8 @@ async def test_http_api_message_submission_generates_mock_reply(client: AsyncCli
         conversations={conv_id: mock_conv},
         billing_periods={mock_bp.id: mock_bp},
     )
-    app.dependency_overrides[get_db] = lambda: mock_session
 
-    try:
+    with _override_db_session(mock_session):
         client_msg_id = f"cli_{uuid.uuid4().hex[:10]}"
         res = await client.post(
             f"/api/v1/public/chatbots/{bot_id}/conversations/{conv_id}/messages",
@@ -648,8 +672,6 @@ async def test_http_api_message_submission_generates_mock_reply(client: AsyncCli
         # Verify orchestrator task and usage accounting occurred
         assert len(mock_session.tasks) == 1
         assert len(mock_session.usage_logs) == 1
-    finally:
-        app.dependency_overrides.pop(get_db, None)
 
 
 @pytest.mark.anyio
@@ -698,9 +720,8 @@ async def test_http_api_timeout_preserves_visitor_message(client: AsyncClient) -
         conversations={conv_id: mock_conv},
         billing_periods={mock_bp.id: mock_bp},
     )
-    app.dependency_overrides[get_db] = lambda: mock_session
 
-    try:
+    with _override_db_session(mock_session):
         res = await client.post(
             f"/api/v1/public/chatbots/{bot_id}/conversations/{conv_id}/messages",
             headers={"Authorization": f"Bearer {session_token}"},
@@ -721,8 +742,6 @@ async def test_http_api_timeout_preserves_visitor_message(client: AsyncClient) -
         task = next(iter(mock_session.tasks.values()))
         assert task.status == GenerationTaskStatus.reconciliation_needed
         assert mock_bp.tokens_reserved > 0
-    finally:
-        app.dependency_overrides.pop(get_db, None)
 
 
 @pytest.mark.anyio
@@ -778,9 +797,8 @@ async def test_http_api_idempotent_replay_without_duplicate_generation(client: A
             existing_assistant_msg.id: existing_assistant_msg,
         },
     )
-    app.dependency_overrides[get_db] = lambda: mock_session
 
-    try:
+    with _override_db_session(mock_session):
         res = await client.post(
             f"/api/v1/public/chatbots/{bot_id}/conversations/{conv_id}/messages",
             headers={"Authorization": f"Bearer {session_token}"},
@@ -796,8 +814,6 @@ async def test_http_api_idempotent_replay_without_duplicate_generation(client: A
         # Provider must NOT have been called!
         assert custom_mock.call_count == 0
         assert len(mock_session.tasks) == 0
-    finally:
-        app.dependency_overrides.pop(get_db, None)
 
 
 @pytest.mark.anyio
@@ -812,9 +828,8 @@ async def test_inactive_bot_triggers_zero_provider_calls(client: AsyncClient) ->
     mock_session = AsyncMock()
     bot_res = MagicMock(); bot_res.scalar_one_or_none.return_value = None
     mock_session.execute = AsyncMock(return_value=bot_res)
-    app.dependency_overrides[get_db] = lambda: mock_session
 
-    try:
+    with _override_db_session(mock_session):
         res = await client.post(
             f"/api/v1/public/chatbots/{bot_id}/conversations/{conv_id}/messages",
             headers={"Authorization": f"Bearer {session_token}"},
@@ -822,8 +837,6 @@ async def test_inactive_bot_triggers_zero_provider_calls(client: AsyncClient) ->
         )
         assert res.status_code == 404
         assert custom_mock.call_count == 0
-    finally:
-        app.dependency_overrides.pop(get_db, None)
 
 
 @pytest.mark.anyio
@@ -856,9 +869,8 @@ async def test_api_rejects_reserved_reply_id_before_db_or_provider(client: Async
 
     mock_session = AsyncMock()
     mock_session.add = MagicMock()
-    app.dependency_overrides[get_db] = lambda: mock_session
 
-    try:
+    with _override_db_session(mock_session):
         res = await client.post(
             f"/api/v1/public/chatbots/{bot_id}/conversations/{conv_id}/messages",
             headers={"Authorization": f"Bearer {session_token}"},
@@ -873,8 +885,6 @@ async def test_api_rejects_reserved_reply_id_before_db_or_provider(client: Async
         mock_session.commit.assert_not_called()
         # Zero provider calls
         assert custom_mock.call_count == 0
-    finally:
-        app.dependency_overrides.pop(get_db, None)
 
 
 @pytest.mark.anyio

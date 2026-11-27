@@ -455,6 +455,7 @@ jobs:
             tests/test_billing_rollover.py \
             tests/test_accounting.py \
             tests/test_accounting_subscription_auth.py \
+            tests/test_ai_generation.py \
             tests/test_auth.py \
             tests/test_infrastructure.py \
             tests/test_orchestrator.py \
@@ -491,7 +492,7 @@ jobs:
 
           tests, skipped, failures, errors = assert_junit_zero_skips(
               "test-results-models.xml",
-              expected_exact_tests=1169,
+              expected_exact_tests=1198,
               max_age_seconds=1800,
               require_testcase_elements=True,
           )
