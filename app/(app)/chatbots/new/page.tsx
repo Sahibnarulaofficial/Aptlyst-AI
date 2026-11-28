@@ -6,6 +6,7 @@ import { ArrowLeft, Save, AlertCircle } from 'lucide-react';
 import Link from 'next/link';
 import { useOrganization } from '@/lib/organization-context';
 import { createChatbot, ApiError } from '@/lib/api';
+import { normalizeAndValidateHexColor, toColorPickerValue } from '@/lib/chatbot-validation';
 import type { ChatbotCreateInput } from '@/lib/types';
 
 export default function NewChatbotPage() {
@@ -44,6 +45,12 @@ export default function NewChatbotPage() {
       return;
     }
 
+    const validatedColor = normalizeAndValidateHexColor(formData.primaryColor);
+    if (!validatedColor) {
+      setError('Primary color must be a valid hex color code (e.g. #3b82f6 or #abc).');
+      return;
+    }
+
     setIsSubmitting(true);
     setError(null);
 
@@ -53,7 +60,7 @@ export default function NewChatbotPage() {
       website_url: trimmedUrl || null,
       welcome_message: formData.welcomeMessage.trim() || null,
       instructions: formData.instructions.trim() || null,
-      primary_color: formData.primaryColor || '#3b82f6',
+      primary_color: validatedColor,
       status: 'draft',
     };
 
@@ -182,7 +189,7 @@ export default function NewChatbotPage() {
                 <input
                   id="primaryColor"
                   type="color"
-                  value={formData.primaryColor}
+                  value={toColorPickerValue(formData.primaryColor)}
                   onChange={(e) => setFormData({ ...formData, primaryColor: e.target.value })}
                   className="h-10 w-10 rounded cursor-pointer border-0 p-0 bg-transparent"
                 />

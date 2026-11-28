@@ -172,13 +172,14 @@ async def test_chatbot_validation_rules(
             )
             assert res_bad_url.status_code == 422
 
-            # Bad hex color
-            res_bad_color = await client.post(
-                f"/api/v1/organizations/{org_id}/chatbots",
-                headers={"Authorization": f"Bearer {token}"},
-                json={"name": "Valid Name", "primary_color": "not-a-color"},
-            )
-            assert res_bad_color.status_code == 422
+            # Bad hex color (non-hex characters and invalid formats)
+            for bad_color in ("not-a-color", "#zzzzzz", "#12g"):
+                res_bad_color = await client.post(
+                    f"/api/v1/organizations/{org_id}/chatbots",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"name": "Valid Name", "primary_color": bad_color},
+                )
+                assert res_bad_color.status_code == 422
     finally:
         await cleanup_test_organizations(pg_session_factory, [org_id])
 
@@ -522,13 +523,14 @@ async def test_update_chatbot_validation_rules(
             )
             assert res_bad_url.status_code == 422
 
-            # Bad hex color
-            res_bad_color = await client.patch(
-                f"/api/v1/organizations/{org_id}/chatbots/{bot_id}",
-                headers={"Authorization": f"Bearer {token}"},
-                json={"primary_color": "blue"},
-            )
-            assert res_bad_color.status_code == 422
+            # Bad hex color (non-hex characters and invalid formats)
+            for bad_color in ("blue", "#zzzzzz", "#12g"):
+                res_bad_color = await client.patch(
+                    f"/api/v1/organizations/{org_id}/chatbots/{bot_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"primary_color": bad_color},
+                )
+                assert res_bad_color.status_code == 422
 
             # Invalid status value
             res_bad_status = await client.patch(

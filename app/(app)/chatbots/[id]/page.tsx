@@ -27,6 +27,7 @@ import {
 import { cn } from '@/lib/utils';
 import { useOrganization } from '@/lib/organization-context';
 import { getChatbot, updateChatbot, deleteChatbot, ApiError } from '@/lib/api';
+import { normalizeAndValidateHexColor, toColorPickerValue } from '@/lib/chatbot-validation';
 import type { Chatbot, ChatbotStatus, ChatbotUpdateInput } from '@/lib/types';
 
 const TABS = [
@@ -219,6 +220,13 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
       return;
     }
 
+    const validatedColor = normalizeAndValidateHexColor(formData.primaryColor);
+    if (!validatedColor) {
+      setSaveError('Primary color must be a valid hex color code (e.g. #3b82f6 or #abc).');
+      setSaveSuccess(false);
+      return;
+    }
+
     setIsSaving(true);
     setSaveError(null);
     setSaveSuccess(false);
@@ -230,7 +238,7 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
       website_url: trimmedUrl || null,
       welcome_message: formData.welcomeMessage.trim() || null,
       instructions: formData.instructions.trim() || null,
-      primary_color: formData.primaryColor || '#3b82f6',
+      primary_color: validatedColor,
     };
 
     try {
@@ -873,7 +881,7 @@ export default function ChatbotDetailPage({ params }: { params: Promise<{ id: st
                       <input
                         id="edit-primaryColor"
                         type="color"
-                        value={formData.primaryColor}
+                        value={toColorPickerValue(formData.primaryColor)}
                         onChange={(e) => {
                           setFormData((prev) => ({ ...prev, primaryColor: e.target.value }));
                           setSaveSuccess(false);

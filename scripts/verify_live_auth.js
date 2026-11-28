@@ -1,6 +1,6 @@
-const fs = require('fs');
-const path = require('path');
-const { createClient } = require('@supabase/supabase-js');
+import fs from 'fs';
+import path from 'path';
+import { createClient } from '@supabase/supabase-js';
 
 // 1. Read .env.local for URL and Anon Key (do not log values)
 const envPath = path.resolve('.env.local');

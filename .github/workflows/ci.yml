@@ -502,6 +502,36 @@ jobs:
           )
           PY
 
+      - name: Run Non-PG API Router, Security & Validation Regression Tests
+        working-directory: apps/api
+        run: |
+          rm -f test-results-api-router.xml
+          python -m pytest -v -m "not pg_api_integration" \
+            tests/test_chatbot_schemas.py \
+            tests/test_cors_and_security.py \
+            tests/test_public_chatbots.py \
+            tests/test_chatbots.py \
+            tests/test_conversations.py \
+            --junitxml=test-results-api-router.xml
+
+      - name: Enforce zero skipped tests in API router & security JUnit report
+        working-directory: apps/api
+        run: |
+          python - <<'PY'
+          from tests.postgres_test_guard import assert_junit_zero_skips
+
+          tests, skipped, failures, errors = assert_junit_zero_skips(
+              "test-results-api-router.xml",
+              expected_exact_tests=54,
+              max_age_seconds=1800,
+              require_testcase_elements=True,
+          )
+          print(
+              f"Verified API Router & Security JUnit gate: tests={tests}, skipped={skipped}, "
+              f"failures={failures}, errors={errors}"
+          )
+          PY
+
       - name: Preserve Test Results Artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -518,3 +548,4 @@ jobs:
             apps/api/test-results-postgres-stage2kc.xml
             apps/api/test-results-postgres-stage2kd2.xml
             apps/api/test-results-models.xml
+            apps/api/test-results-api-router.xml
