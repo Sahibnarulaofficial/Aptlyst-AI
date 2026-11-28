@@ -130,11 +130,18 @@ async def test_get_public_chatbot_active_success_and_field_filtering(
 @pytest.mark.anyio
 async def test_get_public_chatbot_nonexistent_and_invalid_uuid(client: AsyncClient) -> None:
     """Verifies that nonexistent bot IDs return 404 and malformed UUIDs return 422."""
+    from app.security.rate_limiter import _in_memory_limiter
+
+    _in_memory_limiter.clear()
     mock_session = AsyncMock()
     mock_res = MagicMock()
     mock_res.scalar_one_or_none.return_value = None
     mock_session.execute = AsyncMock(return_value=mock_res)
-    app.dependency_overrides[get_db] = lambda: mock_session
+
+    async def _override_get_db():
+        yield mock_session
+
+    app.dependency_overrides[get_db] = _override_get_db
 
     try:
         random_bot_id = uuid.uuid4()
@@ -146,6 +153,7 @@ async def test_get_public_chatbot_nonexistent_and_invalid_uuid(client: AsyncClie
         assert res_invalid_uuid.status_code == 422
     finally:
         app.dependency_overrides.pop(get_db, None)
+        _in_memory_limiter.clear()
 
 
 @pytest.mark.anyio

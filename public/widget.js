@@ -34,7 +34,7 @@
       try {
         var parsedUrl = new URL(script.src);
         baseUrl = parsedUrl.origin;
-      } catch (e) {
+      } catch {
         baseUrl = window.location.origin;
       }
     }

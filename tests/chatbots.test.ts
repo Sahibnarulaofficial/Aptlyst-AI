@@ -12,6 +12,11 @@ import {
   getPublicChatbot,
   ApiError,
 } from '../lib/api.ts';
+import {
+  DEFAULT_CHATBOT_PRIMARY_COLOR,
+  normalizeAndValidateHexColor,
+  toColorPickerValue,
+} from '../lib/chatbot-validation.ts';
 import type {
   Chatbot,
   ChatbotCreateInput,
@@ -113,6 +118,12 @@ class ChatbotCreateController {
       return null;
     }
 
+    const validatedColor = normalizeAndValidateHexColor(formData.primaryColor);
+    if (!validatedColor) {
+      this.error = 'Primary color must be a valid hex color code (e.g. #3b82f6 or #abc).';
+      return null;
+    }
+
     this.isSubmitting = true;
     this.error = null;
 
@@ -122,7 +133,7 @@ class ChatbotCreateController {
       website_url: trimmedUrl || null,
       welcome_message: formData.welcomeMessage?.trim() || null,
       instructions: formData.instructions?.trim() || null,
-      primary_color: formData.primaryColor || '#3b82f6',
+      primary_color: validatedColor,
       status: 'draft',
     };
 
@@ -270,6 +281,13 @@ class ChatbotDetailController {
       return null;
     }
 
+    const validatedColor = normalizeAndValidateHexColor(input.primaryColor);
+    if (!validatedColor) {
+      this.saveError = 'Primary color must be a valid hex color code (e.g. #3b82f6 or #abc).';
+      this.saveSuccess = false;
+      return null;
+    }
+
     this.isSaving = true;
     this.saveError = null;
     this.saveSuccess = false;
@@ -281,7 +299,7 @@ class ChatbotDetailController {
       website_url: trimmedUrl || null,
       welcome_message: input.welcomeMessage?.trim() || null,
       instructions: input.instructions?.trim() || null,
-      primary_color: input.primaryColor || '#3b82f6',
+      primary_color: validatedColor,
     };
 
     try {
@@ -796,6 +814,28 @@ describe('Chatbot Management Frontend Integration', () => {
       assert.equal(controller.error, 'Chatbot name is required.');
     });
 
+    it('rejects invalid hex primaryColor client-side before sending API request', async () => {
+      let fetchCalled = false;
+      globalThis.fetch = async () => {
+        fetchCalled = true;
+        throw new Error('fetch must not be called for invalid color');
+      };
+
+      const controller = new ChatbotCreateController();
+      for (const badColor of ['#zzzzzz', '#12g', 'blue', '#123456;color:red']) {
+        const res = await controller.submit('org-1', {
+          name: 'Color Bot',
+          primaryColor: badColor,
+        });
+        assert.equal(res, null);
+        assert.equal(
+          controller.error,
+          'Primary color must be a valid hex color code (e.g. #3b82f6 or #abc).',
+        );
+      }
+      assert.equal(fetchCalled, false);
+    });
+
     it('validates website URL format client-side', async () => {
       const controller = new ChatbotCreateController();
       const res = await controller.submit('org-1', {
@@ -1080,6 +1120,45 @@ describe('Chatbot Management Frontend Integration', () => {
       assert.equal(res, null);
       assert.equal(controller.saveError, 'Website URL must start with http:// or https://');
       assert.equal(controller.saveSuccess, false);
+    });
+
+    it('rejects invalid hex primaryColor before saving and preserves fallback behavior', async () => {
+      let fetchCalled = false;
+      globalThis.fetch = async () => {
+        fetchCalled = true;
+        throw new Error('fetch must not be called for invalid color');
+      };
+
+      const controller = new ChatbotDetailController();
+      for (const badColor of ['#zzzzzz', '#12g', 'red', '3b82f6']) {
+        const res = await controller.save('org-aaa', 'bot-1', {
+          name: 'Valid Name',
+          primaryColor: badColor,
+        });
+        assert.equal(res, null);
+        assert.equal(
+          controller.saveError,
+          'Primary color must be a valid hex color code (e.g. #3b82f6 or #abc).',
+        );
+        assert.equal(controller.saveSuccess, false);
+      }
+      assert.equal(fetchCalled, false);
+
+      let capturedPayload: ChatbotUpdateInput | null = null;
+      globalThis.fetch = async (_input: RequestInfo | URL, init?: RequestInit) => {
+        capturedPayload = JSON.parse(String(init?.body || '{}')) as ChatbotUpdateInput;
+        return new Response(JSON.stringify({ ...mockApiChatbot, ...capturedPayload }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      };
+
+      const savedDefault = await controller.save('org-aaa', 'bot-1', {
+        name: 'Valid Name',
+        primaryColor: '   ',
+      });
+      assert.notEqual(savedDefault, null);
+      assert.equal((capturedPayload as ChatbotUpdateInput | null)?.primary_color, '#3b82f6');
     });
 
     it('handles API update failure with error message and does not show false success', async () => {
@@ -1499,6 +1578,33 @@ describe('Chatbot Management Frontend Integration', () => {
         true,
         'components/dashboard/recent-activity.tsx must display honest empty state',
       );
+    });
+  });
+
+  describe('Chatbot Hex Color Validation Helpers', () => {
+    it('accepts valid 3-digit and 6-digit hex colors and defaults blank inputs', () => {
+      assert.equal(normalizeAndValidateHexColor('#3b82f6'), '#3b82f6');
+      assert.equal(normalizeAndValidateHexColor('#123'), '#123');
+      assert.equal(normalizeAndValidateHexColor('  #ABC  '), '#ABC');
+      assert.equal(normalizeAndValidateHexColor(''), DEFAULT_CHATBOT_PRIMARY_COLOR);
+      assert.equal(normalizeAndValidateHexColor('   '), DEFAULT_CHATBOT_PRIMARY_COLOR);
+      assert.equal(normalizeAndValidateHexColor(null), DEFAULT_CHATBOT_PRIMARY_COLOR);
+    });
+
+    it('rejects malformed or non-hex color values', () => {
+      for (const badColor of ['#zzzzzz', '#12g', '#12345', '#1234567', 'red', '3b82f6', '#123;color:red']) {
+        assert.equal(
+          normalizeAndValidateHexColor(badColor),
+          null,
+          `Expected '${badColor}' to be rejected`,
+        );
+      }
+    });
+
+    it('expands 3-digit shorthand hex colors to 6-digit values for native color pickers', () => {
+      assert.equal(toColorPickerValue('#123'), '#112233');
+      assert.equal(toColorPickerValue('#AbC'), '#aabbcc');
+      assert.equal(toColorPickerValue('#invalid'), DEFAULT_CHATBOT_PRIMARY_COLOR);
     });
   });
 });

@@ -47,6 +47,14 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Aptlyst AI API", version="0.1.0", lifespan=lifespan)
 
 
+def _apply_public_cors_headers(response: Response) -> Response:
+    """Enforce non-credentialed wildcard CORS headers for /api/v1/public/* responses."""
+    if "access-control-allow-credentials" in response.headers:
+        del response.headers["access-control-allow-credentials"]
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
+
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
     """Format HTTP 429 response with consistent JSON body and rate-limit headers."""
@@ -60,7 +68,7 @@ async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) 
         headers=dict(exc.headers or {}),
     )
     if request.url.path.startswith("/api/v1/public/"):
-        response.headers["Access-Control-Allow-Origin"] = "*"
+        _apply_public_cors_headers(response)
         response.headers["Access-Control-Expose-Headers"] = (
             "Retry-After, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset"
         )
@@ -93,14 +101,13 @@ async def public_cors_middleware(request: Request, call_next):
     if request.url.path.startswith("/api/v1/public/"):
         if request.method == "OPTIONS":
             response = Response(status_code=204)
-            response.headers["Access-Control-Allow-Origin"] = "*"
+            _apply_public_cors_headers(response)
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
             response.headers["Access-Control-Allow-Headers"] = "Content-Type, Accept, Authorization, X-Visitor-Session"
             return response
 
         response = await call_next(request)
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        return response
+        return _apply_public_cors_headers(response)
 
     return await call_next(request)
 
